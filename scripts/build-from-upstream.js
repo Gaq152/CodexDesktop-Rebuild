@@ -181,15 +181,33 @@ function buildWin(platform) {
 
   const resourcesDir = path.join(outApp, "resources");
 
-  // Repack patched ASAR
+  // Compute old ASAR header hash (before repack)
   const asarPath = path.join(resourcesDir, "app.asar");
+  const oldHash = computeAsarHeaderHash(asarPath);
+  console.log(`   [integrity] old hash: ${oldHash.slice(0, 16)}...`);
+
+  // Repack patched ASAR
   console.log("   [asar pack] _asar/ -> app.asar");
   execSync(`npx asar pack "${asarDir}" "${asarPath}"`);
+
+  // Compute new hash and patch exe
+  const newHash = computeAsarHeaderHash(asarPath);
+  console.log(`   [integrity] new hash: ${newHash.slice(0, 16)}...`);
+
+  if (oldHash !== newHash) {
+    // Find Codex.exe in app root
+    const exePath = path.join(outApp, "Codex.exe");
+    if (fs.existsSync(exePath)) {
+      patchExeHash(exePath, oldHash, newHash);
+    } else {
+      console.log("   [!] Codex.exe not found for hash patching");
+    }
+  }
 
   // Replace codex CLI
   replaceCodex(platform, resourcesDir, "codex.exe");
 
-  // Create ZIP (use 7zz — works on all platforms, already installed in CI)
+  // Create ZIP
   const version = getVersion(asarDir);
   const zipName = `Codex-win-x64-${version}.zip`;
   const zipPath = path.join(OUT_DIR, zipName);
@@ -202,17 +220,37 @@ function buildWin(platform) {
 
 // ─── ASAR integrity ─────────────────────────────────────────────
 
-function updateAsarIntegrity(asarPath, infoPlistPath) {
-  // Compute SHA256 of ASAR header (Electron verifies header hash, not full file)
-  const newHash = execSync(`node -e "
+function computeAsarHeaderHash(asarPath) {
+  return execSync(`node -e "
     const fs=require('fs'),crypto=require('crypto');
     const buf=fs.readFileSync(process.argv[1]);
     const sz=buf.readUInt32LE(12);
     const hdr=buf.slice(16,16+sz);
     process.stdout.write(crypto.createHash('sha256').update(hdr).digest('hex'));
   " "${asarPath}"`, { encoding: "utf-8" }).trim();
+}
 
-  // Update Info.plist
+function patchExeHash(exePath, oldHash, newHash) {
+  const result = execSync(`node -e "
+    const fs=require('fs');
+    const buf=fs.readFileSync(process.argv[1]);
+    const oldBuf=Buffer.from(process.argv[2],'ascii');
+    const idx=buf.indexOf(oldBuf);
+    if(idx<0){console.log('NOT_FOUND');process.exit(0)}
+    Buffer.from(process.argv[3],'ascii').copy(buf,idx);
+    fs.writeFileSync(process.argv[1],buf);
+    console.log('REPLACED:'+idx);
+  " "${exePath}" "${oldHash}" "${newHash}"`, { encoding: "utf-8" }).trim();
+
+  if (result.startsWith("REPLACED:")) {
+    console.log(`   [integrity] exe hash patched at offset ${result.split(":")[1]}`);
+  } else {
+    console.log("   [!] old hash not found in exe");
+  }
+}
+
+function updateAsarIntegrity(asarPath, infoPlistPath) {
+  const newHash = computeAsarHeaderHash(asarPath);
   execSync(`plutil -replace ElectronAsarIntegrity.Resources/app\\.asar.hash -string "${newHash}" "${infoPlistPath}"`, { stdio: "pipe" });
   execSync(`plutil -replace ElectronAsarIntegrity.Resources/app\\.asar.algorithm -string "SHA256" "${infoPlistPath}"`, { stdio: "pipe" });
 
