@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       has_update: ${{ steps.detect.outputs.has_update }}
+      current_version: ${{ steps.detect.outputs.current_version }}
+      latest_version: ${{ steps.detect.outputs.latest_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -34,19 +36,49 @@ jobs:
       - name: Check upstream versions
         id: detect
         run: |
-          set +e
-          node scripts/check-update.js --json --force 2>&1
-          exit_code=$?
-          set -e
+          set -euo pipefail
+          node scripts/check-update.js --json --force > upstream.json
 
-          if [ "${{ inputs.force }}" = "true" ]; then
-            echo "has_update=true" >> "$GITHUB_OUTPUT"
-          elif [ $exit_code -eq 0 ]; then
-            echo "has_update=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_update=false" >> "$GITHUB_OUTPUT"
-            echo "No upstream update detected."
-          fi
+          node <<'NODE'
+          const fs = require("fs");
+          const upstream = JSON.parse(fs.readFileSync("upstream.json", "utf8"));
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const platforms = upstream.platforms || {};
+
+          const latestVersion =
+            platforms["macOS-arm64"]?.version ||
+            platforms["macOS-x64"]?.version ||
+            platforms.Windows?.version ||
+            "";
+          const currentVersion = pkg.version || "";
+          const forceSync = "${{ inputs.force }}" === "true";
+          const hasUpdate =
+            forceSync || (!!latestVersion && latestVersion !== currentVersion);
+
+          if (!latestVersion) {
+            console.error("No upstream version detected.");
+            process.exit(1);
+          }
+
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            [
+              `has_update=${hasUpdate ? "true" : "false"}`,
+              `current_version=${currentVersion}`,
+              `latest_version=${latestVersion}`,
+            ].join("\n") + "\n",
+          );
+
+          console.log(`Current version: ${currentVersion}`);
+          console.log(`Upstream version: ${latestVersion}`);
+          if (forceSync) {
+            console.log("Force sync requested.");
+          } else if (hasUpdate) {
+            console.log("Upstream update detected.");
+          } else {
+            console.log("No upstream update detected.");
+          }
+          NODE
 
   # ──────────────────────────────────────────────
   # Each platform: sync + patch + build in one job
@@ -187,8 +219,8 @@ jobs:
   # Bump version + tag + release
   # ──────────────────────────────────────────────
   release:
-    needs: [build-mac, build-windows, build-linux]
-    if: always() && needs.check.result == 'success'
+    needs: [check, build-mac, build-windows, build-linux]
+    if: always() && needs.check.result == 'success' && needs.check.outputs.has_update == 'true' && needs.build-mac.result == 'success' && needs.build-windows.result == 'success' && needs.build-linux.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
