@@ -19,6 +19,8 @@ const PATCHES = [
   "patch-plugin-auth.js",
   "patch-updater.js",
   "patch-archive-delete.js",
+  "patch-sidebar-delete.js",
+  "patch-show-all-local-sessions.js",
 ];
 
 function main() {

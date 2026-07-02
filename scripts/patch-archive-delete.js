@@ -27,15 +27,13 @@ function patchAppMain(bundles) {
       continue;
     }
 
-    // Dynamically find the unarchive-conversation route and extract:
-    //   1. The quote style (" or `)
-    //   2. The wrapper function name (XE, YE, etc.)
-    //   3. The inner parameter variable name (t for conversationId)
-    // Pattern: <quote>unarchive-conversation<quote>:<WrapperFn>(async(e,{conversationId:<var>})=>{await e.unarchiveConversation(<var>)})
-    const routeRe = /(["`])unarchive-conversation\1:(\w+)\(async\((\w+),\{conversationId:(\w+)\}\)=>\{\s*await \3\.unarchiveConversation\(\4\)\s*\}\)/;
+    // Dynamically find the archive-conversation route and reuse its wrapper.
+    // The archive route uses the conversation-aware wrapper, so delete can work
+    // with either a conversationId alone or an explicit hostId.
+    const routeRe = /(["`])archive-conversation\1:(\w+)\(async\((\w+),\{conversationId:(\w+),cleanupWorktree:(\w+),source:(\w+)\}\)=>\{\s*await \3\.archiveConversation\(\4,\{cleanupWorktree:\5,source:\6\}\)\s*\}\)/;
     const routeMatch = code.match(routeRe);
     if (!routeMatch) {
-      console.log(`  [!] ${relPath(bundle.path)}: unarchive-conversation route not found`);
+      console.log(`  [!] ${relPath(bundle.path)}: archive-conversation route not found`);
       continue;
     }
 
@@ -60,6 +58,14 @@ function patchDataControls(bundles) {
   let patched = 0;
   for (const bundle of bundles) {
     const code = fs.readFileSync(bundle.path, "utf-8");
+
+    if (
+      code.includes("delete-archived-conversation") ||
+      code.includes("settings.dataControls.archivedChats.delete")
+    ) {
+      console.log(`  [ok] ${relPath(bundle.path)}: archived delete is native upstream`);
+      continue;
+    }
 
     if (code.includes("delete-conversation")) {
       console.log(`  [ok] ${relPath(bundle.path)}: delete button already patched`);
@@ -243,7 +249,7 @@ function patchDataControls(bundles) {
             `${queryClientVar}.setQueryData([\`archived-threads\`,${hostIdVar}],`,
               `(${queryClientVar}.getQueryData([\`archived-threads\`,${hostIdVar}])??[])`,
               `.filter(e=>e.id!==${threadVar}.id));`,
-            `await ${msgFnName}(\`delete-conversation\`,{conversationId:${threadVar}.id})`,
+            `await ${msgFnName}(\`delete-conversation\`,{conversationId:${threadVar}.id,hostId:${hostIdVar}})`,
           `}catch(e){`,
             `${queryClientVar}.invalidateQueries({queryKey:[\`archived-threads\`,${hostIdVar}]})`,
           `}`,
