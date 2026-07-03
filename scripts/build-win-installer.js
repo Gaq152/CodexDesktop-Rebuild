@@ -210,6 +210,12 @@ function applyPatchedResources(appDirectory) {
   console.log("   [ok] patched upstream app resources");
 }
 
+function getPatchedAppVersion() {
+  const packageJsonPath = path.join(PROJECT_ROOT, "src", "win", "_asar", "package.json");
+  const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
+  return packageJson.version;
+}
+
 async function main() {
   const rootPackageJson = path.join(PROJECT_ROOT, "package.json");
   const originalRootPackageJson = fs.readFileSync(rootPackageJson, "utf-8");
@@ -235,6 +241,8 @@ async function main() {
 
   const appDirectory = stageUpstreamApp(shortWorkspace);
   applyPatchedResources(appDirectory);
+  const installerVersion = process.env.CODEX_REBUILD_INSTALLER_VERSION || getPatchedAppVersion();
+  console.log(`-- installer version: ${installerVersion}`);
 
   await createWindowsInstaller({
     appDirectory,
@@ -244,6 +252,7 @@ async function main() {
     authors: "OpenAI, Cometix Space",
     owners: "OpenAI, Cometix Space",
     description: "Codex Desktop App",
+    version: installerVersion,
     exe: "Codex.exe",
     setupExe: "CodexSetup.exe",
     noMsi: true,
