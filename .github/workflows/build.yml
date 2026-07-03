@@ -13,6 +13,9 @@ on:
 env:
   NODE_VERSION: "24"
 
+permissions:
+  contents: read
+
 jobs:
   build-mac:
     if: inputs.platform == 'all' || inputs.platform == 'mac'
@@ -38,6 +41,7 @@ jobs:
         with:
           name: Codex-macOS-${{ matrix.arch }}
           path: out/*.dmg
+          if-no-files-found: error
 
   build-windows:
     if: inputs.platform == 'all' || inputs.platform == 'windows'
@@ -63,6 +67,7 @@ jobs:
         with:
           name: Codex-Windows-x64
           path: out/*.zip
+          if-no-files-found: error
 
   build-linux:
     if: inputs.platform == 'all' || inputs.platform == 'linux'
@@ -92,3 +97,83 @@ jobs:
             out/make/deb/**/*.deb
             out/make/rpm/**/*.rpm
             out/make/zip/**/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [build-mac, build-windows, build-linux]
+    if: always() && inputs.platform == 'all' && needs.build-mac.result == 'success' && needs.build-windows.result == 'success' && needs.build-linux.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Get upstream version
+        id: version
+        run: |
+          set -euo pipefail
+          node scripts/check-update.js --json --force > upstream.json
+
+          node <<'NODE'
+          const fs = require("fs");
+          const upstream = JSON.parse(fs.readFileSync("upstream.json", "utf8"));
+          const platforms = upstream.platforms || {};
+          const macArm64 = platforms["macOS-arm64"]?.version || "";
+          const macX64 = platforms["macOS-x64"]?.version || "";
+          const windows = platforms.Windows?.version || "";
+          const version = macArm64 || macX64 || windows;
+
+          if (!version) {
+            console.error("No upstream version detected.");
+            process.exit(1);
+          }
+
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            [
+              `version=${version}`,
+              `mac_arm64=${macArm64}`,
+              `mac_x64=${macX64}`,
+              `windows=${windows}`,
+            ].join("\n") + "\n",
+          );
+
+          console.log(`Release version: ${version}`);
+          NODE
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Display artifact structure
+        run: find artifacts -maxdepth 4 -type f -print
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Codex ${{ steps.version.outputs.version }}
+          body: |
+            Manual all-platform rebuild from upstream Codex.
+
+            | Platform | Upstream version |
+            | --- | --- |
+            | macOS arm64 | `${{ steps.version.outputs.mac_arm64 || 'N/A' }}` |
+            | macOS x64 | `${{ steps.version.outputs.mac_x64 || 'N/A' }}` |
+            | Windows x64 | `${{ steps.version.outputs.windows || 'N/A' }}` |
+            | Linux | built from macOS ASAR resources |
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*.zip
+            artifacts/**/*.deb
+            artifacts/**/*.rpm
+          fail_on_unmatched_files: true
+          draft: false
+          make_latest: true
