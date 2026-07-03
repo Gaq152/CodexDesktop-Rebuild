@@ -79,6 +79,7 @@ function resolveCodexVendor(platform) {
   try {
     baseVer = execSync("npm view @cometix/codex version", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
   } catch { return null; }
+  if (!baseVer) return null;
 
   // e.g. "0.128.0-cometix" → "@cometix/codex@0.128.0-cometix-darwin-x64"
   const platPkgSpec = `@cometix/codex@${baseVer}-${suffix}`;

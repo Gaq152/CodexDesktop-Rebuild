@@ -8,11 +8,13 @@
  * NuGet package. Use a short root-level temp directory for this make step.
  */
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
 const { createWindowsInstaller } = require("electron-winstaller");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
+const INITIAL_TMPDIR = os.tmpdir();
 
 function run(command, args, options = {}) {
   execFileSync(command, args, {
@@ -60,21 +62,6 @@ function resetShortWorkspace(root) {
 
   fs.mkdirSync(shortWorkspace, { recursive: true });
   fs.writeFileSync(marker, "CodexDesktop-Rebuild Windows installer staging\n", "utf-8");
-  fs.copyFileSync(path.join(PROJECT_ROOT, "package.json"), path.join(shortWorkspace, "package.json"));
-  fs.copyFileSync(path.join(PROJECT_ROOT, "forge.config.js"), path.join(shortWorkspace, "forge.config.js"));
-
-  const packageLock = path.join(PROJECT_ROOT, "package-lock.json");
-  if (fs.existsSync(packageLock)) fs.copyFileSync(packageLock, path.join(shortWorkspace, "package-lock.json"));
-
-  copyRecursive(path.join(PROJECT_ROOT, "resources"), path.join(shortWorkspace, "resources"));
-  copyRecursive(path.join(PROJECT_ROOT, "src", ".vite"), path.join(shortWorkspace, "src", ".vite"));
-  fs.copyFileSync(path.join(PROJECT_ROOT, "src", ".build-mode"), path.join(shortWorkspace, "src", ".build-mode"));
-  fs.copyFileSync(path.join(PROJECT_ROOT, "src", "package.json"), path.join(shortWorkspace, "src", "package.json"));
-  copyRecursive(path.join(PROJECT_ROOT, "src", "win"), path.join(shortWorkspace, "src", "win"), {
-    skipNames: new Set(["_asar"]),
-  });
-
-  fs.symlinkSync(path.join(PROJECT_ROOT, "node_modules"), path.join(shortWorkspace, "node_modules"), "junction");
   return shortWorkspace;
 }
 
@@ -115,6 +102,114 @@ function normalizeEscapedScopeDirs(rootDir) {
   return renamed;
 }
 
+function findCachedMsix() {
+  const cacheDirs = [...new Set([INITIAL_TMPDIR, os.tmpdir()].map((dir) => path.join(dir, "codex-sync")))];
+  const candidates = [];
+
+  for (const cacheDir of cacheDirs) {
+    if (!fs.existsSync(cacheDir)) continue;
+    for (const entry of fs.readdirSync(cacheDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !/^OpenAI\.Codex_.*_x64__.*\.msix$/i.test(entry.name)) continue;
+      const fullPath = path.join(cacheDir, entry.name);
+      candidates.push({ fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs });
+    }
+  }
+
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  return candidates[0]?.fullPath || null;
+}
+
+function computeAsarHeaderHash(asarPath) {
+  const crypto = require("crypto");
+  const buf = fs.readFileSync(asarPath);
+  const headerSize = buf.readUInt32LE(12);
+  const header = buf.slice(16, 16 + headerSize);
+  return crypto.createHash("sha256").update(header).digest("hex");
+}
+
+function patchExeHash(exePath, oldHash, newHash) {
+  const buf = fs.readFileSync(exePath);
+  const oldBuf = Buffer.from(oldHash, "ascii");
+  const idx = buf.indexOf(oldBuf);
+  if (idx < 0) {
+    console.log("   [!] old ASAR integrity hash not found in Codex.exe");
+    return;
+  }
+
+  Buffer.from(newHash, "ascii").copy(buf, idx);
+  fs.writeFileSync(exePath, buf);
+  console.log(`   [integrity] Codex.exe hash patched at offset ${idx}`);
+}
+
+function stageUpstreamApp(shortWorkspace) {
+  const msixPath = process.env.CODEX_REBUILD_WIN_MSIX || findCachedMsix();
+  if (!msixPath || !fs.existsSync(msixPath)) {
+    throw new Error(
+      "Windows MSIX cache not found. Run `node scripts/sync-upstream.js --force --skip-mac` first.",
+    );
+  }
+
+  const extractDir = path.join(shortWorkspace, "msix");
+  fs.mkdirSync(extractDir, { recursive: true });
+  console.log(`-- extracting upstream MSIX: ${path.basename(msixPath)}`);
+  run("tar", ["-xf", msixPath, "-C", extractDir]);
+
+  const appDirectory = path.join(extractDir, "app");
+  const exePath = path.join(appDirectory, "Codex.exe");
+  const chromeDll = path.join(appDirectory, "chrome.dll");
+  const resourcesDir = path.join(appDirectory, "resources");
+  if (!fs.existsSync(exePath) || !fs.existsSync(chromeDll) || !fs.existsSync(resourcesDir)) {
+    throw new Error(`Incomplete Windows app extracted from MSIX: ${appDirectory}`);
+  }
+  const licensePath = path.join(appDirectory, "LICENSE");
+  if (!fs.existsSync(licensePath)) {
+    fs.writeFileSync(
+      licensePath,
+      "Codex Desktop App installer package.\nSee upstream OpenAI Codex and bundled dependency licenses.\n",
+      "utf-8",
+    );
+  }
+
+  return appDirectory;
+}
+
+function applyPatchedResources(appDirectory) {
+  const resourcesDir = path.join(appDirectory, "resources");
+  const sourceWinDir = path.join(PROJECT_ROOT, "src", "win");
+  const sourceAsar = path.join(sourceWinDir, "app.asar");
+  const sourceUnpacked = path.join(sourceWinDir, "app.asar.unpacked");
+  const destAsar = path.join(resourcesDir, "app.asar");
+  const destUnpacked = path.join(resourcesDir, "app.asar.unpacked");
+  const exePath = path.join(appDirectory, "Codex.exe");
+
+  if (!fs.existsSync(sourceAsar) || !fs.existsSync(sourceUnpacked)) {
+    throw new Error("Patched Windows app.asar/app.asar.unpacked not found.");
+  }
+
+  const oldHash = computeAsarHeaderHash(destAsar);
+  fs.copyFileSync(sourceAsar, destAsar);
+  fs.rmSync(destUnpacked, { recursive: true, force: true });
+  copyRecursive(sourceUnpacked, destUnpacked);
+
+  for (const fileName of ["codex.exe", "rg.exe"]) {
+    const sourceFile = path.join(sourceWinDir, fileName);
+    if (fs.existsSync(sourceFile)) {
+      fs.copyFileSync(sourceFile, path.join(resourcesDir, fileName));
+    }
+  }
+
+  const normalizedScopes = normalizeEscapedScopeDirs(destUnpacked);
+  if (normalizedScopes > 0) {
+    console.log(`-- normalized ${normalizedScopes} escaped scope directories in app.asar.unpacked`);
+  }
+
+  const newHash = computeAsarHeaderHash(destAsar);
+  if (oldHash !== newHash) patchExeHash(exePath, oldHash, newHash);
+
+  console.log("   [ok] patched upstream app resources");
+}
+
 async function main() {
   const rootPackageJson = path.join(PROJECT_ROOT, "package.json");
   const originalRootPackageJson = fs.readFileSync(rootPackageJson, "utf-8");
@@ -134,33 +229,12 @@ async function main() {
   fs.mkdirSync(shortTemp, { recursive: true });
   resetMarkedDirectory(shortInstallerOut, ".codex-rebuild-squirrel-output");
 
-  const env = {
-    ...process.env,
-    TEMP: shortTemp,
-    TMP: shortTemp,
-    TMPDIR: shortTemp,
-  };
+  process.env.TEMP = shortTemp;
+  process.env.TMP = shortTemp;
+  process.env.TMPDIR = shortTemp;
 
-  const forgeCli = path.join(
-    shortWorkspace,
-    "node_modules",
-    "@electron-forge",
-    "cli",
-    "dist",
-    "electron-forge.js",
-  );
-  run(process.execPath, [forgeCli, "package", "--platform=win32", "--arch=x64"], {
-    cwd: shortWorkspace,
-    env,
-  });
-
-  const appDirectory = path.join(shortWorkspace, "out", "Codex-win32-x64");
-  const normalizedScopes = normalizeEscapedScopeDirs(
-    path.join(appDirectory, "resources", "app.asar.unpacked"),
-  );
-  if (normalizedScopes > 0) {
-    console.log(`-- normalized ${normalizedScopes} escaped scope directories in app.asar.unpacked`);
-  }
+  const appDirectory = stageUpstreamApp(shortWorkspace);
+  applyPatchedResources(appDirectory);
 
   await createWindowsInstaller({
     appDirectory,
@@ -173,7 +247,8 @@ async function main() {
     exe: "Codex.exe",
     setupExe: "CodexSetup.exe",
     noMsi: true,
-    setupIcon: path.join(shortWorkspace, "resources", "electron.ico"),
+    skipUpdateIcon: true,
+    setupIcon: path.join(PROJECT_ROOT, "resources", "electron.ico"),
     iconUrl: "https://raw.githubusercontent.com/Gaq152/CodexDesktop-Rebuild/master/resources/electron.ico",
     remoteReleases: process.env.CODEX_REBUILD_REMOTE_RELEASES || undefined,
   });
