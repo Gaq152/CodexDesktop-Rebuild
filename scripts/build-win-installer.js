@@ -210,6 +210,48 @@ function applyPatchedResources(appDirectory) {
   console.log("   [ok] patched upstream app resources");
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripExternalAssemblyManifestDependencies(appDirectory, exeName) {
+  const manifestAssemblyNames = fs
+    .readdirSync(appDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".manifest"))
+    .map((entry) => entry.name.slice(0, -".manifest".length));
+  if (manifestAssemblyNames.length === 0) return;
+
+  const ResEdit = require("resedit");
+  const exePath = path.join(appDirectory, exeName);
+  const exe = ResEdit.NtExecutable.from(fs.readFileSync(exePath), { ignoreCert: true });
+  const resources = ResEdit.NtExecutableResource.from(exe);
+  let changed = false;
+
+  for (const entry of resources.entries.filter((resource) => resource.type === 24)) {
+    let manifest = Buffer.from(entry.bin).toString("utf-8");
+    const original = manifest;
+
+    for (const assemblyName of manifestAssemblyNames) {
+      const quotedName = escapeRegExp(assemblyName);
+      const dependencyPattern = new RegExp(
+        `<dependency><dependentAssembly><assemblyIdentity\\s+type="win32"\\s+name="${quotedName}"\\s+version="${quotedName}"\\s+language="\\*"\\s*/></dependentAssembly></dependency>`,
+        "g",
+      );
+      manifest = manifest.replace(dependencyPattern, "");
+    }
+
+    if (manifest !== original) {
+      entry.bin = Buffer.from(manifest, "utf-8");
+      changed = true;
+    }
+  }
+
+  if (!changed) return;
+  resources.outputResource(exe);
+  fs.writeFileSync(exePath, Buffer.from(exe.generate()));
+  console.log("   [ok] stripped root-stub-breaking manifest dependency from Codex.exe");
+}
+
 function isCoveredByDefaultNuspec(entryName, exeName) {
   const lower = entryName.toLowerCase();
   if (lower === "locales" || lower === "resources") return true;
@@ -284,6 +326,7 @@ async function main() {
 
   const appDirectory = stageUpstreamApp(shortWorkspace);
   applyPatchedResources(appDirectory);
+  stripExternalAssemblyManifestDependencies(appDirectory, "Codex.exe");
   markSquirrelAware(appDirectory, "Codex.exe");
   const additionalFiles = collectAdditionalFiles(appDirectory, "Codex.exe");
   console.log(`-- additional root runtime entries: ${additionalFiles.length}`);

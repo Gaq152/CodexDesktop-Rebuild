@@ -43,7 +43,8 @@
     "@electron/rebuild": "^3.7.1",
     "acorn": "^8.16.0",
     "electron": "^42.0.1",
-    "fast-xml-parser": "^5.5.9"
+    "fast-xml-parser": "^5.5.9",
+    "resedit": "^3.0.2"
   },
   "dependencies": {
     "@sentry/electron": "^7.5.0",

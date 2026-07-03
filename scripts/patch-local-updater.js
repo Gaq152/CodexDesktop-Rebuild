@@ -48,7 +48,7 @@ function CodexRebuildWindowsBootstrap(){
     return!1;
   }
   let {app,autoUpdater,dialog}=electron;
-  let squirrelEvent=process.argv[1];
+  let squirrelEvent=process.argv.find(arg=>arg===\`--squirrel-install\`||arg===\`--squirrel-updated\`||arg===\`--squirrel-uninstall\`||arg===\`--squirrel-obsolete\`);
   let isSquirrelEvent=squirrelEvent===\`--squirrel-install\`||squirrelEvent===\`--squirrel-updated\`||squirrelEvent===\`--squirrel-uninstall\`||squirrelEvent===\`--squirrel-obsolete\`;
   if(isSquirrelEvent){
     try{
@@ -57,6 +57,14 @@ function CodexRebuildWindowsBootstrap(){
       let updateExe=path.resolve(path.join(rootFolder,\`Update.exe\`));
       let exeName=path.basename(process.execPath);
       if(squirrelEvent===\`--squirrel-install\`||squirrelEvent===\`--squirrel-updated\`){
+        try{
+          let fs=require(\`node:fs\`);
+          for(let name of fs.readdirSync(appFolder)){
+            if(name.toLowerCase().endsWith(\`.manifest\`)){
+              fs.copyFileSync(path.join(appFolder,name),path.join(rootFolder,name));
+            }
+          }
+        }catch{}
         childProcess.spawn(updateExe,[\`--createShortcut\`,exeName],{detached:!0,stdio:\`ignore\`}).unref();
       }else if(squirrelEvent===\`--squirrel-uninstall\`){
         childProcess.spawn(updateExe,[\`--removeShortcut\`,exeName],{detached:!0,stdio:\`ignore\`}).unref();
