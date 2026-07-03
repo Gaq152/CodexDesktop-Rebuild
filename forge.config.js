@@ -129,13 +129,24 @@ module.exports = {
         for (const d of MACOS_ONLY_DIRS) skip.add(d);
       }
       let copied = 0;
+      let skipped = 0;
+      const linuxSkyBinary = isLinux ? `sky_linux_${arch === "arm64" ? "arm64" : "x64"}` : null;
+      const shouldSkipLinuxResource = (filePath, fileName) => {
+        if (!isLinux) return false;
+        const normalized = filePath.split(path.sep).join("/");
+        return normalized.includes("/@oai/sky/bin/linux/") && fileName !== linuxSkyBinary;
+      };
 
       const copyDir = (s, d) => {
         fs.mkdirSync(d, { recursive: true });
         for (const e of fs.readdirSync(s, { withFileTypes: true })) {
           const sp = path.join(s, e.name), dp = path.join(d, e.name);
           if (e.isDirectory()) copyDir(sp, dp);
-          else if (!e.isSymbolicLink()) { fs.copyFileSync(sp, dp); copied++; }
+          else if (!e.isSymbolicLink()) {
+            if (shouldSkipLinuxResource(sp, e.name)) { skipped++; continue; }
+            fs.copyFileSync(sp, dp);
+            copied++;
+          }
         }
       };
 
@@ -149,12 +160,14 @@ module.exports = {
         if (entry.isDirectory()) {
           copyDir(srcPath, destPath);
         } else if (!entry.isSymbolicLink()) {
+          if (shouldSkipLinuxResource(srcPath, entry.name)) { skipped++; continue; }
           fs.copyFileSync(srcPath, destPath);
           try { fs.chmodSync(destPath, 0o755); } catch {}
           copied++;
         }
       }
 
+      if (skipped) console.log(`   [linux] skipped ${skipped} non-target helper files`);
       console.log(`   [ok] ${copied} files (app.asar + unpacked + resources)`);
     },
   },
