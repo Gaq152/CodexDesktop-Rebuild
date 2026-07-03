@@ -5,6 +5,7 @@
  * Two-layer patch:
  *   1. app-main chunk: inject "delete-conversation" route into the message router
  *   2. data-controls chunk: inject a red "Delete" button next to "Unarchive"
+ *      with inline two-step confirmation, not a native confirm() dialog
  *
  * The delete button calls the app-server "thread/delete" protocol via the
  * message router, which permanently removes the thread (DB + rollout file).
@@ -68,7 +69,18 @@ function patchDataControls(bundles) {
     }
 
     if (code.includes("delete-conversation")) {
-      console.log(`  [ok] ${relPath(bundle.path)}: delete button already patched`);
+      const legacyConfirm =
+        "onClick:async()=>{if(!confirm(`Permanently delete this conversation?`))return;try{";
+      if (!code.includes(legacyConfirm)) {
+        console.log(`  [ok] ${relPath(bundle.path)}: delete button already patched`);
+        continue;
+      }
+
+      const inlineConfirm =
+        "onClick:async e=>{let t=e.currentTarget;if(t.dataset.codexConfirmDelete!==`true`){t.dataset.codexConfirmDelete=`true`,t.textContent=`确认删除`,t.style.boxShadow=`inset 0 0 0 1px color-mix(in srgb, #ef4444 45%, transparent)`,clearTimeout(t.__codexDeleteTimer),t.__codexDeleteTimer=setTimeout(()=>{t.isConnected&&t.dataset.codexConfirmDelete===`true`&&(delete t.dataset.codexConfirmDelete,t.textContent=`删除`,t.style.boxShadow=``)},5e3);return}clearTimeout(t.__codexDeleteTimer);try{";
+      fs.writeFileSync(bundle.path, code.replace(legacyConfirm, inlineConfirm));
+      console.log(`  [ok] ${relPath(bundle.path)}: migrated delete button to inline confirmation`);
+      patched++;
       continue;
     }
 
@@ -243,8 +255,19 @@ function patchDataControls(bundles) {
         `color:\`secondary\`,`,
         `size:\`toolbar\`,`,
         `style:{color:\`#ef4444\`},`,
-        `onClick:async()=>{`,
-          `if(!confirm(\`Permanently delete this conversation?\`))return;`,
+        `onClick:async e=>{`,
+          `let t=e.currentTarget;`,
+          `if(t.dataset.codexConfirmDelete!==\`true\`){`,
+            `t.dataset.codexConfirmDelete=\`true\`,t.textContent=\`确认删除\`,`,
+            `t.style.boxShadow=\`inset 0 0 0 1px color-mix(in srgb, #ef4444 45%, transparent)\`,`,
+            `clearTimeout(t.__codexDeleteTimer),`,
+            `t.__codexDeleteTimer=setTimeout(()=>{`,
+              `t.isConnected&&t.dataset.codexConfirmDelete===\`true\`&&`,
+              `(delete t.dataset.codexConfirmDelete,t.textContent=\`删除\`,t.style.boxShadow=\`\`)`,
+            `},5e3);`,
+            `return`,
+          `}`,
+          `clearTimeout(t.__codexDeleteTimer);`,
           `try{`,
             `${queryClientVar}.setQueryData([\`archived-threads\`,${hostIdVar}],`,
               `(${queryClientVar}.getQueryData([\`archived-threads\`,${hostIdVar}])??[])`,
@@ -254,7 +277,7 @@ function patchDataControls(bundles) {
             `${queryClientVar}.invalidateQueries({queryKey:[\`archived-threads\`,${hostIdVar}]})`,
           `}`,
         `},`,
-        `children:\`Delete\``,
+        `children:\`删除\``,
       `})`,
     ].join("");
 

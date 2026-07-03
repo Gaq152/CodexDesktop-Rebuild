@@ -5,6 +5,11 @@
  * This uses the app's own "delete-conversation" message route, which is backed
  * by the app-server "thread/delete" protocol. The route itself is injected by
  * patch-archive-delete.js.
+ *
+ * The sidebar action uses an inline two-step confirmation instead of a native
+ * confirm() dialog: first click shows a row-level Confirm button, second click
+ * permanently deletes the thread, and moving the mouse out of the row restores
+ * the original delete action.
  */
 const fs = require("fs");
 const path = require("path");
@@ -43,15 +48,66 @@ function patchThreadActions(bundles) {
         /archiveThread:\{id:`sidebarElectron\.archiveThread`,defaultMessage:`Archive chat`,description:`Menu item to archive a local thread`\},/;
       const insert =
         "archiveThread:{id:`sidebarElectron.archiveThread`,defaultMessage:`Archive chat`,description:`Menu item to archive a local thread`}," +
-        "deleteThread:{id:`sidebarElectron.deleteThread`,defaultMessage:`Delete chat`,description:`Menu item to permanently delete a local thread`}," +
-        "deleteThreadConfirm:{id:`sidebarElectron.deleteThreadConfirm`,defaultMessage:`Permanently delete this chat?`,description:`Confirmation shown before permanently deleting a local thread`}," +
-        "deleteThreadError:{id:`sidebarElectron.deleteThreadError`,defaultMessage:`Failed to delete chat`,description:`Error message when permanently deleting a local thread`},";
+        "deleteThread:{id:`sidebarElectron.deleteThread`,defaultMessage:`删除对话`,description:`Menu item to permanently delete a local thread`}," +
+        "deleteThreadConfirm:{id:`sidebarElectron.deleteThreadConfirm`,defaultMessage:`确认删除？`,description:`Confirmation shown before permanently deleting a local thread`}," +
+        "deleteThreadConfirmAction:{id:`sidebarElectron.deleteThreadConfirmAction`,defaultMessage:`确认`,description:`Inline confirmation button label shown before permanently deleting a local thread`}," +
+        "deleteThreadError:{id:`sidebarElectron.deleteThreadError`,defaultMessage:`删除对话失败`,description:`Error message when permanently deleting a local thread`},";
 
       if (!archiveMessageRe.test(code)) {
         console.log(`  [!] ${relPath(bundle.path)}: archiveThread message not found`);
         continue;
       }
       code = code.replace(archiveMessageRe, insert);
+      changed = true;
+    }
+
+    const messageReplacements = [
+      [
+        "deleteThread:{id:`sidebarElectron.deleteThread`,defaultMessage:`Delete chat`,description:`Menu item to permanently delete a local thread`}",
+        "deleteThread:{id:`sidebarElectron.deleteThread`,defaultMessage:`删除对话`,description:`Menu item to permanently delete a local thread`}",
+      ],
+      [
+        "deleteThreadConfirm:{id:`sidebarElectron.deleteThreadConfirm`,defaultMessage:`Permanently delete this chat?`,description:`Confirmation shown before permanently deleting a local thread`}",
+        "deleteThreadConfirm:{id:`sidebarElectron.deleteThreadConfirm`,defaultMessage:`确认删除？`,description:`Confirmation shown before permanently deleting a local thread`}",
+      ],
+      [
+        "deleteThreadConfirm:{id:`sidebarElectron.deleteThreadConfirm`,defaultMessage:`永久删除这个对话？`,description:`Confirmation shown before permanently deleting a local thread`}",
+        "deleteThreadConfirm:{id:`sidebarElectron.deleteThreadConfirm`,defaultMessage:`确认删除？`,description:`Confirmation shown before permanently deleting a local thread`}",
+      ],
+      [
+        "deleteThreadError:{id:`sidebarElectron.deleteThreadError`,defaultMessage:`Failed to delete chat`,description:`Error message when permanently deleting a local thread`}",
+        "deleteThreadError:{id:`sidebarElectron.deleteThreadError`,defaultMessage:`删除对话失败`,description:`Error message when permanently deleting a local thread`}",
+      ],
+    ];
+    for (const [from, to] of messageReplacements) {
+      if (code.includes(from)) {
+        code = code.replace(from, to);
+        changed = true;
+      }
+    }
+
+    const confirmActionLong =
+      "deleteThreadConfirmAction:{id:`sidebarElectron.deleteThreadConfirmAction`,defaultMessage:`确认删除`,description:`Inline confirmation button label shown before permanently deleting a local thread`}";
+    if (code.includes(confirmActionLong)) {
+      code = code.replace(
+        confirmActionLong,
+        "deleteThreadConfirmAction:{id:`sidebarElectron.deleteThreadConfirmAction`,defaultMessage:`确认`,description:`Inline confirmation button label shown before permanently deleting a local thread`}",
+      );
+      changed = true;
+    }
+
+    if (!code.includes("deleteThreadConfirmAction")) {
+      const confirmMessageRe =
+        /deleteThreadConfirm:\{id:`sidebarElectron\.deleteThreadConfirm`,defaultMessage:`[^`]+`,description:`Confirmation shown before permanently deleting a local thread`\},/;
+      if (!confirmMessageRe.test(code)) {
+        console.log(`  [!] ${relPath(bundle.path)}: deleteThreadConfirm message not found`);
+        continue;
+      }
+      code = code.replace(
+        confirmMessageRe,
+        (match) =>
+          `${match}deleteThreadConfirmAction:{id:\`sidebarElectron.deleteThreadConfirmAction\`,defaultMessage:\`确认\`,description:\`Inline confirmation button label shown before permanently deleting a local thread\`},`,
+      );
       changed = true;
     }
 
@@ -163,7 +219,25 @@ function patchSidebarFlat(bundles) {
       changed = true;
     }
 
-    if (!code.includes("deleteAction:")) {
+    const inlineDeleteActions =
+      "function zl(e){let t=(0,Hl.c)(16),{archive:n,pinAction:r,deleteAction:i}=e,a=z(),o=i?.confirming??!1;" +
+      "if(n==null&&r==null&&i==null)return null;" +
+      "let s;t[0]!==r||t[1]!==o?(s=r==null||o?[]:[{id:`thread-pin-action`,ariaLabel:r.ariaLabel,icon:r.isPinned?(0,Wl.jsx)(Do,{className:`translate-x-px`}):(0,Wl.jsx)(Ba,{className:`translate-x-px`}),onClick:r.onClick}],t[0]=r,t[1]=o,t[2]=s):s=t[2];" +
+      "let c;t[3]!==n||t[4]!==a||t[5]!==o?(c=n==null||o?[]:[{id:`thread-primary-action`,ariaLabel:a.formatMessage(aa.archiveThread),icon:(0,Wl.jsx)(_o,{}),onClick:n}],t[3]=n,t[4]=a,t[5]=o,t[6]=c):c=t[6];" +
+      "let l;t[7]!==i||t[8]!==a||t[9]!==o?(l=i==null?[]:o?[{id:`thread-delete-confirm-action`,ariaLabel:a.formatMessage(aa.deleteThreadConfirmAction),label:a.formatMessage(aa.deleteThreadConfirmAction),color:`secondary`,buttonClassName:`text-token-error-foreground hover:text-token-error-foreground`,onClick:i.onConfirm}]:[{id:`thread-delete-action`,ariaLabel:a.formatMessage(aa.deleteThread),buttonClassName:`text-token-error-foreground hover:text-token-error-foreground`,icon:(0,Wl.jsx)(CodexTrashIcon,{}),onClick:i.onRequest}],t[7]=i,t[8]=a,t[9]=o,t[10]=l):l=t[10];" +
+      "let u;return t[11]!==s||t[12]!==c||t[13]!==l||t[14]!==o?(u=(0,Wl.jsx)(fl,{actions:[...s,...c,...l],className:V(Za,o&&`opacity-100`)}),t[11]=s,t[12]=c,t[13]=l,t[14]=o,t[15]=u):u=t[15],u}";
+    const legacyDeleteActions =
+      "function zl(e){let t=(0,Hl.c)(12),{archive:n,pinAction:r,deleteAction:i}=e,a=z();" +
+      "if(n==null&&r==null&&i==null)return null;" +
+      "let o;t[0]===r?o=t[1]:(o=r==null?[]:[{id:`thread-pin-action`,ariaLabel:r.ariaLabel,icon:r.isPinned?(0,Wl.jsx)(Do,{className:`translate-x-px`}):(0,Wl.jsx)(Ba,{className:`translate-x-px`}),onClick:r.onClick}],t[0]=r,t[1]=o);" +
+      "let s;t[2]!==n||t[3]!==a?(s=n==null?[]:[{id:`thread-primary-action`,ariaLabel:a.formatMessage(aa.archiveThread),icon:(0,Wl.jsx)(_o,{}),onClick:n}],t[2]=n,t[3]=a,t[4]=s):s=t[4];" +
+      "let c;t[5]!==i||t[6]!==a?(c=i==null?[]:[{id:`thread-delete-action`,ariaLabel:a.formatMessage(aa.deleteThread),buttonClassName:`text-token-error-foreground hover:text-token-error-foreground`,icon:(0,Wl.jsx)(CodexTrashIcon,{}),onClick:i}],t[5]=i,t[6]=a,t[7]=c):c=t[7];" +
+      "let l;return t[8]!==o||t[9]!==s||t[10]!==c?(l=(0,Wl.jsx)(fl,{actions:[...o,...s,...c],className:Za}),t[8]=o,t[9]=s,t[10]=c,t[11]=l):l=t[11],l}";
+
+    if (code.includes(legacyDeleteActions)) {
+      code = code.replace(legacyDeleteActions, inlineDeleteActions);
+      changed = true;
+    } else if (!code.includes("deleteAction:")) {
       const ast = parse(code, bundle.path);
       if (!ast) continue;
 
@@ -181,16 +255,28 @@ function patchSidebarFlat(bundles) {
         continue;
       }
 
-      const replacement =
-        "function zl(e){let t=(0,Hl.c)(12),{archive:n,pinAction:r,deleteAction:i}=e,a=z();" +
-        "if(n==null&&r==null&&i==null)return null;" +
-        "let o;t[0]===r?o=t[1]:(o=r==null?[]:[{id:`thread-pin-action`,ariaLabel:r.ariaLabel,icon:r.isPinned?(0,Wl.jsx)(Do,{className:`translate-x-px`}):(0,Wl.jsx)(Ba,{className:`translate-x-px`}),onClick:r.onClick}],t[0]=r,t[1]=o);" +
-        "let s;t[2]!==n||t[3]!==a?(s=n==null?[]:[{id:`thread-primary-action`,ariaLabel:a.formatMessage(aa.archiveThread),icon:(0,Wl.jsx)(_o,{}),onClick:n}],t[2]=n,t[3]=a,t[4]=s):s=t[4];" +
-        "let c;t[5]!==i||t[6]!==a?(c=i==null?[]:[{id:`thread-delete-action`,ariaLabel:a.formatMessage(aa.deleteThread),buttonClassName:`text-token-error-foreground hover:text-token-error-foreground`,icon:(0,Wl.jsx)(CodexTrashIcon,{}),onClick:i}],t[5]=i,t[6]=a,t[7]=c):c=t[7];" +
-        "let l;return t[8]!==o||t[9]!==s||t[10]!==c?(l=(0,Wl.jsx)(fl,{actions:[...o,...s,...c],className:Za}),t[8]=o,t[9]=s,t[10]=c,t[11]=l):l=t[11],l}";
-
-      code = code.slice(0, hoverActionsFn.start) + replacement + code.slice(hoverActionsFn.end);
+      code = code.slice(0, hoverActionsFn.start) + inlineDeleteActions + code.slice(hoverActionsFn.end);
       changed = true;
+    }
+
+    if (code.includes("ariaLabel:`Confirm delete`,label:`Confirm`")) {
+      code = code.replace(
+        "ariaLabel:`Confirm delete`,label:`Confirm`",
+        "ariaLabel:a.formatMessage(aa.deleteThreadConfirmAction),label:a.formatMessage(aa.deleteThreadConfirmAction)",
+      );
+      changed = true;
+    }
+
+    const stateAnchor = "[x,S]=(0,Ul.useState)(!1),C=z(),";
+    if (code.includes(stateAnchor) && !code.includes("CodexDeleteConfirm")) {
+      code = code.replace(
+        stateAnchor,
+        "[x,S]=(0,Ul.useState)(!1),[CodexDeleteConfirm,CodexSetDeleteConfirm]=(0,Ul.useState)(!1),C=z(),",
+      );
+      changed = true;
+    } else if (!code.includes("CodexDeleteConfirm")) {
+      console.log(`  [!] ${relPath(bundle.path)}: delete confirmation state anchor not found`);
+      continue;
     }
 
     const actionDestructure =
@@ -211,10 +297,23 @@ function patchSidebarFlat(bundles) {
     if (code.includes(archiveHandler)) {
       const deleteHandler =
         "Ce=()=>{Q(),F({conversationId:e,hostId:g?.hostId,source:`sidebar_context_menu`,onArchiveSuccess:te,onArchiveError:ne})}," +
-        "CodexHandleDelete=ie(()=>{if(!confirm(C.formatMessage(aa.deleteThreadConfirm)))return;Q(),CodexDeleteThread({conversationId:e,hostId:g?.hostId,onDeleteSuccess:()=>{te(),G&&y(`/`,{replace:!0,state:{focusComposerNonce:Date.now(),prefillCwd:w}})},onDeleteError:ne})}),we=ie(()=>{";
+        "CodexConfirmDelete=ie(()=>{CodexSetDeleteConfirm(!1),Q(),CodexDeleteThread({conversationId:e,hostId:g?.hostId,onDeleteSuccess:()=>{te(),G&&y(`/`,{replace:!0,state:{focusComposerNonce:Date.now(),prefillCwd:w}})},onDeleteError:ne})})," +
+        "CodexRequestDelete=ie(()=>{CodexSetDeleteConfirm(!0)}),we=ie(()=>{";
       code = code.replace(archiveHandler, deleteHandler);
       changed = true;
-    } else if (!code.includes("CodexHandleDelete")) {
+    } else if (code.includes("CodexHandleDelete=ie(()=>{if(!confirm(C.formatMessage(aa.deleteThreadConfirm)))return;")) {
+      code = code.replace(
+        "CodexHandleDelete=ie(()=>{if(!confirm(C.formatMessage(aa.deleteThreadConfirm)))return;Q(),CodexDeleteThread({conversationId:e,hostId:g?.hostId,onDeleteSuccess:()=>{te(),G&&y(`/`,{replace:!0,state:{focusComposerNonce:Date.now(),prefillCwd:w}})},onDeleteError:ne})}),",
+        "CodexConfirmDelete=ie(()=>{CodexSetDeleteConfirm(!1),Q(),CodexDeleteThread({conversationId:e,hostId:g?.hostId,onDeleteSuccess:()=>{te(),G&&y(`/`,{replace:!0,state:{focusComposerNonce:Date.now(),prefillCwd:w}})},onDeleteError:ne})}),CodexRequestDelete=ie(()=>{CodexSetDeleteConfirm(!0)}),",
+      );
+      changed = true;
+    } else if (code.includes("CodexRequestDelete=ie(()=>{CodexSetDeleteConfirm(!0),setTimeout(()=>CodexSetDeleteConfirm(!1),5e3)})")) {
+      code = code.replace(
+        "CodexRequestDelete=ie(()=>{CodexSetDeleteConfirm(!0),setTimeout(()=>CodexSetDeleteConfirm(!1),5e3)})",
+        "CodexRequestDelete=ie(()=>{CodexSetDeleteConfirm(!0)})",
+      );
+      changed = true;
+    } else if (!code.includes("CodexConfirmDelete")) {
       console.log(`  [!] ${relPath(bundle.path)}: sidebar archive handler not found`);
       continue;
     }
@@ -223,7 +322,13 @@ function patchSidebarFlat(bundles) {
     if (code.includes(archiveMenu) && !code.includes("id:`delete-thread`")) {
       code = code.replace(
         archiveMenu,
-        `${archiveMenu}{id:\`delete-thread\`,message:aa.deleteThread,onSelect:CodexHandleDelete},`,
+        `${archiveMenu}{id:\`delete-thread\`,message:aa.deleteThread,onSelect:CodexRequestDelete},`,
+      );
+      changed = true;
+    } else if (code.includes("{id:`delete-thread`,message:aa.deleteThread,onSelect:CodexHandleDelete}")) {
+      code = code.replace(
+        "{id:`delete-thread`,message:aa.deleteThread,onSelect:CodexHandleDelete}",
+        "{id:`delete-thread`,message:aa.deleteThread,onSelect:CodexRequestDelete}",
       );
       changed = true;
     } else if (!code.includes("id:`delete-thread`")) {
@@ -236,10 +341,16 @@ function patchSidebarFlat(bundles) {
     if (code.includes(renderActions)) {
       code = code.replace(
         renderActions,
-        "je=(0,Ul.useCallback)(({archive:t})=>(0,Wl.jsx)(zl,{archive:t!=null&&xe?we:t,deleteAction:CodexHandleDelete,pinAction:Ae?{ariaLabel:C.formatMessage(n?_a:Ta),isPinned:n,onClick:()=>{ta(v,e,!n)}}:void 0}),[we,xe,C,n,e,v,Ae,CodexHandleDelete])",
+        "je=(0,Ul.useCallback)(({archive:t})=>(0,Wl.jsx)(zl,{archive:t!=null&&xe?we:t,deleteAction:{confirming:CodexDeleteConfirm,onRequest:CodexRequestDelete,onConfirm:CodexConfirmDelete},pinAction:Ae?{ariaLabel:C.formatMessage(n?_a:Ta),isPinned:n,onClick:()=>{ta(v,e,!n)}}:void 0}),[we,xe,C,n,e,v,Ae,CodexDeleteConfirm,CodexRequestDelete,CodexConfirmDelete])",
       );
       changed = true;
-    } else if (!code.includes("deleteAction:CodexHandleDelete")) {
+    } else if (code.includes("deleteAction:CodexHandleDelete")) {
+      code = code.replace(
+        "je=(0,Ul.useCallback)(({archive:t})=>(0,Wl.jsx)(zl,{archive:t!=null&&xe?we:t,deleteAction:CodexHandleDelete,pinAction:Ae?{ariaLabel:C.formatMessage(n?_a:Ta),isPinned:n,onClick:()=>{ta(v,e,!n)}}:void 0}),[we,xe,C,n,e,v,Ae,CodexHandleDelete])",
+        "je=(0,Ul.useCallback)(({archive:t})=>(0,Wl.jsx)(zl,{archive:t!=null&&xe?we:t,deleteAction:{confirming:CodexDeleteConfirm,onRequest:CodexRequestDelete,onConfirm:CodexConfirmDelete},pinAction:Ae?{ariaLabel:C.formatMessage(n?_a:Ta),isPinned:n,onClick:()=>{ta(v,e,!n)}}:void 0}),[we,xe,C,n,e,v,Ae,CodexDeleteConfirm,CodexRequestDelete,CodexConfirmDelete])",
+      );
+      changed = true;
+    } else if (!code.includes("onConfirm:CodexConfirmDelete")) {
       console.log(`  [!] ${relPath(bundle.path)}: renderActions callback not found`);
       continue;
     }
@@ -248,8 +359,28 @@ function patchSidebarFlat(bundles) {
     if (code.includes(hoverCount)) {
       code = code.replace(hoverCount, "additionalHoverActionCount:(Ae?1:0)+1,");
       changed = true;
-    } else if (!code.includes("additionalHoverActionCount:(Ae?1:0)+1")) {
+    } else if (code.includes("additionalHoverActionCount:(Ae?1:0)+1")) {
+      // Already reserves one slot for the delete/confirm action.
+    } else if (code.includes("additionalHoverActionCount:(Ae?1:0)+(CodexDeleteConfirm?3:1)")) {
+      code = code.replace(
+        "additionalHoverActionCount:(Ae?1:0)+(CodexDeleteConfirm?3:1)",
+        "additionalHoverActionCount:(Ae?1:0)+1",
+      );
+      changed = true;
+    } else {
       console.log(`  [!] ${relPath(bundle.path)}: hover action count not found`);
+      continue;
+    }
+
+    const legacyReturn =
+      "return(0,Wl.jsxs)(Wl.Fragment,{children:[re?Me:(0,Wl.jsx)(pe,{getItems:ke,children:Me}),x?(0,Wl.jsx)(ha,{heartbeatAutomationName:be,open:!0,onOpenChange:S,onConfirm:Te}):null]})";
+    const leaveReturn =
+      "let CodexRow=re?Me:(0,Wl.jsx)(pe,{getItems:ke,children:Me});return(0,Wl.jsxs)(Wl.Fragment,{children:[(0,Wl.jsx)(`div`,{onMouseLeave:()=>CodexSetDeleteConfirm(!1),children:CodexRow}),x?(0,Wl.jsx)(ha,{heartbeatAutomationName:be,open:!0,onOpenChange:S,onConfirm:Te}):null]})";
+    if (code.includes(legacyReturn)) {
+      code = code.replace(legacyReturn, leaveReturn);
+      changed = true;
+    } else if (!code.includes("onMouseLeave:()=>CodexSetDeleteConfirm(!1)")) {
+      console.log(`  [!] ${relPath(bundle.path)}: sidebar row return not found`);
       continue;
     }
 
