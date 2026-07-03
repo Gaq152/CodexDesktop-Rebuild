@@ -2,6 +2,8 @@ const { FuseV1Options, FuseVersion } = require("@electron/fuses");
 const path = require("path");
 const fs = require("fs");
 
+const WINDOWS_REMOTE_RELEASES = process.env.CODEX_REBUILD_REMOTE_RELEASES || "";
+
 module.exports = {
   packagerConfig: {
     name: "Codex",
@@ -63,8 +65,11 @@ module.exports = {
         name: "Codex",
         authors: "OpenAI, Cometix Space",
         description: "Codex Desktop App",
+        setupExe: "CodexSetup.exe",
+        noMsi: true,
         setupIcon: "./resources/electron.ico",
-        iconUrl: "https://raw.githubusercontent.com/Haleclipse/CodexDesktop-Rebuild/master/resources/electron.ico",
+        iconUrl: "https://raw.githubusercontent.com/Gaq152/CodexDesktop-Rebuild/master/resources/electron.ico",
+        remoteReleases: WINDOWS_REMOTE_RELEASES || undefined,
       },
     },
     { name: "@electron-forge/maker-zip", platforms: ["win32"] },

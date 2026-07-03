@@ -50,6 +50,35 @@ function copyRecursive(src, dest, skipFiles, skipDirs) {
   return count;
 }
 
+function ensureWindowsExtraResources(sourceDir) {
+  const requiredUnpacked = path.join(sourceDir, "app.asar.unpacked");
+  if (fs.existsSync(requiredUnpacked)) return;
+
+  const cachedResources = path.join(require("os").tmpdir(), "codex-sync", "win-extract", "app", "resources");
+  if (fs.existsSync(cachedResources)) {
+    let restored = 0;
+    for (const entry of fs.readdirSync(cachedResources, { withFileTypes: true })) {
+      if (entry.name === "app.asar" || entry.name.endsWith(".lproj")) continue;
+      const srcPath = path.join(cachedResources, entry.name);
+      const destPath = path.join(sourceDir, entry.name);
+      if (fs.existsSync(destPath)) continue;
+      if (entry.isDirectory()) restored += copyRecursive(srcPath, destPath);
+      else if (!entry.isSymbolicLink()) {
+        fs.copyFileSync(srcPath, destPath);
+        restored++;
+      }
+    }
+    if (restored > 0) {
+      console.log(`   [win] restored ${restored} missing resource files from MSIX cache`);
+    }
+  }
+
+  if (!fs.existsSync(requiredUnpacked)) {
+    console.error("[x] Windows resources are incomplete. Run sync-upstream.js --force --skip-mac before building the installer.");
+    process.exit(1);
+  }
+}
+
 /**
  * Ensure the @cometix/codex platform package is extracted to a temp dir.
  * Returns the vendor root path (e.g. .../vendor/{triple}/) or null.
@@ -180,6 +209,10 @@ function main() {
     console.log(`   [codex] replaced with @cometix/codex`);
   } else {
     console.log(`   [!] @cometix/codex vendor not found for ${platform}, keeping upstream`);
+  }
+
+  if (isWin) {
+    ensureWindowsExtraResources(sourceDir);
   }
 
   // 2b. For Linux: replace rg with platform-native version from @cometix/codex

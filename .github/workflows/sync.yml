@@ -159,14 +159,34 @@ jobs:
       - name: Patch
         run: node scripts/patch-all.js win
 
+      - name: Enable Squirrel delta source
+        shell: pwsh
+        run: |
+          $feed = "https://gaq152.github.io/CodexDesktop-Rebuild/updates/win32/x64"
+          try {
+            Invoke-WebRequest "$feed/RELEASES" -Method Head -UseBasicParsing -TimeoutSec 20 | Out-Null
+            "CODEX_REBUILD_REMOTE_RELEASES=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            "CODEX_REBUILD_UPDATE_URL=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            Write-Host "Using previous Squirrel feed for delta packages: $feed"
+          } catch {
+            Write-Host "No previous Squirrel feed found; building full package only."
+          }
+
       - name: Build
         run: npm run build:win-x64
+
+      - name: Build installer
+        run: npm run build:win-installer
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: Codex-Windows-x64
-          path: out/*.zip
+          path: |
+            out/*.zip
+            out/make/squirrel.windows/x64/*.exe
+            out/make/squirrel.windows/x64/RELEASES
+            out/make/squirrel.windows/x64/*.nupkg
           if-no-files-found: error
 
   build-linux:
@@ -298,6 +318,8 @@ jobs:
             artifacts/**/*.deb
             artifacts/**/*.rpm
             artifacts/**/*.exe
+            artifacts/**/*.nupkg
+            artifacts/**/RELEASES
           draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

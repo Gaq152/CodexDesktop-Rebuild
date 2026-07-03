@@ -62,11 +62,28 @@ jobs:
           echo "C:\Program Files\7-Zip" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - run: node scripts/sync-upstream.js --force --skip-mac
       - run: node scripts/patch-all.js win
+      - name: Enable Squirrel delta source
+        shell: pwsh
+        run: |
+          $feed = "https://gaq152.github.io/CodexDesktop-Rebuild/updates/win32/x64"
+          try {
+            Invoke-WebRequest "$feed/RELEASES" -Method Head -UseBasicParsing -TimeoutSec 20 | Out-Null
+            "CODEX_REBUILD_REMOTE_RELEASES=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            "CODEX_REBUILD_UPDATE_URL=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            Write-Host "Using previous Squirrel feed for delta packages: $feed"
+          } catch {
+            Write-Host "No previous Squirrel feed found; building full package only."
+          }
       - run: npm run build:win-x64
+      - run: npm run build:win-installer
       - uses: actions/upload-artifact@v7
         with:
           name: Codex-Windows-x64
-          path: out/*.zip
+          path: |
+            out/*.zip
+            out/make/squirrel.windows/x64/*.exe
+            out/make/squirrel.windows/x64/RELEASES
+            out/make/squirrel.windows/x64/*.nupkg
           if-no-files-found: error
 
   build-linux:
@@ -105,6 +122,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v6
 
@@ -174,6 +196,24 @@ jobs:
             artifacts/**/*.zip
             artifacts/**/*.deb
             artifacts/**/*.rpm
+            artifacts/**/*.exe
+            artifacts/**/*.nupkg
+            artifacts/**/RELEASES
           fail_on_unmatched_files: true
           draft: false
           make_latest: true
+
+      - name: Prepare Windows update feed
+        run: |
+          set -euo pipefail
+          mkdir -p update-feed/updates/win32/x64
+          find artifacts -type f \( -name 'RELEASES' -o -name '*.nupkg' \) -exec cp {} update-feed/updates/win32/x64/ \;
+          find update-feed -type f -print
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: update-feed
+
+      - name: Deploy Windows update feed
+        id: deployment
+        uses: actions/deploy-pages@v4
