@@ -210,6 +210,49 @@ function applyPatchedResources(appDirectory) {
   console.log("   [ok] patched upstream app resources");
 }
 
+function isCoveredByDefaultNuspec(entryName, exeName) {
+  const lower = entryName.toLowerCase();
+  if (lower === "locales" || lower === "resources") return true;
+  if (lower === exeName.toLowerCase()) return true;
+  if (lower === "squirrel.exe" || lower === "license" || lower === "icudtl.dat") return true;
+  if (lower === "vk_swiftshader_icd.json") return true;
+  if (lower.endsWith(".bin") || lower.endsWith(".dll") || lower.endsWith(".pak")) return true;
+  if (lower.endsWith(".exe.config") || lower.endsWith(".exe.sig")) return true;
+  return false;
+}
+
+function collectAdditionalFiles(appDirectory, exeName) {
+  const additionalFiles = [];
+  for (const entry of fs.readdirSync(appDirectory, { withFileTypes: true })) {
+    if (isCoveredByDefaultNuspec(entry.name, exeName)) continue;
+
+    if (entry.isDirectory()) {
+      additionalFiles.push({
+        src: `${entry.name}\\**`,
+        target: `lib\\net45\\${entry.name}`,
+      });
+    } else if (!entry.isSymbolicLink()) {
+      additionalFiles.push({
+        src: entry.name,
+        target: "lib\\net45",
+      });
+    }
+  }
+
+  return additionalFiles;
+}
+
+function markSquirrelAware(appDirectory, exeName) {
+  const rcedit = path.join(PROJECT_ROOT, "node_modules", "electron-winstaller", "vendor", "rcedit.exe");
+  const exePath = path.join(appDirectory, exeName);
+  if (!fs.existsSync(rcedit) || !fs.existsSync(exePath)) return;
+
+  execFileSync(rcedit, [exePath, "--set-version-string", "SquirrelAwareVersion", "1"], {
+    stdio: "inherit",
+  });
+  console.log("   [ok] marked Codex.exe as Squirrel-aware");
+}
+
 function getPatchedAppVersion() {
   const packageJsonPath = path.join(PROJECT_ROOT, "src", "win", "_asar", "package.json");
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
@@ -241,6 +284,9 @@ async function main() {
 
   const appDirectory = stageUpstreamApp(shortWorkspace);
   applyPatchedResources(appDirectory);
+  markSquirrelAware(appDirectory, "Codex.exe");
+  const additionalFiles = collectAdditionalFiles(appDirectory, "Codex.exe");
+  console.log(`-- additional root runtime entries: ${additionalFiles.length}`);
   const installerVersion = process.env.CODEX_REBUILD_INSTALLER_VERSION || getPatchedAppVersion();
   console.log(`-- installer version: ${installerVersion}`);
 
@@ -254,6 +300,7 @@ async function main() {
     description: "Codex Desktop App",
     version: installerVersion,
     exe: "Codex.exe",
+    additionalFiles,
     setupExe: "CodexSetup.exe",
     noMsi: true,
     skipUpdateIcon: true,
