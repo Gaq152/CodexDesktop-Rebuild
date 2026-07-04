@@ -13,6 +13,7 @@ const path = require("path");
 
 const PATCHES = [
   "patch-i18n.js",
+  "patch-native-menu-i18n.js",
   "patch-copyright.js",
   "patch-devtools.js",
   "patch-fast-mode.js",
