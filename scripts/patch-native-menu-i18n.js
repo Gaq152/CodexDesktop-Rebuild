@@ -16,6 +16,15 @@ const path = require("path");
 const { locateBundles, relPath } = require("./patch-util");
 
 const MENU_LABEL_KEYS = ["label", "menuTitle"];
+const ROLE_LABEL_TRANSLATIONS = [
+  ["undo", "撤销"],
+  ["redo", "重做"],
+  ["cut", "剪切"],
+  ["copy", "复制"],
+  ["paste", "粘贴"],
+  ["delete", "删除"],
+  ["selectAll", "全选"],
+];
 const DIRECT_LITERAL_TRANSLATIONS = [
   ["Start Performance Trace", "开始性能跟踪"],
   ["Stop Performance Trace", "停止性能跟踪"],
@@ -130,6 +139,64 @@ function templateLiteral(value) {
   return "`" + value.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${") + "`";
 }
 
+function editMenuSubmenuSource() {
+  const items = [
+    ...ROLE_LABEL_TRANSLATIONS.slice(0, 2).map(
+      ([role, label]) => `{label:${templateLiteral(label)},role:${templateLiteral(role)}}`,
+    ),
+    "{type:`separator`}",
+    ...ROLE_LABEL_TRANSLATIONS.slice(2, 6).map(
+      ([role, label]) => `{label:${templateLiteral(label)},role:${templateLiteral(role)}}`,
+    ),
+    "{type:`separator`}",
+    `{label:${templateLiteral("全选")},role:${templateLiteral("selectAll")}}`,
+  ];
+  return `[${items.join(",")}]`;
+}
+
+function removeFlatRoleProperty(body, role) {
+  let next = body;
+  for (const literal of jsStringLiteralVariants(role)) {
+    next = next.replace(new RegExp(`^\\s*role\\s*:\\s*${escapeRegex(literal)}\\s*,?\\s*`), "");
+    next = next.replace(new RegExp(`\\s*,\\s*role\\s*:\\s*${escapeRegex(literal)}\\s*(?=\\s*,|\\s*$)`), "");
+  }
+  return next.trim().replace(/^,|,$/g, "").trim();
+}
+
+function patchEditRoleMenuItems(code, replacements) {
+  const rolePattern = jsStringLiteralVariants("editMenu").map(escapeRegex).join("|");
+  const pattern = new RegExp(
+    `\\{(?=[^{}]*\\brole\\s*:\\s*(?:${rolePattern}))(?![^{}]*\\bsubmenu\\s*:)([^{}]*)\\}`,
+    "g",
+  );
+  return code.replace(pattern, (match, body) => {
+    const bodyWithoutRole = removeFlatRoleProperty(body, "editMenu");
+    const hasLabel = /\blabel\s*:/.test(bodyWithoutRole);
+    const props = [
+      ...(hasLabel ? [] : [`label:${templateLiteral("编辑")}`]),
+      ...(bodyWithoutRole ? [bodyWithoutRole] : []),
+      `submenu:${editMenuSubmenuSource()}`,
+    ];
+    replacements.push({ key: "roleMenu", from: "editMenu", to: "编辑" });
+    return `{${props.join(",")}}`;
+  });
+}
+
+function patchRoleCommandLabels(code, replacements) {
+  for (const [role, label] of ROLE_LABEL_TRANSLATIONS) {
+    const rolePattern = jsStringLiteralVariants(role).map(escapeRegex).join("|");
+    const pattern = new RegExp(
+      `\\{(?=[^{}]*\\brole\\s*:\\s*(?:${rolePattern}))(?![^{}]*\\blabel\\s*:)([^{}]*)\\}`,
+      "g",
+    );
+    code = code.replace(pattern, (match, body) => {
+      replacements.push({ key: "role", from: role, to: label });
+      return `{label:${templateLiteral(label)},${body}}`;
+    });
+  }
+  return code;
+}
+
 function patchSource(source) {
   let code = source;
   const replacements = [];
@@ -145,6 +212,9 @@ function patchSource(source) {
       }
     }
   }
+
+  code = patchEditRoleMenuItems(code, replacements);
+  code = patchRoleCommandLabels(code, replacements);
 
   for (const [from, to] of DIRECT_LITERAL_TRANSLATIONS) {
     for (const literal of jsStringLiteralVariants(from)) {
