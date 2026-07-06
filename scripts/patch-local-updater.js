@@ -207,6 +207,10 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
       transientTimer.unref?.();
     }
   };
+  let isDownloadComplete=(done,total)=>{
+    let d=Number(done),t=Number(total);
+    return Number.isFinite(d)&&Number.isFinite(t)&&t>0&&d>=t;
+  };
   let updateProgress=()=>{
     if(!downloading)return;
     let file=state.activeDownloadFile||state.updateFile||(state.updateVersion?('Codex-'+state.updateVersion+'-full.nupkg'):null);
@@ -234,7 +238,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
       }catch{}
     }
     let elapsedMs=state.downloadStartedAt?Date.now()-state.downloadStartedAt:null;
-    setStatus('downloading',{downloadedBytes,elapsedMs,activeDownloadFile:file,activeDownloadSize});
+    setStatus(isDownloadComplete(downloadedBytes,activeDownloadSize)?'preparing':'downloading',{downloadedBytes,elapsedMs,activeDownloadFile:file,activeDownloadSize});
   };
   let startProgress=()=>{
     if(progressTimer!=null)clearInterval(progressTimer);
@@ -399,6 +403,7 @@ function makePreloadPatch() {
       checking:'检查中...',
       available:'有新版本',
       downloading:'正在下载更新...',
+      preparing:'正在准备更新...',
       ready:'重启安装',
       noUpdate:'已是最新版本',
       error:'检查失败',
@@ -406,12 +411,14 @@ function makePreloadPatch() {
       tooltipChecking:'正在检查更新',
       tooltipAvailable:'发现新版本，点击查看',
       tooltipDownloading:'正在下载更新，点击查看进度',
+      tooltipPreparing:'下载完成，正在准备更新',
       tooltipReady:'更新已就绪，点击查看',
       tooltipNoUpdate:'当前已经是最新版本',
       tooltipError:'更新检查失败，点击查看',
       titleChecking:'正在检查更新',
       titleAvailable:'发现新版本',
       titleDownloading:'正在下载更新',
+      titlePreparing:'正在准备更新',
       titleReady:'更新已下载',
       titleError:'检查更新失败',
       currentVersion:'当前版本',
@@ -428,12 +435,14 @@ function makePreloadPatch() {
       later:'稍后',
       unknown:'-',
       availableBody:'确认后开始下载，下载完成后再重启安装。',
+      preparingBody:'下载已完成，正在合并差分包并准备安装。',
       readyBody:'重启 Codex 后会自动完成安装。'
     }:{
       idle:'Check updates',
       checking:'Checking...',
       available:'Update available',
       downloading:'Downloading update...',
+      preparing:'Preparing update...',
       ready:'Restart to update',
       noUpdate:'Up to date',
       error:'Update failed',
@@ -441,12 +450,14 @@ function makePreloadPatch() {
       tooltipChecking:'Checking for updates',
       tooltipAvailable:'Update available. Click for details',
       tooltipDownloading:'Downloading update. Click for progress',
+      tooltipPreparing:'Download complete. Preparing update',
       tooltipReady:'Update ready. Click for details',
       tooltipNoUpdate:'Codex is up to date',
       tooltipError:'Update check failed. Click for details',
       titleChecking:'Checking for updates',
       titleAvailable:'Update available',
       titleDownloading:'Downloading update',
+      titlePreparing:'Preparing update',
       titleReady:'Update downloaded',
       titleError:'Update check failed',
       currentVersion:'Current version',
@@ -463,6 +474,7 @@ function makePreloadPatch() {
       later:'Later',
       unknown:'-',
       availableBody:'Download starts only after you confirm. Restart after the download finishes.',
+      preparingBody:'Download complete. Preparing the update package.',
       readyBody:'Restart Codex to finish installing the update.'
     };
     const escapeHtml=value=>String(value==null?text.unknown:value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
@@ -503,8 +515,8 @@ function makePreloadPatch() {
       '.trigger:hover,.trigger.open{opacity:1;background:color-mix(in srgb,var(--color-token-main-surface-primary,#111827) 96%,white 4%);transform:translateY(1px)}',
       '.mark{width:7px;height:7px;border-radius:999px;background:currentColor;opacity:.75;flex:0 0 auto}',
       '.label{overflow:hidden;text-overflow:ellipsis}',
-      '.checking,.downloading{color:var(--color-token-text-primary,#f3f4f6);opacity:.9}',
-      '.checking .mark,.downloading .mark{width:10px;height:10px;border:2px solid currentColor;border-top-color:transparent;background:transparent;animation:codex-rebuild-spin .8s linear infinite}',
+      '.checking,.downloading,.preparing{color:var(--color-token-text-primary,#f3f4f6);opacity:.9}',
+      '.checking .mark,.downloading .mark,.preparing .mark{width:10px;height:10px;border:2px solid currentColor;border-top-color:transparent;background:transparent;animation:codex-rebuild-spin .8s linear infinite}',
       '.available{color:#f59e0b;border-color:color-mix(in srgb,#f59e0b 55%,transparent);background:color-mix(in srgb,#f59e0b 12%,var(--color-token-main-surface-primary,#111827));opacity:1}',
       '.ready{color:#10b981;border-color:color-mix(in srgb,#10b981 55%,transparent);background:color-mix(in srgb,#10b981 14%,var(--color-token-main-surface-primary,#111827));opacity:1}',
       '.no-update{color:#60a5fa;border-color:color-mix(in srgb,#60a5fa 45%,transparent);opacity:1}',
@@ -546,11 +558,12 @@ function makePreloadPatch() {
       if(status==='available'){
         return '<div class="title">'+escapeHtml(text.titleAvailable)+'</div><p class="body">'+escapeHtml(text.availableBody)+'</p>'+row(text.currentVersion,currentVersion)+row(text.newVersion,updateVersion)+row(text.packageSize,formatBytes(state.updateSize))+'<div class="actions">'+action('close',text.cancel,'subtle')+action('download',text.update,'primary')+'</div>';
       }
-      if(status==='downloading'){
+      if(status==='downloading'||status==='preparing'){
         const pct=progressOf(state);
         const pctText=pct==null?text.unknown:Math.floor(pct)+'%';
         const width=pct==null?8:pct;
-        return '<div class="title">'+escapeHtml(text.titleDownloading)+'</div>'+row(text.currentVersion,currentVersion)+row(text.newVersion,updateVersion)+row(text.progress,pctText)+'<div class="meter" aria-hidden="true"><span style="width:'+Math.max(3,Math.min(100,width))+'%"></span></div>'+row(text.downloaded,formatBytes(state.downloadedBytes)+' / '+formatBytes(total))+row(text.elapsed,formatElapsed(state.elapsedMs))+'<div class="actions">'+action('close',text.close,'subtle')+'</div>';
+        const preparing=status==='preparing';
+        return '<div class="title">'+escapeHtml(preparing?text.titlePreparing:text.titleDownloading)+'</div>'+(preparing?'<p class="body">'+escapeHtml(text.preparingBody)+'</p>':'')+row(text.currentVersion,currentVersion)+row(text.newVersion,updateVersion)+row(text.progress,pctText)+'<div class="meter" aria-hidden="true"><span style="width:'+Math.max(3,Math.min(100,width))+'%"></span></div>'+row(text.downloaded,formatBytes(state.downloadedBytes)+' / '+formatBytes(total))+row(text.elapsed,formatElapsed(state.elapsedMs))+'<div class="actions">'+action('close',text.close,'subtle')+'</div>';
       }
       if(status==='ready'){
         return '<div class="title">'+escapeHtml(text.titleReady)+'</div><p class="body">'+escapeHtml(text.readyBody)+'</p>'+row(text.currentVersion,currentVersion)+row(text.newVersion,updateVersion)+'<div class="actions">'+action('close',text.later,'subtle')+action('install',text.install,'primary')+'</div>';
@@ -566,7 +579,7 @@ function makePreloadPatch() {
     const render=state=>{
       current=state||current||{status:'idle'};
       const status=current.status||'idle';
-      const canOpen=status==='available'||status==='downloading'||status==='ready'||status==='error'||status==='checking';
+      const canOpen=status==='available'||status==='downloading'||status==='preparing'||status==='ready'||status==='error'||status==='checking';
       if(!canOpen)open=false;
       button.className='trigger '+status+(open?' open':'');
       label.textContent=text[status]||text.idle;
@@ -578,7 +591,7 @@ function makePreloadPatch() {
     };
     button.addEventListener('click',()=>{
       const status=current?.status||'idle';
-      if(status==='available'||status==='downloading'||status==='ready'||status==='error'||status==='checking'){
+      if(status==='available'||status==='downloading'||status==='preparing'||status==='ready'||status==='error'||status==='checking'){
         open=!open;
         render(current);
         return;
