@@ -12,7 +12,7 @@ const path = require("path");
 const { relPath, SRC_DIR } = require("./patch-util");
 
 const DEFAULT_WINDOWS_UPDATE_URL =
-  "https://gaq152.github.io/CodexDesktop-Rebuild/updates/win32/x64";
+  "https://github.com/Gaq152/CodexDesktop-Rebuild/releases/download/windows-update-feed";
 const START_MARKER = "/* CodexRebuildLocalUpdater:start */";
 const END_MARKER = "/* CodexRebuildLocalUpdater:end */";
 const FILE_END_MARKER = "/* CodexRebuildLocalUpdater:file-end */";

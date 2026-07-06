@@ -22,7 +22,8 @@ on:
 
 env:
   NODE_VERSION: "24"
-  WINDOWS_UPDATE_FEED: "https://gaq152.github.io/CodexDesktop-Rebuild/updates/win32/x64"
+  WINDOWS_UPDATE_TAG: "windows-update-feed"
+  WINDOWS_UPDATE_FEED: "https://github.com/Gaq152/CodexDesktop-Rebuild/releases/download/windows-update-feed"
 
 permissions:
   contents: read
@@ -151,11 +152,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v6
 
@@ -238,25 +234,23 @@ jobs:
           node scripts/prepare-windows-update-feed.js --source artifacts --dest update-feed/updates/win32/x64
           find update-feed -type f -print
 
-      - uses: actions/upload-pages-artifact@v4
-        with:
-          path: update-feed
-
-      - name: Deploy Windows update feed
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Publish Windows update feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ env.WINDOWS_UPDATE_TAG }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "Windows update feed" --notes "Squirrel.Windows update feed for CodexDesktop-Rebuild." --latest=false
+          fi
+          gh release upload "$tag" update-feed/updates/win32/x64/RELEASES update-feed/updates/win32/x64/*.nupkg --clobber
 
   publish-windows-update-feed:
     needs: [build-windows]
     if: always() && inputs.platform == 'windows' && inputs.publish_update_feed == true && needs.build-windows.result == 'success'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      contents: write
     steps:
       - uses: actions/checkout@v6
 
@@ -271,10 +265,13 @@ jobs:
           node scripts/prepare-windows-update-feed.js --source artifacts --dest update-feed/updates/win32/x64
           find update-feed -type f -print
 
-      - uses: actions/upload-pages-artifact@v4
-        with:
-          path: update-feed
-
-      - name: Deploy Windows update feed
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Publish Windows update feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ env.WINDOWS_UPDATE_TAG }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "Windows update feed" --notes "Squirrel.Windows update feed for CodexDesktop-Rebuild." --latest=false
+          fi
+          gh release upload "$tag" update-feed/updates/win32/x64/RELEASES update-feed/updates/win32/x64/*.nupkg --clobber
