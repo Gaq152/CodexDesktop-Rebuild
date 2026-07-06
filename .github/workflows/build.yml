@@ -92,12 +92,25 @@ jobs:
       - run: node scripts/patch-all.js win
       - run: npm run build:win-x64
       - run: npm run build:win-installer
-      - uses: actions/upload-artifact@v7
+      - name: Upload Windows portable zip
+        uses: actions/upload-artifact@v7
         with:
-          name: Codex-Windows-x64
+          name: Codex-Windows-Portable-x64
           path: |
             out/*.zip
-            out/make/squirrel.windows/x64/*.exe
+            out/make/zip/win32/x64/*.zip
+          if-no-files-found: error
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: Codex-Windows-Installer-x64
+          path: out/make/squirrel.windows/x64/*.exe
+          if-no-files-found: error
+      - name: Upload Windows update feed
+        uses: actions/upload-artifact@v7
+        with:
+          name: Codex-Windows-UpdateFeed-x64
+          path: |
             out/make/squirrel.windows/x64/RELEASES
             out/make/squirrel.windows/x64/*.nupkg
           if-no-files-found: error
@@ -248,8 +261,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v7
         with:
-          name: Codex-Windows-x64
-          path: artifacts/Codex-Windows-x64
+          name: Codex-Windows-UpdateFeed-x64
+          path: artifacts/Codex-Windows-UpdateFeed-x64
 
       - name: Prepare Windows update feed
         run: |
