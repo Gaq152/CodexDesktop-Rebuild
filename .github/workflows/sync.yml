@@ -12,6 +12,7 @@ on:
 
 env:
   NODE_VERSION: "24"
+  WINDOWS_UPDATE_FEED: "https://gaq152.github.io/CodexDesktop-Rebuild/updates/win32/x64"
 
 jobs:
   check:
@@ -156,21 +157,21 @@ jobs:
       - name: Sync upstream (Windows only)
         run: node scripts/sync-upstream.js --force --skip-mac
 
-      - name: Patch
-        run: node scripts/patch-all.js win
-
-      - name: Enable Squirrel delta source
+      - name: Configure Windows update feed
         shell: pwsh
         run: |
-          $feed = "https://gaq152.github.io/CodexDesktop-Rebuild/updates/win32/x64"
+          $feed = "${{ env.WINDOWS_UPDATE_FEED }}"
+          "CODEX_REBUILD_UPDATE_URL=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           try {
             Invoke-WebRequest "$feed/RELEASES" -Method Head -UseBasicParsing -TimeoutSec 20 | Out-Null
             "CODEX_REBUILD_REMOTE_RELEASES=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-            "CODEX_REBUILD_UPDATE_URL=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
             Write-Host "Using previous Squirrel feed for delta packages: $feed"
           } catch {
             Write-Host "No previous Squirrel feed found; building full package only."
           }
+
+      - name: Patch
+        run: node scripts/patch-all.js win
 
       - name: Build
         run: npm run build:win-x64
@@ -244,6 +245,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -323,3 +329,21 @@ jobs:
           draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare Windows update feed
+        if: steps.version.outputs.version != ''
+        run: |
+          set -euo pipefail
+          mkdir -p update-feed/updates/win32/x64
+          find artifacts -type f \( -name 'RELEASES' -o -name '*.nupkg' \) -exec cp {} update-feed/updates/win32/x64/ \;
+          find update-feed -type f -print
+
+      - uses: actions/upload-pages-artifact@v4
+        if: steps.version.outputs.version != ''
+        with:
+          path: update-feed
+
+      - name: Deploy Windows update feed
+        if: steps.version.outputs.version != ''
+        id: deployment
+        uses: actions/deploy-pages@v4

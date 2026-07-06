@@ -9,9 +9,20 @@ on:
         default: "all"
         type: choice
         options: [all, mac, windows, linux]
+      installer_version:
+        description: "Optional Windows Squirrel package version override, for update testing"
+        required: false
+        default: ""
+        type: string
+      publish_update_feed:
+        description: "For Windows-only builds, deploy RELEASES and nupkg to the update feed"
+        required: false
+        default: false
+        type: boolean
 
 env:
   NODE_VERSION: "24"
+  WINDOWS_UPDATE_FEED: "https://gaq152.github.io/CodexDesktop-Rebuild/updates/win32/x64"
 
 permissions:
   contents: read
@@ -61,19 +72,24 @@ jobs:
           Copy-Item "C:\Program Files\7-Zip\7z.exe" "C:\Program Files\7-Zip\7zz.exe"
           echo "C:\Program Files\7-Zip" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - run: node scripts/sync-upstream.js --force --skip-mac
-      - run: node scripts/patch-all.js win
-      - name: Enable Squirrel delta source
+      - name: Configure Windows update feed
         shell: pwsh
         run: |
-          $feed = "https://gaq152.github.io/CodexDesktop-Rebuild/updates/win32/x64"
+          $feed = "${{ env.WINDOWS_UPDATE_FEED }}"
+          "CODEX_REBUILD_UPDATE_URL=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           try {
             Invoke-WebRequest "$feed/RELEASES" -Method Head -UseBasicParsing -TimeoutSec 20 | Out-Null
             "CODEX_REBUILD_REMOTE_RELEASES=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-            "CODEX_REBUILD_UPDATE_URL=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
             Write-Host "Using previous Squirrel feed for delta packages: $feed"
           } catch {
             Write-Host "No previous Squirrel feed found; building full package only."
           }
+      - name: Configure installer version override
+        if: inputs.installer_version != ''
+        shell: pwsh
+        run: |
+          "CODEX_REBUILD_INSTALLER_VERSION=${{ inputs.installer_version }}" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - run: node scripts/patch-all.js win
       - run: npm run build:win-x64
       - run: npm run build:win-installer
       - uses: actions/upload-artifact@v7
@@ -202,6 +218,38 @@ jobs:
           fail_on_unmatched_files: true
           draft: false
           make_latest: true
+
+      - name: Prepare Windows update feed
+        run: |
+          set -euo pipefail
+          mkdir -p update-feed/updates/win32/x64
+          find artifacts -type f \( -name 'RELEASES' -o -name '*.nupkg' \) -exec cp {} update-feed/updates/win32/x64/ \;
+          find update-feed -type f -print
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: update-feed
+
+      - name: Deploy Windows update feed
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  publish-windows-update-feed:
+    needs: [build-windows]
+    if: always() && inputs.platform == 'windows' && inputs.publish_update_feed == true && needs.build-windows.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: Codex-Windows-x64
+          path: artifacts/Codex-Windows-x64
 
       - name: Prepare Windows update feed
         run: |
