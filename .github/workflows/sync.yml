@@ -132,6 +132,9 @@ jobs:
     needs: check
     if: needs.check.outputs.has_update == 'true'
     runs-on: windows-latest
+    outputs:
+      windows_portable_version: ${{ steps.windows_artifacts.outputs.windows_portable_version }}
+      windows_installer_version: ${{ steps.windows_artifacts.outputs.windows_installer_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -180,10 +183,14 @@ jobs:
       - name: Build installer
         run: npm run build:win-installer
 
+      - name: Resolve Windows artifact versions
+        id: windows_artifacts
+        run: node scripts/resolve-release-artifacts.js --root out --rename-windows-setup --github-output
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: Codex-Windows-x64
+          name: Codex-Windows-x64-${{ steps.windows_artifacts.outputs.windows_portable_version }}
           path: |
             out/*.zip
             out/make/squirrel.windows/x64/*.exe
@@ -300,19 +307,24 @@ jobs:
       - name: Display structure
         run: ls -lhR artifacts/
 
+      - name: Resolve release artifact versions
+        id: artifacts
+        run: node scripts/resolve-release-artifacts.js --root artifacts --github-output
+
       - name: Create Release
         if: steps.version.outputs.version != ''
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: Codex ${{ steps.version.outputs.version }}
+          tag_name: v${{ steps.artifacts.outputs.release_version || steps.version.outputs.version }}
+          name: Codex ${{ steps.artifacts.outputs.release_version || steps.version.outputs.version }}
           body: |
-            ## Upstream Versions
-            | Platform | Version |
+            ## Build Artifact Versions
+            | Platform / artifact | Version |
             |----------|---------|
-            | macOS arm64 | `${{ steps.version.outputs.mac_arm64 || 'N/A' }}` |
-            | macOS x64 | `${{ steps.version.outputs.mac_x64 || 'N/A' }}` |
-            | Windows x64 | `${{ steps.version.outputs.win_version || 'N/A' }}` |
+            | macOS arm64 | `${{ steps.artifacts.outputs.mac_arm64_version || 'N/A' }}` |
+            | macOS x64 | `${{ steps.artifacts.outputs.mac_x64_version || 'N/A' }}` |
+            | Windows x64 portable | `${{ steps.artifacts.outputs.windows_portable_version || 'N/A' }}` |
+            | Windows x64 installer | `${{ steps.artifacts.outputs.windows_installer_version || 'N/A' }}` |
             | Linux | uses macOS ASAR |
           files: |
             artifacts/**/*.dmg
