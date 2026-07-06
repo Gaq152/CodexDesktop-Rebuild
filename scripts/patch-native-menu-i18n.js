@@ -4,17 +4,26 @@
  *
  * The renderer/webview locale bundle can translate menu bar captions such as
  * File/Edit/View/Help, but several native menu labels and command menu titles
- * are hard-coded in the Electron main bundle. Patch those strings directly
- * after upstream extraction.
+ * are hard-coded in Electron build chunks. Patch those strings directly after
+ * upstream extraction.
  *
  * Usage:
  *   node scripts/patch-native-menu-i18n.js [platform]   # Apply
  *   node scripts/patch-native-menu-i18n.js --check      # Dry-run
  */
 const fs = require("fs");
+const path = require("path");
 const { locateBundles, relPath } = require("./patch-util");
 
 const MENU_LABEL_KEYS = ["label", "menuTitle"];
+const DIRECT_LITERAL_TRANSLATIONS = [
+  ["Start Performance Trace", "开始性能跟踪"],
+  ["Stop Performance Trace", "停止性能跟踪"],
+  ["Waiting to Start Trace…", "等待开始跟踪..."],
+  ["Saving Trace…", "正在保存跟踪..."],
+  ["Waiting for Trace Details…", "等待跟踪详情..."],
+  ["Uploading Trace…", "正在上传跟踪..."],
+];
 
 const MENU_LABEL_TRANSLATIONS = [
   ["File", "文件"],
@@ -63,9 +72,13 @@ const MENU_LABEL_TRANSLATIONS = [
   ["Open Terminal", "打开终端"],
   ["Open Browser Tab", "打开浏览器标签页"],
   ["Toggle Browser Panel", "切换浏览器面板"],
+  ["Open review tab", "打开审查标签页"],
   ["Toggle Side Panel", "切换侧边面板"],
+  ["Toggle maximize side panel", "切换侧边面板最大化"],
   ["Find", "查找"],
   ["Focus Browser Address Bar", "聚焦浏览器地址栏"],
+  ["Browser back", "浏览器后退"],
+  ["Browser forward", "浏览器前进"],
   ["Back", "后退"],
   ["Forward", "前进"],
   ["Go to Chat 1", "转到对话 1"],
@@ -78,6 +91,8 @@ const MENU_LABEL_TRANSLATIONS = [
   ["Go to Chat 8", "转到对话 8"],
   ["Go to Chat 9", "转到对话 9"],
   ["Log Out", "退出登录"],
+  ["Log out", "退出登录"],
+  ["Feedback", "发送反馈"],
   ["Reload Window", "重新加载窗口"],
   ["Zoom In", "放大"],
   ["Zoom Out", "缩小"],
@@ -131,6 +146,16 @@ function patchSource(source) {
     }
   }
 
+  for (const [from, to] of DIRECT_LITERAL_TRANSLATIONS) {
+    for (const literal of jsStringLiteralVariants(from)) {
+      const pattern = new RegExp(escapeRegex(literal), "g");
+      code = code.replace(pattern, (match) => {
+        replacements.push({ key: "literal", from, to });
+        return match.replace(literal, templateLiteral(to));
+      });
+    }
+  }
+
   return { code, replacements };
 }
 
@@ -147,14 +172,52 @@ function locateTargets(platform) {
     },
   ];
   const targets = [];
+  const seen = new Set();
+  const addTarget = (target) => {
+    if (seen.has(target.path)) return;
+    seen.add(target.path);
+    targets.push(target);
+  };
   for (const spec of specs) {
     for (const plat of platforms ?? [null]) {
-      targets.push(
-        ...locateBundles({
+      for (const target of locateBundles({
           ...spec,
           platform: plat ?? undefined,
-        })
-      );
+        })) {
+        addTarget(target);
+      }
+    }
+  }
+
+  for (const target of locateCommandMetadataTargets(platforms)) {
+    addTarget(target);
+  }
+  return targets;
+}
+
+function locateCommandMetadataTargets(platforms) {
+  const roots = [];
+  const basePlatforms = platforms ?? ["mac-arm64", "mac-x64", "win"];
+  for (const plat of basePlatforms) {
+    roots.push({
+      platform: plat,
+      dir: path.join(__dirname, "..", "src", plat, "_asar", ".vite", "build"),
+    });
+  }
+
+  const targets = [];
+  for (const root of roots) {
+    if (!fs.existsSync(root.dir)) continue;
+    for (const name of fs.readdirSync(root.dir)) {
+      if (!name.endsWith(".js")) continue;
+      const filePath = path.join(root.dir, name);
+      const source = fs.readFileSync(filePath, "utf8");
+      if (
+        source.includes("menuTitleIntlId") ||
+        DIRECT_LITERAL_TRANSLATIONS.some(([from]) => source.includes(from))
+      ) {
+        targets.push({ platform: root.platform, path: filePath });
+      }
     }
   }
   return targets;
