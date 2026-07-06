@@ -3,8 +3,9 @@
  * Post-build patch: localize hard-coded Electron native menu labels.
  *
  * The renderer/webview locale bundle can translate menu bar captions such as
- * File/Edit/View/Help, but several native menu items are hard-coded in the
- * Electron main bundle. Patch those labels directly after upstream extraction.
+ * File/Edit/View/Help, but several native menu labels and command menu titles
+ * are hard-coded in the Electron main bundle. Patch those strings directly
+ * after upstream extraction.
  *
  * Usage:
  *   node scripts/patch-native-menu-i18n.js [platform]   # Apply
@@ -12,6 +13,8 @@
  */
 const fs = require("fs");
 const { locateBundles, relPath } = require("./patch-util");
+
+const MENU_LABEL_KEYS = ["label", "menuTitle"];
 
 const MENU_LABEL_TRANSLATIONS = [
   ["File", "文件"],
@@ -118,11 +121,13 @@ function patchSource(source) {
 
   for (const [from, to] of MENU_LABEL_TRANSLATIONS) {
     for (const literal of jsStringLiteralVariants(from)) {
-      const pattern = new RegExp(`label\\s*:\\s*${escapeRegex(literal)}`, "g");
-      code = code.replace(pattern, (match) => {
-        replacements.push({ from, to });
-        return match.replace(literal, templateLiteral(to));
-      });
+      for (const key of MENU_LABEL_KEYS) {
+        const pattern = new RegExp(`\\b${key}\\s*:\\s*${escapeRegex(literal)}`, "g");
+        code = code.replace(pattern, (match) => {
+          replacements.push({ key, from, to });
+          return match.replace(literal, templateLiteral(to));
+        });
+      }
     }
   }
 
@@ -131,15 +136,26 @@ function patchSource(source) {
 
 function locateTargets(platform) {
   const platforms = platform === "unix" ? ["mac-arm64", "mac-x64"] : platform ? [platform] : null;
+  const specs = [
+    {
+      dir: "build",
+      pattern: /^main(?:-[A-Za-z0-9_-]+)?\.js$/,
+    },
+    {
+      dir: "assets",
+      pattern: /^electron-menu-shortcuts(?:-[A-Za-z0-9_-]+)?\.js$/,
+    },
+  ];
   const targets = [];
-  for (const plat of platforms ?? [null]) {
-    targets.push(
-      ...locateBundles({
-        dir: "build",
-        pattern: /^main(?:-[A-Za-z0-9_-]+)?\.js$/,
-        platform: plat ?? undefined,
-      })
-    );
+  for (const spec of specs) {
+    for (const plat of platforms ?? [null]) {
+      targets.push(
+        ...locateBundles({
+          ...spec,
+          platform: plat ?? undefined,
+        })
+      );
+    }
   }
   return targets;
 }
@@ -169,7 +185,7 @@ function main() {
 
     const summary = new Map();
     for (const item of replacements) {
-      const key = `${item.from} -> ${item.to}`;
+      const key = `${item.key}: ${item.from} -> ${item.to}`;
       summary.set(key, (summary.get(key) ?? 0) + 1);
     }
     for (const [label, count] of summary) {
