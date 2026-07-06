@@ -21,7 +21,7 @@ const tls = require("tls");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execFileSync, execSync } = require("child_process");
 
 // TLS certs for MS delivery CDN
 const certsDir = path.join(__dirname, "certs");
@@ -70,15 +70,17 @@ function extractArchive(archive, dest) {
   if (process.platform === "darwin" && archive.endsWith(".zip")) {
     // ditto preserves macOS symlinks + resource forks (required for .app)
     execSync(`ditto -xk "${archive}" "${dest}"`);
+  } else if (archive.endsWith(".msix")) {
+    // Windows MSIX packages contain very long Chromium paths. 7z can leave a
+    // partial extraction behind, so prefer bsdtar and fail hard on errors.
+    execFileSync("tar", ["-xf", archive, "-C", dest], { stdio: "inherit" });
   } else {
-    // 7zz for Windows MSIX and Linux (symlinks don't matter — only ASAR content used)
+    // 7zz for Linux/other archives (symlinks don't matter — only ASAR content used)
     for (const bin of ["7zz", "7z"]) {
       try {
         execSync(`${bin} x -y -o"${dest}" "${archive}"`, { stdio: "pipe" });
         return;
-      } catch {
-        if (fs.readdirSync(dest).length > 0) return;
-      }
+      } catch {}
     }
     throw new Error(`Failed to extract ${archive}`);
   }

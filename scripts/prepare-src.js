@@ -15,7 +15,7 @@
  */
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execFileSync, execSync } = require("child_process");
 
 const SRC = path.join(__dirname, "..", "src");
 const PROJECT_ROOT = path.join(__dirname, "..");
@@ -35,6 +35,11 @@ const MACOS_STRIP = new Set([
   "codexTemplate.png", "codexTemplate@2x.png",
 ]);
 const MACOS_STRIP_DIRS = new Set(["native"]);
+const WINDOWS_ASAR_UNPACK_DIRS = [
+  "node_modules/better-sqlite3",
+  "node_modules/node-pty",
+  "node_modules/@worklouder/device-kit-oai/node_modules/@worklouder/wl-device-kit/node_modules/serialport/node_modules/@serialport/bindings-cpp/build/Release",
+];
 
 function copyRecursive(src, dest, skipFiles, skipDirs) {
   fs.mkdirSync(dest, { recursive: true });
@@ -48,6 +53,81 @@ function copyRecursive(src, dest, skipFiles, skipDirs) {
     else { fs.copyFileSync(s, d); count++; }
   }
   return count;
+}
+
+function ensureWindowsExtraResources(sourceDir) {
+  const requiredUnpacked = path.join(sourceDir, "app.asar.unpacked");
+  if (fs.existsSync(requiredUnpacked)) return;
+
+  const cachedResources = path.join(require("os").tmpdir(), "codex-sync", "win-extract", "app", "resources");
+  if (fs.existsSync(cachedResources)) {
+    let restored = 0;
+    for (const entry of fs.readdirSync(cachedResources, { withFileTypes: true })) {
+      if (entry.name === "app.asar" || entry.name.endsWith(".lproj")) continue;
+      const srcPath = path.join(cachedResources, entry.name);
+      const destPath = path.join(sourceDir, entry.name);
+      if (fs.existsSync(destPath)) continue;
+      if (entry.isDirectory()) restored += copyRecursive(srcPath, destPath);
+      else if (!entry.isSymbolicLink()) {
+        fs.copyFileSync(srcPath, destPath);
+        restored++;
+      }
+    }
+    if (restored > 0) {
+      console.log(`   [win] restored ${restored} missing resource files from MSIX cache`);
+    }
+  }
+
+  if (!fs.existsSync(requiredUnpacked)) {
+    console.error("[x] Windows resources are incomplete. Run sync-upstream.js --force --skip-mac before building the installer.");
+    process.exit(1);
+  }
+}
+
+function decodedUnpackedSegment(name) {
+  return name.replace(/%40/gi, "@");
+}
+
+function copyUnpackedFilesIntoAsarSource(sourceDir, asarContentDir) {
+  const unpackedDir = path.join(sourceDir, "app.asar.unpacked");
+  if (!fs.existsSync(unpackedDir)) return 0;
+
+  let copied = 0;
+  const visit = (srcDir, relativeDir = "") => {
+    for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+      const srcPath = path.join(srcDir, entry.name);
+      const decodedName = decodedUnpackedSegment(entry.name);
+      const relativePath = relativeDir ? path.join(relativeDir, decodedName) : decodedName;
+      const destPath = path.join(asarContentDir, relativePath);
+
+      if (entry.isDirectory()) {
+        visit(srcPath, relativePath);
+      } else if (!entry.isSymbolicLink()) {
+        fs.mkdirSync(path.dirname(destPath), { recursive: true });
+        fs.copyFileSync(srcPath, destPath);
+        copied++;
+      }
+    }
+  };
+
+  visit(unpackedDir);
+  return copied;
+}
+
+function packAsar(asarContentDir, repackedAsar, platform) {
+  const asarCli = path.join(PROJECT_ROOT, "node_modules", "@electron", "asar", "bin", "asar.mjs");
+  const args = [asarCli, "pack"];
+
+  if (platform === "win") {
+    const unpackedDir = path.join(path.dirname(repackedAsar), "app.asar.unpacked");
+    const copied = copyUnpackedFilesIntoAsarSource(path.dirname(repackedAsar), asarContentDir);
+    if (fs.existsSync(unpackedDir)) fs.rmSync(unpackedDir, { recursive: true, force: true });
+    if (copied > 0) console.log(`   [win] merged ${copied} unpacked native files into ASAR source`);
+    args.push("--unpack-dir", `{${WINDOWS_ASAR_UNPACK_DIRS.join(",")}}`);
+  }
+
+  args.push(asarContentDir, repackedAsar);
+  execFileSync(process.execPath, args, { cwd: PROJECT_ROOT, stdio: "inherit" });
 }
 
 /**
@@ -89,6 +169,7 @@ function ensureVendorExtracted(platform) {
   try {
     baseVer = execSync("npm view @cometix/codex version", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
   } catch { return null; }
+  if (!baseVer) return null;
 
   const spec = `@cometix/codex@${baseVer}-${suffix}`;
   console.log(`   [vendor] fetching ${spec} via npm pack...`);
@@ -142,6 +223,7 @@ function main() {
   }
 
   const isLinux = platform.startsWith("linux");
+  const isWin = platform === "win";
   const sourceDir = isLinux
     ? path.join(SRC, platform === "linux-arm64" ? "mac-arm64" : "mac-x64")
     : path.join(SRC, platform);
@@ -163,12 +245,11 @@ function main() {
   // 1. Repack _asar/ -> app.asar
   const repackedAsar = path.join(sourceDir, "app.asar");
   console.log("   [repack] _asar/ -> app.asar");
-  execSync(`npx asar pack "${asarContentDir}" "${repackedAsar}"`);
+  packAsar(asarContentDir, repackedAsar, platform);
   const asarSize = (fs.statSync(repackedAsar).size / 1048576).toFixed(1);
   console.log(`   [ok] app.asar: ${asarSize} MB`);
 
   // 2. Replace codex binary with @cometix/codex
-  const isWin = platform === "win";
   const codexBinName = isWin ? "codex.exe" : "codex";
   const vendorCodex = resolveCodexVendor(platform);
   if (vendorCodex) {
@@ -180,6 +261,10 @@ function main() {
     console.log(`   [codex] replaced with @cometix/codex`);
   } else {
     console.log(`   [!] @cometix/codex vendor not found for ${platform}, keeping upstream`);
+  }
+
+  if (isWin) {
+    ensureWindowsExtraResources(sourceDir);
   }
 
   // 2b. For Linux: replace rg with platform-native version from @cometix/codex
