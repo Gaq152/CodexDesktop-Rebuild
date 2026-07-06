@@ -243,7 +243,19 @@ jobs:
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --title "Windows update feed" --notes "Squirrel.Windows update feed for CodexDesktop-Rebuild." --latest=false
           fi
-          gh release upload "$tag" update-feed/updates/win32/x64/RELEASES update-feed/updates/win32/x64/*.nupkg --clobber
+          feed_dir="update-feed/updates/win32/x64"
+          desired_assets="$(mktemp)"
+          (
+            find "$feed_dir" -maxdepth 1 -type f -name '*.nupkg' -printf '%f\n'
+            printf 'RELEASES\n'
+          ) | sort > "$desired_assets"
+          gh release upload "$tag" "$feed_dir"/*.nupkg --clobber
+          gh release upload "$tag" "$feed_dir/RELEASES" --clobber
+          gh release view "$tag" --json assets --jq '.assets[].name' | while IFS= read -r asset; do
+            if ! grep -Fxq "$asset" "$desired_assets"; then
+              gh release delete-asset "$tag" "$asset" -y
+            fi
+          done
 
   publish-windows-update-feed:
     needs: [build-windows]
@@ -274,4 +286,16 @@ jobs:
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --title "Windows update feed" --notes "Squirrel.Windows update feed for CodexDesktop-Rebuild." --latest=false
           fi
-          gh release upload "$tag" update-feed/updates/win32/x64/RELEASES update-feed/updates/win32/x64/*.nupkg --clobber
+          feed_dir="update-feed/updates/win32/x64"
+          desired_assets="$(mktemp)"
+          (
+            find "$feed_dir" -maxdepth 1 -type f -name '*.nupkg' -printf '%f\n'
+            printf 'RELEASES\n'
+          ) | sort > "$desired_assets"
+          gh release upload "$tag" "$feed_dir"/*.nupkg --clobber
+          gh release upload "$tag" "$feed_dir/RELEASES" --clobber
+          gh release view "$tag" --json assets --jq '.assets[].name' | while IFS= read -r asset; do
+            if ! grep -Fxq "$asset" "$desired_assets"; then
+              gh release delete-asset "$tag" "$asset" -y
+            fi
+          done
