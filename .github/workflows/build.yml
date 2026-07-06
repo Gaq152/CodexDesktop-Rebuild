@@ -92,6 +92,8 @@ jobs:
       - run: node scripts/patch-all.js win
       - run: npm run build:win-x64
       - run: npm run build:win-installer
+      - name: Prepare Windows update feed artifact
+        run: node scripts/prepare-windows-update-feed.js --source out/make/squirrel.windows/x64 --dest out/update-feed
       - name: Upload Windows portable zip
         uses: actions/upload-artifact@v7
         with:
@@ -110,9 +112,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: Codex-Windows-UpdateFeed-x64
-          path: |
-            out/make/squirrel.windows/x64/RELEASES
-            out/make/squirrel.windows/x64/*.nupkg
+          path: out/update-feed/*
           if-no-files-found: error
 
   build-linux:
@@ -235,8 +235,7 @@ jobs:
       - name: Prepare Windows update feed
         run: |
           set -euo pipefail
-          mkdir -p update-feed/updates/win32/x64
-          find artifacts -type f \( -name 'RELEASES' -o -name '*.nupkg' \) -exec cp {} update-feed/updates/win32/x64/ \;
+          node scripts/prepare-windows-update-feed.js --source artifacts --dest update-feed/updates/win32/x64
           find update-feed -type f -print
 
       - uses: actions/upload-pages-artifact@v4
@@ -259,6 +258,8 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@v6
+
       - uses: actions/download-artifact@v7
         with:
           name: Codex-Windows-UpdateFeed-x64
@@ -267,8 +268,7 @@ jobs:
       - name: Prepare Windows update feed
         run: |
           set -euo pipefail
-          mkdir -p update-feed/updates/win32/x64
-          find artifacts -type f \( -name 'RELEASES' -o -name '*.nupkg' \) -exec cp {} update-feed/updates/win32/x64/ \;
+          node scripts/prepare-windows-update-feed.js --source artifacts --dest update-feed/updates/win32/x64
           find update-feed -type f -print
 
       - uses: actions/upload-pages-artifact@v4
