@@ -17,22 +17,40 @@ function walkFiles(root) {
   return files;
 }
 
-function firstVersion(files, pattern) {
+function compareVersionStrings(a, b) {
+  const aParts = String(a).split(/[.-]/);
+  const bParts = String(b).split(/[.-]/);
+  const length = Math.max(aParts.length, bParts.length);
+  for (let i = 0; i < length; i++) {
+    const aPart = aParts[i] || "0";
+    const bPart = bParts[i] || "0";
+    const aNum = /^\d+$/.test(aPart) ? Number(aPart) : NaN;
+    const bNum = /^\d+$/.test(bPart) ? Number(bPart) : NaN;
+    const result = Number.isNaN(aNum) || Number.isNaN(bNum)
+      ? aPart.localeCompare(bPart)
+      : aNum - bNum;
+    if (result !== 0) return result;
+  }
+  return 0;
+}
+
+function latestVersion(files, pattern) {
+  let latest = "";
   for (const file of files) {
     const match = path.basename(file).match(pattern);
-    if (match) return match[1];
+    if (match && (!latest || compareVersionStrings(match[1], latest) > 0)) latest = match[1];
   }
-  return "";
+  return latest;
 }
 
 function collectReleaseArtifactMetadata(root) {
   const files = walkFiles(root).sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
-  const macArm64Version = firstVersion(files, /^Codex-mac-arm64-(.+)\.dmg$/);
-  const macX64Version = firstVersion(files, /^Codex-mac-x64-(.+)\.dmg$/);
-  const windowsPortableVersion = firstVersion(files, /^Codex-win-x64-(.+)\.zip$/);
+  const macArm64Version = latestVersion(files, /^Codex-mac-arm64-(.+)\.dmg$/);
+  const macX64Version = latestVersion(files, /^Codex-mac-x64-(.+)\.dmg$/);
+  const windowsPortableVersion = latestVersion(files, /^Codex-win-x64-(.+)\.zip$/);
   const windowsInstallerVersion =
-    firstVersion(files, /^Codex-(.+)-full\.nupkg$/) ||
-    firstVersion(files, /^CodexSetup-win-x64-(.+)\.exe$/);
+    latestVersion(files, /^Codex-(.+)-full\.nupkg$/) ||
+    latestVersion(files, /^CodexSetup-win-x64-(.+)\.exe$/);
   const releaseVersion = macArm64Version || macX64Version || windowsPortableVersion || windowsInstallerVersion;
 
   return {
