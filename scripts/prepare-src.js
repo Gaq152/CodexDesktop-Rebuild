@@ -16,6 +16,10 @@
 const fs = require("fs");
 const path = require("path");
 const { execFileSync, execSync } = require("child_process");
+const {
+  WINDOWS_SHORT_UNPACKED_NATIVE_FILES,
+  toNativePath,
+} = require("./windows-native-relocation");
 
 const SRC = path.join(__dirname, "..", "src");
 const PROJECT_ROOT = path.join(__dirname, "..");
@@ -38,7 +42,6 @@ const MACOS_STRIP_DIRS = new Set(["native"]);
 const WINDOWS_ASAR_UNPACK_DIRS = [
   "node_modules/better-sqlite3",
   "node_modules/node-pty",
-  "node_modules/@worklouder/device-kit-oai/node_modules/@worklouder/wl-device-kit/node_modules/serialport/node_modules/@serialport/bindings-cpp/build/Release",
 ];
 
 function copyRecursive(src, dest, skipFiles, skipDirs) {
@@ -114,12 +117,30 @@ function copyUnpackedFilesIntoAsarSource(sourceDir, asarContentDir) {
   return copied;
 }
 
+function copyWindowsShortUnpackedNativeFiles(asarContentDir, unpackedDir) {
+  let copied = 0;
+  for (const entry of WINDOWS_SHORT_UNPACKED_NATIVE_FILES) {
+    const source = path.join(asarContentDir, toNativePath(entry.source));
+    if (!fs.existsSync(source)) {
+      console.log(`   [win] optional native file not found for short unpack: ${entry.source}`);
+      continue;
+    }
+
+    const dest = path.join(unpackedDir, toNativePath(entry.dest));
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(source, dest);
+    copied++;
+  }
+  return copied;
+}
+
 function packAsar(asarContentDir, repackedAsar, platform) {
   const asarCli = path.join(PROJECT_ROOT, "node_modules", "@electron", "asar", "bin", "asar.mjs");
   const args = [asarCli, "pack"];
+  let unpackedDir = null;
 
   if (platform === "win") {
-    const unpackedDir = path.join(path.dirname(repackedAsar), "app.asar.unpacked");
+    unpackedDir = path.join(path.dirname(repackedAsar), "app.asar.unpacked");
     const copied = copyUnpackedFilesIntoAsarSource(path.dirname(repackedAsar), asarContentDir);
     if (fs.existsSync(unpackedDir)) fs.rmSync(unpackedDir, { recursive: true, force: true });
     if (copied > 0) console.log(`   [win] merged ${copied} unpacked native files into ASAR source`);
@@ -128,6 +149,11 @@ function packAsar(asarContentDir, repackedAsar, platform) {
 
   args.push(asarContentDir, repackedAsar);
   execFileSync(process.execPath, args, { cwd: PROJECT_ROOT, stdio: "inherit" });
+
+  if (platform === "win" && unpackedDir) {
+    const copied = copyWindowsShortUnpackedNativeFiles(asarContentDir, unpackedDir);
+    if (copied > 0) console.log(`   [win] relocated ${copied} native file(s) to short unpack paths`);
+  }
 }
 
 /**

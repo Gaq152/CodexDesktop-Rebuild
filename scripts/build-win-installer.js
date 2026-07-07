@@ -11,7 +11,6 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
-const { createWindowsInstaller } = require("electron-winstaller");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const INITIAL_TMPDIR = os.tmpdir();
@@ -323,6 +322,8 @@ async function main() {
   process.env.TEMP = shortTemp;
   process.env.TMP = shortTemp;
   process.env.TMPDIR = shortTemp;
+
+  const { createWindowsInstaller } = require("electron-winstaller");
 
   const appDirectory = stageUpstreamApp(shortWorkspace);
   applyPatchedResources(appDirectory);
