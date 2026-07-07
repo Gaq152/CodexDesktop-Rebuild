@@ -8,7 +8,7 @@ on:
         required: false
         default: "all"
         type: choice
-        options: [all, mac, windows, linux]
+        options: [all, mac, windows]
       installer_version:
         description: "Optional Windows Squirrel package version override, for update testing"
         required: false
@@ -122,39 +122,9 @@ jobs:
           path: out/update-feed/*
           if-no-files-found: error
 
-  build-linux:
-    if: inputs.platform == 'all' || inputs.platform == 'linux'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x64, arm64]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-      - run: |
-          npm ci
-      - run: |
-          sudo apt-get update
-          sudo apt-get install -y rpm fakeroot dpkg 7zip libarchive-tools
-      - run: node scripts/sync-upstream.js --force --skip-win
-      - run: node scripts/patch-all.js mac-${{ matrix.arch }}
-      - run: npm run build:linux-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v7
-        with:
-          name: Codex-Linux-${{ matrix.arch }}
-          path: |
-            out/make/deb/**/*.deb
-            out/make/rpm/**/*.rpm
-            out/make/zip/**/*.zip
-          if-no-files-found: error
-
   release:
-    needs: [build-mac, build-windows, build-linux]
-    if: always() && inputs.platform == 'all' && needs.build-mac.result == 'success' && needs.build-windows.result == 'success' && needs.build-linux.result == 'success'
+    needs: [build-mac, build-windows]
+    if: always() && inputs.platform == 'all' && needs.build-mac.result == 'success' && needs.build-windows.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -201,6 +171,32 @@ jobs:
           console.log(`Release version: ${version}`);
           NODE
 
+      - name: Update tracked upstream versions
+        run: |
+          set -euo pipefail
+          PACKAGE_VERSION="${{ steps.version.outputs.mac_arm64 || steps.version.outputs.mac_x64 || steps.version.outputs.windows }}"
+          PACKAGE_VERSION=$(node -e "const v=process.argv[1]||''; const m=v.match(/^(\d+\.\d+\.\d+)\.\d+$/); console.log(m ? m[1] : v)" "$PACKAGE_VERSION")
+          node scripts/resolve-sync-plan.js \
+            --upstream upstream.json \
+            --previous scripts/upstream-versions.json \
+            --write-current scripts/upstream-versions.json \
+            --json
+          node -e "
+            const fs=require('fs'), p=JSON.parse(fs.readFileSync('package.json','utf8'));
+            p.version='$PACKAGE_VERSION';
+            fs.writeFileSync('package.json', JSON.stringify(p,null,2)+'\n');
+          "
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json scripts/upstream-versions.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Bump upstream versions to ${{ steps.version.outputs.version }}"
+            git push origin HEAD
+          else
+            echo "No version metadata change"
+          fi
+
       - uses: actions/download-artifact@v7
         with:
           path: artifacts
@@ -218,7 +214,7 @@ jobs:
           tag_name: v${{ steps.artifacts.outputs.release_version }}
           name: Codex ${{ steps.artifacts.outputs.release_version }}
           body: |
-            Manual all-platform rebuild from upstream Codex.
+            Manual macOS and Windows rebuild from upstream Codex.
 
             | Platform / artifact | Version |
             | --- | --- |
@@ -226,12 +222,9 @@ jobs:
             | macOS x64 | `${{ steps.artifacts.outputs.mac_x64_version || 'N/A' }}` |
             | Windows x64 portable | `${{ steps.artifacts.outputs.windows_portable_version || 'N/A' }}` |
             | Windows x64 installer | `${{ steps.artifacts.outputs.windows_installer_version || 'N/A' }}` |
-            | Linux | built from macOS ASAR resources |
           files: |
             artifacts/**/*.dmg
             artifacts/**/*.zip
-            artifacts/**/*.deb
-            artifacts/**/*.rpm
             artifacts/**/*.exe
             artifacts/**/*.nupkg
             artifacts/**/RELEASES
