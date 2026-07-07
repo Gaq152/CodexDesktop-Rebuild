@@ -193,7 +193,7 @@ async function syncMac(variant, appcastUrl, destDir) {
   const resourcesDir = findResourcesDir(extractDir);
   if (!resourcesDir) throw new Error(`${label}: Resources directory not found`);
 
-  assembleOutput(resourcesDir, destDir, label);
+  await assembleOutput(resourcesDir, destDir, label);
   return info;
 }
 
@@ -224,13 +224,77 @@ async function syncWin(destDir) {
     throw new Error(`Windows: resources dir not found${alt ? `, app.asar at ${alt}` : ""}`);
   }
 
-  assembleOutput(resourcesDir, destDir, "Windows");
+  await assembleOutput(resourcesDir, destDir, "Windows");
   return info;
 }
 
 // ─── Assemble output ────────────────────────────────────────────
 
-function assembleOutput(resourcesDir, destDir, label) {
+function trimAsarListPath(entryPath) {
+  return entryPath.replace(/^[\\/]+/, "");
+}
+
+function normalizeAsarListPath(entryPath) {
+  return entryPath.replace(/^[\\/]+/, "").replace(/\\/g, "/");
+}
+
+async function extractAsarForPatching(asarPath, asarDest) {
+  try {
+    execFileSync(process.execPath, [
+      path.join(PROJECT_ROOT, "node_modules", "@electron", "asar", "bin", "asar.mjs"),
+      "extract",
+      asarPath,
+      asarDest,
+    ], { cwd: PROJECT_ROOT, stdio: "pipe" });
+    return { mode: "strict", missingUnpackedFiles: [] };
+  } catch (strictError) {
+    const asar = await import("@electron/asar");
+    const entries = asar.listPackage(asarPath, { isPack: true });
+    const missingUnpackedFiles = [];
+
+    clearDir(asarDest);
+    for (const entry of entries) {
+      const match = String(entry).match(/^(pack|unpack)\s*:\s*(.+)$/);
+      if (!match) continue;
+
+      const apiName = trimAsarListPath(match[2]);
+      const archiveName = normalizeAsarListPath(match[2]);
+      if (!archiveName) continue;
+
+      const destPath = path.join(asarDest, archiveName);
+      if (path.relative(asarDest, destPath).startsWith("..")) {
+        throw new Error(`${archiveName}: writes out of ${asarDest}`);
+      }
+
+      try {
+        const content = asar.extractFile(asarPath, apiName);
+        fs.mkdirSync(path.dirname(destPath), { recursive: true });
+        fs.writeFileSync(destPath, content);
+        const stat = asar.statFile(asarPath, apiName);
+        if (stat.executable) fs.chmodSync(destPath, 0o755);
+      } catch (error) {
+        if (/not a file|directory or link/i.test(error?.message || "") || (match[1] === "pack" && /was not found in this archive/i.test(error?.message || ""))) {
+          fs.mkdirSync(destPath, { recursive: true });
+          continue;
+        }
+        if (match[1] === "unpack" && (error?.code === "ENOENT" || /was not found in this archive/i.test(error?.message || ""))) {
+          missingUnpackedFiles.push(`/${archiveName}`);
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    console.warn(`   [warn] strict ASAR extract failed, used tolerant fallback: ${strictError.message.split("\n")[0]}`);
+    if (missingUnpackedFiles.length > 0) {
+      console.warn(`   [warn] skipped ${missingUnpackedFiles.length} missing unpacked ASAR file(s)`);
+    }
+
+    return { mode: "tolerant", missingUnpackedFiles };
+  }
+}
+
+async function assembleOutput(resourcesDir, destDir, label) {
   const asarPath = path.join(resourcesDir, "app.asar");
   if (!fs.existsSync(asarPath)) throw new Error(`${label}: app.asar not found`);
 
@@ -240,7 +304,7 @@ function assembleOutput(resourcesDir, destDir, label) {
   // 1. Extract app.asar → _asar/ (for patching)
   const asarDest = path.join(destDir, "_asar");
   console.log("   [asar extract] -> _asar/");
-  execSync(`npx asar extract "${asarPath}" "${asarDest}"`);
+  await extractAsarForPatching(asarPath, asarDest);
 
   // 2. Copy app.asar.unpacked/ as-is (native modules)
   const unpackedSrc = path.join(resourcesDir, "app.asar.unpacked");
@@ -370,4 +434,8 @@ async function main() {
   }
 }
 
-main().catch((e) => { console.error(`\n[x] ${e.message}`); process.exit(1); });
+module.exports = { extractAsarForPatching };
+
+if (require.main === module) {
+  main().catch((e) => { console.error(`\n[x] ${e.message}`); process.exit(1); });
+}
