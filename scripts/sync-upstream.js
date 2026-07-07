@@ -22,6 +22,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { execFileSync, execSync } = require("child_process");
+const { selectWindowsMsixPackage } = require("./windows-package-utils");
 
 // TLS certs for MS delivery CDN
 const certsDir = path.join(__dirname, "certs");
@@ -70,6 +71,20 @@ function extractArchive(archive, dest) {
   if (process.platform === "darwin" && archive.endsWith(".zip")) {
     // ditto preserves macOS symlinks + resource forks (required for .app)
     execSync(`ditto -xk "${archive}" "${dest}"`);
+  } else if (archive.endsWith(".zip")) {
+    // macOS release ZIPs can make 7zip exit non-zero on metadata warnings.
+    // bsdtar/libarchive handles those ZIPs more reliably on Linux runners.
+    for (const command of [
+      ["bsdtar", ["-xf", archive, "-C", dest]],
+      ["7zz", ["x", "-y", `-o${dest}`, archive]],
+      ["7z", ["x", "-y", `-o${dest}`, archive]],
+    ]) {
+      try {
+        execFileSync(command[0], command[1], { stdio: "inherit" });
+        return;
+      } catch {}
+    }
+    throw new Error(`Failed to extract ${archive}`);
   } else if (archive.endsWith(".msix")) {
     // Windows MSIX packages contain very long Chromium paths. 7z can leave a
     // partial extraction behind, so prefer bsdtar and fail hard on errors.
@@ -78,7 +93,7 @@ function extractArchive(archive, dest) {
     // 7zz for Linux/other archives (symlinks don't matter — only ASAR content used)
     for (const bin of ["7zz", "7z"]) {
       try {
-        execSync(`${bin} x -y -o"${dest}" "${archive}"`, { stdio: "pipe" });
+        execFileSync(bin, ["x", "-y", `-o${dest}`, archive], { stdio: "inherit" });
         return;
       } catch {}
     }
@@ -147,7 +162,7 @@ async function getWindowsVersion() {
   if (!info.categoryId) throw new Error("No CategoryID");
   const pkgs = await msstore.getFileList(cookie, info.categoryId, "Retail");
   if (pkgs.length === 0) throw new Error("No packages");
-  const pkg = pkgs[0];
+  const pkg = selectWindowsMsixPackage(pkgs, "x64");
   const url = await msstore.getDownloadUrl(pkg.updateID, pkg.revisionNumber, "Retail", pkg.digest);
   const verMatch = pkg.name.match(/_(\d+\.\d+\.\d+(?:\.\d+)?)_/);
   return { version: verMatch?.[1] || "unknown", url, packageName: pkg.name };
@@ -271,6 +286,7 @@ async function main() {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 
   const results = {};
+  const failures = [];
 
   // Detect versions
   if (!SKIP_MAC) {
@@ -278,13 +294,19 @@ async function main() {
       const arm64Info = await getAppcastVersion(APPCAST_ARM64);
       console.log(`\n   mac-arm64: ${arm64Info.version} (build ${arm64Info.build})`);
       results["mac-arm64"] = arm64Info;
-    } catch (e) { console.error(`   [x] mac-arm64 check: ${e.message}`); }
+    } catch (e) {
+      failures.push(`mac-arm64 check: ${e.message}`);
+      console.error(`   [x] mac-arm64 check: ${e.message}`);
+    }
 
     try {
       const x64Info = await getAppcastVersion(APPCAST_X64);
       console.log(`   mac-x64:   ${x64Info.version} (build ${x64Info.build})`);
       results["mac-x64"] = x64Info;
-    } catch (e) { console.error(`   [x] mac-x64 check: ${e.message}`); }
+    } catch (e) {
+      failures.push(`mac-x64 check: ${e.message}`);
+      console.error(`   [x] mac-x64 check: ${e.message}`);
+    }
   }
 
   if (!SKIP_WIN) {
@@ -292,11 +314,17 @@ async function main() {
       const winInfo = await getWindowsVersion();
       console.log(`   win:       ${winInfo.version}`);
       results.win = winInfo;
-    } catch (e) { console.error(`   [x] win check: ${e.message}`); }
+    } catch (e) {
+      failures.push(`win check: ${e.message}`);
+      console.error(`   [x] win check: ${e.message}`);
+    }
   }
 
   if (CHECK_ONLY) {
     console.log("\n== Check only, skipping download ==");
+    if (failures.length > 0) {
+      throw new Error(`Sync check failed:\n   ${failures.join("\n   ")}`);
+    }
     return;
   }
 
@@ -304,17 +332,30 @@ async function main() {
   if (!SKIP_MAC && results["mac-arm64"]) {
     try {
       results["mac-arm64"] = await syncMac("arm64", APPCAST_ARM64, path.join(SRC_DIR, "mac-arm64"));
-    } catch (e) { console.error(`   [x] mac-arm64: ${e.message}`); }
+    } catch (e) {
+      failures.push(`mac-arm64: ${e.message}`);
+      console.error(`   [x] mac-arm64: ${e.message}`);
+    }
   }
   if (!SKIP_MAC && results["mac-x64"]) {
     try {
       results["mac-x64"] = await syncMac("x64", APPCAST_X64, path.join(SRC_DIR, "mac-x64"));
-    } catch (e) { console.error(`   [x] mac-x64: ${e.message}`); }
+    } catch (e) {
+      failures.push(`mac-x64: ${e.message}`);
+      console.error(`   [x] mac-x64: ${e.message}`);
+    }
   }
   if (!SKIP_WIN && results.win) {
     try {
       results.win = await syncWin(path.join(SRC_DIR, "win"));
-    } catch (e) { console.error(`   [x] win: ${e.message}`); }
+    } catch (e) {
+      failures.push(`win: ${e.message}`);
+      console.error(`   [x] win: ${e.message}`);
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new Error(`Sync failed:\n   ${failures.join("\n   ")}`);
   }
 
   const saved = loadVersions();

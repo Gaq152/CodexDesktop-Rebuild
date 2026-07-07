@@ -106,25 +106,34 @@ function main() {
   const latestEntries = entries
     .filter((entry) => entry.version === latestVersion)
     .sort((a, b) => a.kind.localeCompare(b.kind));
+  const availableLatestEntries = latestEntries.filter((entry) => packageFiles.has(entry.filename));
+  const missingLatestEntries = latestEntries.filter((entry) => !packageFiles.has(entry.filename));
+  const fullEntry = availableLatestEntries.find((entry) => entry.kind === "full");
+
+  if (!fullEntry) {
+    const expected = latestEntries.find((entry) => entry.kind === "full")?.filename || `${latestVersion} full package`;
+    console.error(`[x] RELEASES references missing required package: ${expected}`);
+    process.exit(1);
+  }
+
+  for (const entry of missingLatestEntries) {
+    console.warn(`[!] Skipping RELEASES entry without package: ${entry.filename}`);
+  }
 
   fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(dest, { recursive: true });
-  fs.writeFileSync(path.join(dest, "RELEASES"), latestEntries.map((entry) => entry.line).join("\n") + "\n");
+  fs.writeFileSync(path.join(dest, "RELEASES"), availableLatestEntries.map((entry) => entry.line).join("\n") + "\n");
 
   let totalBytes = 0;
-  for (const entry of latestEntries) {
+  for (const entry of availableLatestEntries) {
     const sourceFile = packageFiles.get(entry.filename);
-    if (!sourceFile) {
-      console.error(`[x] RELEASES references missing package: ${entry.filename}`);
-      process.exit(1);
-    }
     const destFile = path.join(dest, entry.filename);
     fs.copyFileSync(sourceFile, destFile);
     totalBytes += fs.statSync(destFile).size;
   }
 
   console.log(`Prepared Windows update feed ${latestVersion}:`);
-  for (const entry of latestEntries) {
+  for (const entry of availableLatestEntries) {
     console.log(`  ${entry.filename}`);
   }
   console.log(`Total package size: ${(totalBytes / 1048576).toFixed(1)} MB`);

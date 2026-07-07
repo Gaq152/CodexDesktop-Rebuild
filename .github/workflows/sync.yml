@@ -219,7 +219,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm fakeroot dpkg 7zip
+          sudo apt-get install -y rpm fakeroot dpkg 7zip libarchive-tools
 
       - name: Install dependencies
         run: |

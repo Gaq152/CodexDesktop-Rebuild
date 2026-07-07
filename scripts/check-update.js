@@ -17,6 +17,7 @@ const tls = require("tls");
 const { XMLParser } = require("fast-xml-parser");
 const fs = require("fs");
 const path = require("path");
+const { selectWindowsMsixPackage } = require("./windows-package-utils");
 
 // ─── 证书注入（复用 fetch-msstore 的 CA 补丁）─────────────────────
 const certsDir = path.join(__dirname, "certs");
@@ -114,7 +115,7 @@ async function checkWindowsVersion() {
   }
 
   // 从包名提取版本: OpenAI.Codex_26.325.2171.0_x64__xxx.msix
-  const pkg = packages[0];
+  const pkg = selectWindowsMsixPackage(packages, "x64");
   const versionMatch = pkg.name.match(/_(\d+\.\d+\.\d+(?:\.\d+)?)_/);
   const version = versionMatch ? versionMatch[1] : "unknown";
 
