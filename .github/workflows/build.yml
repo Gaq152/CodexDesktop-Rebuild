@@ -81,13 +81,8 @@ jobs:
         run: |
           $feed = "${{ env.WINDOWS_UPDATE_FEED }}"
           "CODEX_REBUILD_UPDATE_URL=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          try {
-            Invoke-WebRequest "$feed/RELEASES" -Method Head -UseBasicParsing -TimeoutSec 20 | Out-Null
-            "CODEX_REBUILD_REMOTE_RELEASES=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-            Write-Host "Using previous Squirrel feed for delta packages: $feed"
-          } catch {
-            Write-Host "No previous Squirrel feed found; building full package only."
-          }
+          Write-Host "Using Windows update feed URL: $feed"
+          Write-Host "Skipping Squirrel delta generation; long upstream native-module paths can exceed legacy Windows path limits during releasify."
       - name: Configure installer version override
         if: inputs.installer_version != ''
         shell: pwsh
