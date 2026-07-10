@@ -18,6 +18,11 @@ const END_MARKER = "/* CodexRebuildLocalUpdater:end */";
 const FILE_END_MARKER = "/* CodexRebuildLocalUpdater:file-end */";
 const PRELOAD_START_MARKER = "/* CodexRebuildUpdaterPreload:start */";
 const PRELOAD_END_MARKER = "/* CodexRebuildUpdaterPreload:end */";
+const MAIN_MENU_START_MARKER = "/* CodexRebuildUpdaterMainMenu:start */";
+const MAIN_MENU_END_MARKER = "/* CodexRebuildUpdaterMainMenu:end */";
+const WEBVIEW_UPDATER_MENU_ID = "codex-rebuild-updater-top";
+const WEBVIEW_MENU_BAR_ITEM =
+  "{id:'codex-rebuild-updater-top',message:{id:`windowsMenuBar.checkUpdates`,defaultMessage:`检查更新`,description:`Label for the update menu in the desktop application menu bar`}}";
 
 function updatePackageMetadata() {
   const pkgPath = path.join(SRC_DIR, "win", "_asar", "package.json");
@@ -76,7 +81,7 @@ function CodexRebuildWindowsBootstrap(){
     setTimeout(()=>app.quit(),1000);
     return!0;
   }
-  app.whenReady().then(()=>CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWindow)).catch(()=>{});
+  app.whenReady().then(()=>CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWindow)).catch(e=>{try{console.warn('[CodexRebuildUpdater] setup failed',e&&e.message?e.message:e)}catch{}});
   return!1;
 }
 function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWindow){
@@ -188,6 +193,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
   };
   let emit=()=>{
     let payload={...state};
+    try{globalThis.__CodexRebuildUpdaterLastState=payload;globalThis.__CodexRebuildUpdaterMenuSetState?.(payload)}catch{}
     try{
       for(let win of BrowserWindow?.getAllWindows?.()??[]){
         if(!win.isDestroyed?.())win.webContents?.send?.('codex_rebuild:update-state',payload);
@@ -293,7 +299,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
       checking=!1;
       let message=e&&e.message?e.message:String(e);
       console.warn('[CodexRebuildUpdater] update check failed',message);
-      setStatus(manual?'error':'idle',{error:message,lastCheckedAt:Date.now()},manual?8000:0);
+      setStatus(manual?'error':'idle',{error:message,lastCheckedAt:Date.now()});
     }
     return emit();
   };
@@ -312,10 +318,23 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
       stopProgress();
       let message=e&&e.message?e.message:String(e);
       console.warn('[CodexRebuildUpdater] update download failed',message);
-      setStatus('error',{error:message,lastCheckedAt:Date.now()},8000);
+      setStatus('error',{error:message,lastCheckedAt:Date.now()});
     }
     return emit();
   };
+  let installUpdate=()=>{
+    if(downloaded){autoUpdater.quitAndInstall();return emit()}
+    return startDownload();
+  };
+  let clearStatus=()=>{
+    checking=!1;
+    downloading=!1;
+    downloadRequested=!1;
+    stopProgress();
+    setStatus('idle',{error:null,updateVersion:null,updateFile:null,updateFiles:null,updateSize:null,activeDownloadFile:null,activeDownloadSize:null,downloadedBytes:null,downloadStartedAt:null,elapsedMs:null});
+    return emit();
+  };
+  globalThis.__CodexRebuildUpdaterCommand={check:()=>checkOnly(!0),download:startDownload,install:installUpdate,clear:clearStatus};
   try{
     if(ipcMain&&!globalThis.__CodexRebuildUpdaterIpcRegistered){
       globalThis.__CodexRebuildUpdaterIpcRegistered=!0;
@@ -324,9 +343,9 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
         if(command==='get-state')return emit();
         if(command==='check')return checkOnly(!0);
         if(command==='download')return startDownload();
+        if(command==='clear')return clearStatus();
         if(command==='install'){
-          if(downloaded){autoUpdater.quitAndInstall();return emit()}
-          return startDownload();
+          return installUpdate();
         }
         return emit();
       });
@@ -354,7 +373,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     stopProgress();
     let message=e&&e.message?e.message:String(e);
     console.warn('[CodexRebuildUpdater] update failed',message);
-    setStatus('error',{error:message,lastCheckedAt:Date.now()},8000);
+    setStatus('error',{error:message,lastCheckedAt:Date.now()});
   });
   autoUpdater.on('update-downloaded',()=>{
     checking=!1;
@@ -378,6 +397,24 @@ if(!CodexRebuildWindowsBootstrap()){
 }
 
 function makePreloadPatch() {
+  return `${PRELOAD_START_MARKER}
+;(()=>{try{
+  const channelState='codex_rebuild:update-state';
+  const channelCommand='codex_rebuild:update-command';
+  const listeners=new Set;
+  const invoke=command=>e.ipcRenderer.invoke(channelCommand,{command});
+  const updaterApi={
+    getState:()=>invoke('get-state'),
+    checkForUpdates:()=>invoke('check'),
+    downloadUpdate:()=>invoke('download'),
+    installUpdate:()=>invoke('install'),
+    clearUpdateState:()=>invoke('clear'),
+    onState:t=>{if(typeof t!=='function')return()=>{};listeners.add(t);return()=>listeners.delete(t)}
+  };
+  e.ipcRenderer.on(channelState,(_event,state)=>{for(const listener of listeners){try{listener(state)}catch{}}});
+  try{e.contextBridge.exposeInMainWorld('codexRebuildUpdater',updaterApi)}catch{}
+}catch{}})();
+${PRELOAD_END_MARKER}`;
   return `${PRELOAD_START_MARKER}
 ;(()=>{try{
   const channelState='codex_rebuild:update-state';
@@ -510,18 +547,19 @@ function makePreloadPatch() {
     const root=host.attachShadow?host.attachShadow({mode:'open'}):host;
     const style=document.createElement('style');
     style.textContent=[
-      ':host{position:fixed;top:8px;right:138px;z-index:2147483647;pointer-events:none;-webkit-app-region:no-drag;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
-      '.trigger{-webkit-app-region:no-drag;user-select:none;pointer-events:auto;height:28px;max-width:min(260px,calc(100vw - 180px));display:inline-flex;align-items:center;gap:7px;border-radius:7px;border:1px solid color-mix(in srgb,var(--color-token-border-default,#4b5563) 70%,transparent);background:color-mix(in srgb,var(--color-token-main-surface-primary,#111827) 86%,transparent);color:var(--color-token-text-secondary,#c4c7c5);box-shadow:0 8px 24px rgba(0,0,0,.18);backdrop-filter:blur(10px);font-size:12px;font-weight:500;line-height:1;padding:0 10px;opacity:.62;transition:opacity .16s ease,background .16s ease,border-color .16s ease,color .16s ease,transform .16s ease;white-space:nowrap;overflow:hidden;cursor:pointer}',
-      '.trigger:hover,.trigger.open{opacity:1;background:color-mix(in srgb,var(--color-token-main-surface-primary,#111827) 96%,white 4%);transform:translateY(1px)}',
+      ':host([hidden]){display:none!important}',
+      ':host{position:fixed;right:20px;bottom:20px;z-index:2147483647;pointer-events:none;-webkit-app-region:no-drag;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;width:min(220px,calc(100vw - 40px));}',
+      '.trigger{-webkit-app-region:no-drag;user-select:none;pointer-events:auto;height:30px;width:100%;display:inline-flex;align-items:center;justify-content:flex-start;gap:8px;border-radius:7px;border:1px solid color-mix(in srgb,var(--color-token-border-default,#4b5563) 70%,transparent);background:color-mix(in srgb,var(--color-token-main-surface-primary,#111827) 86%,transparent);color:var(--color-token-text-secondary,#c4c7c5);box-shadow:0 8px 24px rgba(0,0,0,.18);backdrop-filter:blur(10px);font-size:12px;font-weight:500;line-height:1;padding:0 10px;opacity:.72;transition:opacity .16s ease,background .16s ease,border-color .16s ease,color .16s ease;overflow:hidden;cursor:pointer}',
+      '.trigger:hover,.trigger.open{opacity:1;background:color-mix(in srgb,var(--color-token-main-surface-primary,#111827) 96%,white 4%)}',
       '.mark{width:7px;height:7px;border-radius:999px;background:currentColor;opacity:.75;flex:0 0 auto}',
-      '.label{overflow:hidden;text-overflow:ellipsis}',
+      '.label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
       '.checking,.downloading,.preparing{color:var(--color-token-text-primary,#f3f4f6);opacity:.9}',
       '.checking .mark,.downloading .mark,.preparing .mark{width:10px;height:10px;border:2px solid currentColor;border-top-color:transparent;background:transparent;animation:codex-rebuild-spin .8s linear infinite}',
       '.available{color:#f59e0b;border-color:color-mix(in srgb,#f59e0b 55%,transparent);background:color-mix(in srgb,#f59e0b 12%,var(--color-token-main-surface-primary,#111827));opacity:1}',
       '.ready{color:#10b981;border-color:color-mix(in srgb,#10b981 55%,transparent);background:color-mix(in srgb,#10b981 14%,var(--color-token-main-surface-primary,#111827));opacity:1}',
       '.no-update{color:#60a5fa;border-color:color-mix(in srgb,#60a5fa 45%,transparent);opacity:1}',
       '.error{color:#ef4444;border-color:color-mix(in srgb,#ef4444 55%,transparent);background:color-mix(in srgb,#ef4444 12%,var(--color-token-main-surface-primary,#111827));opacity:1}',
-      '.panel{position:absolute;top:36px;right:0;width:min(324px,calc(100vw - 24px));pointer-events:auto;border:1px solid color-mix(in srgb,var(--color-token-border-default,#4b5563) 76%,transparent);border-radius:8px;background:color-mix(in srgb,var(--color-token-main-surface-primary,#111827) 96%,black 4%);color:var(--color-token-text-primary,#f3f4f6);box-shadow:0 18px 48px rgba(0,0,0,.34);padding:12px;box-sizing:border-box;opacity:0;visibility:hidden;transform:translateY(-4px);transition:opacity .14s ease,visibility .14s ease,transform .14s ease;backdrop-filter:blur(14px)}',
+      '.panel{position:absolute;bottom:38px;right:0;width:min(324px,calc(100vw - 40px));max-height:calc(100vh - 128px);overflow:auto;pointer-events:auto;border:1px solid color-mix(in srgb,var(--color-token-border-default,#4b5563) 76%,transparent);border-radius:8px;background:color-mix(in srgb,var(--color-token-main-surface-primary,#111827) 96%,black 4%);color:var(--color-token-text-primary,#f3f4f6);box-shadow:0 18px 48px rgba(0,0,0,.34);padding:12px;box-sizing:border-box;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .14s ease,visibility .14s ease,transform .14s ease;backdrop-filter:blur(14px)}',
       '.panel.open{opacity:1;visibility:visible;transform:translateY(0)}',
       '.title{font-size:13px;font-weight:650;line-height:1.3;margin:0 0 8px;color:var(--color-token-text-primary,#f3f4f6)}',
       '.body{font-size:12px;line-height:1.45;margin:0 0 10px;color:var(--color-token-text-secondary,#c4c7c5)}',
@@ -535,7 +573,7 @@ function makePreloadPatch() {
       '.action.primary{background:#0f766e;color:white}.action.primary:hover{background:#0d9488}',
       '.action.subtle{color:var(--color-token-text-secondary,#c4c7c5)}',
       '@keyframes codex-rebuild-spin{to{transform:rotate(360deg)}}',
-      '@media(max-width:720px){:host{right:96px}.label{display:none}.trigger{width:28px;padding:0;justify-content:center}.panel{right:-72px}}'
+      '@media(max-width:720px){:host{right:10px;bottom:10px;width:min(220px,calc(100vw - 20px))}.panel{right:0;width:min(324px,calc(100vw - 20px))}}'
     ].join('\\n');
     const button=document.createElement('button');
     button.type='button';
@@ -545,11 +583,13 @@ function makePreloadPatch() {
     const panel=document.createElement('div');
     panel.className='panel';
     panel.setAttribute('role','dialog');
+    host.hidden=true;
     root.append(style,button,panel);
     document.documentElement.appendChild(host);
     const label=button.querySelector('.label');
     let open=false;
     let current={status:'idle'};
+    const visibleStatuses=new Set(['checking','available','downloading','preparing','ready','no-update','error']);
     const buildPanel=state=>{
       const status=state.status||'idle';
       const currentVersion=formatVersion(state.version||state.appVersion);
@@ -579,11 +619,16 @@ function makePreloadPatch() {
     const render=state=>{
       current=state||current||{status:'idle'};
       const status=current.status||'idle';
+      const visible=visibleStatuses.has(status);
+      host.toggleAttribute('hidden',!visible);
+      if(!visible){open=false;panel.innerHTML=''}
       const canOpen=status==='available'||status==='downloading'||status==='preparing'||status==='ready'||status==='error'||status==='checking';
       if(!canOpen)open=false;
       button.className='trigger '+status+(open?' open':'');
-      label.textContent=text[status]||text.idle;
-      button.title=current.error&&status==='error'?text.tooltipError+': '+current.error:(text['tooltip'+status.charAt(0).toUpperCase()+status.slice(1)]||text.tooltipIdle);
+      const statusLabel=status==='no-update'?text.noUpdate:text[status]||text.idle;
+      const tooltipByStatus={idle:text.tooltipIdle,checking:text.tooltipChecking,available:text.tooltipAvailable,downloading:text.tooltipDownloading,preparing:text.tooltipPreparing,ready:text.tooltipReady,'no-update':text.tooltipNoUpdate,error:text.tooltipError};
+      label.textContent=statusLabel;
+      button.title=current.error&&status==='error'?text.tooltipError+': '+current.error:(tooltipByStatus[status]||text.tooltipIdle);
       button.setAttribute('aria-label',button.title);
       button.setAttribute('aria-expanded',open?'true':'false');
       panel.className='panel '+(open&&canOpen?'open':'');
@@ -634,6 +679,263 @@ function makePreloadPatch() {
   });
 }catch{}})();
 ${PRELOAD_END_MARKER}`;
+}
+
+function makeMainMenuPatch() {
+  return `${MAIN_MENU_START_MARKER}
+(()=>{
+  let codexRebuildUpdaterIds={
+    top:'codex-rebuild-updater-top',
+    status:'codex-rebuild-updater-status',
+    current:'codex-rebuild-updater-current-version',
+    next:'codex-rebuild-updater-next-version',
+    size:'codex-rebuild-updater-package-size',
+    progress:'codex-rebuild-updater-progress',
+    downloaded:'codex-rebuild-updater-downloaded',
+    elapsed:'codex-rebuild-updater-elapsed',
+    error:'codex-rebuild-updater-error',
+    check:'codex-rebuild-updater-action-check',
+    download:'codex-rebuild-updater-action-download',
+    install:'codex-rebuild-updater-action-install',
+    retry:'codex-rebuild-updater-action-retry',
+    clear:'codex-rebuild-updater-action-clear'
+  };
+  let codexRebuildUpdaterState=globalThis.__CodexRebuildUpdaterLastState||{status:'idle'};
+  let codexRebuildUpdaterUnknown='-';
+  let codexRebuildUpdaterFormatVersion=value=>value?String(value):codexRebuildUpdaterUnknown;
+  let codexRebuildUpdaterFormatBytes=value=>{
+    let n=Number(value);
+    if(!Number.isFinite(n)||n<=0)return codexRebuildUpdaterUnknown;
+    let units=['B','KB','MB','GB'],size=n,index=0;
+    while(size>=1024&&index<units.length-1){size/=1024;index+=1}
+    let digits=index===0?0:size>=100?0:size>=10?1:2;
+    return size.toFixed(digits)+' '+units[index];
+  };
+  let codexRebuildUpdaterFormatElapsed=value=>{
+    let ms=Number(value);
+    if(!Number.isFinite(ms)||ms<0)return codexRebuildUpdaterUnknown;
+    let total=Math.floor(ms/1000),minutes=Math.floor(total/60),seconds=total%60;
+    return minutes>0?minutes+'分'+String(seconds).padStart(2,'0')+'秒':seconds+'秒';
+  };
+  let codexRebuildUpdaterProgress=state=>{
+    let total=Number(state.activeDownloadSize||state.updateSize),done=Number(state.downloadedBytes);
+    if(!Number.isFinite(total)||total<=0||!Number.isFinite(done)||done<0)return null;
+    return Math.max(0,Math.min(100,done/total*100));
+  };
+  let codexRebuildUpdaterLabel=state=>{
+    let status=state.status||'idle';
+    if(status==='checking')return '检查中...';
+    if(status==='available')return '有新版本';
+    if(status==='downloading'){
+      let pct=codexRebuildUpdaterProgress(state);
+      return pct==null?'下载中':'下载中 '+Math.floor(pct)+'%';
+    }
+    if(status==='preparing')return '准备中';
+    if(status==='ready')return '重启安装';
+    if(status==='no-update')return '已是最新';
+    if(status==='error')return '检查失败';
+    return '检查更新';
+  };
+  let codexRebuildUpdaterStatusText=state=>{
+    let status=state.status||'idle';
+    if(status==='checking')return '正在检查更新';
+    if(status==='available')return '发现新版本，确认后开始下载';
+    if(status==='downloading')return '正在下载更新';
+    if(status==='preparing')return '下载完成，正在准备安装';
+    if(status==='ready')return '更新已下载，可以重启安装';
+    if(status==='no-update')return '当前已是最新版本';
+    if(status==='error')return '检查更新失败';
+    return '未检查更新';
+  };
+  let codexRebuildUpdaterMenuItem=id=>{
+    try{return a.Menu.getApplicationMenu?.()?.getMenuItemById?.(id)||null}catch{return null}
+  };
+  let codexRebuildUpdaterSetMenuItem=(id,props)=>{
+    let item=codexRebuildUpdaterMenuItem(id);
+    if(!item)return;
+    for(let [key,value] of Object.entries(props)){
+      try{item[key]=value}catch{}
+    }
+  };
+  let codexRebuildUpdaterSetRow=(id,visible,label)=>{
+    codexRebuildUpdaterSetMenuItem(id,{visible,enabled:false,label});
+  };
+  let codexRebuildUpdaterApplyState=state=>{
+    codexRebuildUpdaterState={...codexRebuildUpdaterState,...(state||{})};
+    let s=codexRebuildUpdaterState,status=s.status||'idle';
+    globalThis.__CodexRebuildUpdaterLastState=s;
+    let pct=codexRebuildUpdaterProgress(s);
+    let showVersion=status==='available'||status==='downloading'||status==='preparing'||status==='ready'||status==='checking';
+    let showDownload=status==='downloading'||status==='preparing';
+    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.top,{label:codexRebuildUpdaterLabel(s)});
+    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.status,{label:codexRebuildUpdaterStatusText(s)});
+    codexRebuildUpdaterSetRow(codexRebuildUpdaterIds.current,showVersion,'当前版本: '+codexRebuildUpdaterFormatVersion(s.version||s.appVersion));
+    codexRebuildUpdaterSetRow(codexRebuildUpdaterIds.next,!!s.updateVersion,'新版本: '+codexRebuildUpdaterFormatVersion(s.updateVersion));
+    codexRebuildUpdaterSetRow(codexRebuildUpdaterIds.size,!!(s.updateSize||s.activeDownloadSize),'更新包: '+codexRebuildUpdaterFormatBytes(s.updateSize||s.activeDownloadSize));
+    codexRebuildUpdaterSetRow(codexRebuildUpdaterIds.progress,showDownload,'进度: '+(pct==null?codexRebuildUpdaterUnknown:Math.floor(pct)+'%'));
+    codexRebuildUpdaterSetRow(codexRebuildUpdaterIds.downloaded,showDownload,'已下载: '+codexRebuildUpdaterFormatBytes(s.downloadedBytes)+' / '+codexRebuildUpdaterFormatBytes(s.activeDownloadSize||s.updateSize));
+    codexRebuildUpdaterSetRow(codexRebuildUpdaterIds.elapsed,showDownload,'耗时: '+codexRebuildUpdaterFormatElapsed(s.elapsedMs));
+    codexRebuildUpdaterSetRow(codexRebuildUpdaterIds.error,status==='error','错误信息: '+(s.error||'未知错误'));
+    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.check,{visible:status==='idle'||status==='no-update',enabled:status!=='checking'});
+    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.download,{visible:status==='available',enabled:status==='available'});
+    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.install,{visible:status==='ready',enabled:status==='ready'});
+    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.retry,{visible:status==='error',enabled:status==='error'});
+    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.clear,{visible:status==='error',enabled:status==='error'});
+    return s;
+  };
+  globalThis.__CodexRebuildUpdaterMenuSetState=codexRebuildUpdaterApplyState;
+  let codexRebuildSendUpdaterFallback=(status,extra={})=>{
+    let payload={status,feedUrl:null,version:null,appVersion:null,updateVersion:null,updateFile:null,updateFiles:null,updateSize:null,activeDownloadFile:null,activeDownloadSize:null,downloadedBytes:null,downloadStartedAt:null,elapsedMs:null,lastCheckedAt:Date.now(),error:null,...extra};
+    codexRebuildUpdaterApplyState(payload);
+    try{for(let win of a.BrowserWindow.getAllWindows()){if(!win.isDestroyed?.())win.webContents?.send?.(\`codex_rebuild:update-state\`,payload)}}catch{}
+    return payload;
+  };
+  let codexRebuildRunUpdaterCommand=(name,checkingStatus)=>{
+    if(checkingStatus)codexRebuildSendUpdaterFallback(checkingStatus);
+    try{
+      let command=globalThis.__CodexRebuildUpdaterCommand?.[name];
+      let result=command?.();
+      if(result){result.then?.(codexRebuildUpdaterApplyState)?.catch?.(e=>codexRebuildSendUpdaterFallback('error',{error:e&&e.message?e.message:String(e)}));return}
+    }catch(e){
+      codexRebuildSendUpdaterFallback('error',{error:e&&e.message?e.message:String(e)});
+      return;
+    }
+    codexRebuildSendUpdaterFallback('error',{error:'更新组件尚未初始化，请重启应用后再试'});
+  };
+  setTimeout(()=>{try{codexRebuildUpdaterApplyState(codexRebuildUpdaterState)}catch{}},0);
+  return {
+    helpItems:[],
+    topItems:[
+      {id:'codex-rebuild-updater-top',label:'检查更新',submenu:[
+        {id:'codex-rebuild-updater-status',label:'未检查更新',enabled:false},
+        {type:'separator'},
+        {id:'codex-rebuild-updater-current-version',label:'当前版本: -',enabled:false,visible:false},
+        {id:'codex-rebuild-updater-next-version',label:'新版本: -',enabled:false,visible:false},
+        {id:'codex-rebuild-updater-package-size',label:'更新包: -',enabled:false,visible:false},
+        {id:'codex-rebuild-updater-progress',label:'进度: -',enabled:false,visible:false},
+        {id:'codex-rebuild-updater-downloaded',label:'已下载: -',enabled:false,visible:false},
+        {id:'codex-rebuild-updater-elapsed',label:'耗时: -',enabled:false,visible:false},
+        {id:'codex-rebuild-updater-error',label:'错误信息: -',enabled:false,visible:false},
+        {type:'separator'},
+        {id:'codex-rebuild-updater-action-check',label:'立即检查更新',click:()=>{codexRebuildRunUpdaterCommand('check','checking')}},
+        {id:'codex-rebuild-updater-action-download',label:'下载更新',visible:false,click:()=>{codexRebuildRunUpdaterCommand('download','downloading')}},
+        {id:'codex-rebuild-updater-action-install',label:'重启安装',visible:false,click:()=>{codexRebuildRunUpdaterCommand('install',null)}},
+        {id:'codex-rebuild-updater-action-retry',label:'重试',visible:false,click:()=>{codexRebuildRunUpdaterCommand('check','checking')}},
+        {id:'codex-rebuild-updater-action-clear',label:'取消',visible:false,click:()=>{codexRebuildRunUpdaterCommand('clear','idle')}}
+      ]}
+    ]
+  }
+})()
+${MAIN_MENU_END_MARKER}`;
+}
+
+function patchMainMenuCode(code) {
+  const patch = makeMainMenuPatch();
+  let next = code;
+  if (code.includes(MAIN_MENU_START_MARKER)) {
+    const start = code.indexOf(MAIN_MENU_START_MARKER);
+    const end = code.indexOf(MAIN_MENU_END_MARKER, start);
+    if (end === -1) return code;
+    next = code.slice(0, start) + patch + code.slice(end + MAIN_MENU_END_MARKER.length);
+  } else {
+    const target = "let _t=[]";
+    const index = code.indexOf(target);
+    if (index === -1) return code;
+    next = code.slice(0, index) + `let _t=${patch}` + code.slice(index + target.length);
+  }
+
+  next = next.replace("..._t,{type:`separator`}", "..._t.helpItems,{type:`separator`}");
+  if (!next.includes("..._t.topItems],yt=a.Menu.buildFromTemplate(vt)")) {
+    const helpIndex = next.indexOf("{role:`help`,id:t.fo.help");
+    const anchor = "]}],yt=a.Menu.buildFromTemplate(vt)";
+    const anchorIndex = helpIndex === -1 ? -1 : next.indexOf(anchor, helpIndex);
+    if (anchorIndex !== -1) {
+      next =
+        next.slice(0, anchorIndex) +
+        "]},..._t.topItems],yt=a.Menu.buildFromTemplate(vt)" +
+        next.slice(anchorIndex + anchor.length);
+    }
+  }
+  return next;
+}
+
+function makeWebviewMenuBarFunctionPatch() {
+  return `function codexRebuildUpdaterEnsureTitlebarStyle(){let e='codex-rebuild-updater-titlebar-style';if(document.getElementById(e))return;let t=document.createElement('style');t.id=e,t.textContent=[
+'.cru-anchor{--cru-success:var(--color-token-charts-green,#22c55e);--cru-error:var(--color-token-error-foreground,#ef4444);position:relative;display:inline-flex;align-items:center;-webkit-app-region:no-drag}',
+'.cru-trigger{-webkit-app-region:no-drag;height:24px;min-width:72px;max-width:154px;display:inline-flex;align-items:center;gap:6px;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--color-token-text-tertiary);padding:0 9px;font:500 12px/1 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;white-space:nowrap;overflow:hidden;cursor:pointer;transition:background .16s ease,border-color .16s ease,color .16s ease,box-shadow .16s ease,transform .12s ease}',
+'.cru-trigger:hover,.cru-trigger.open{background:color-mix(in srgb,var(--color-token-foreground) 7%,transparent);color:var(--color-token-description-foreground)}',
+'.cru-trigger:active{transform:translateY(1px)}',
+'.cru-trigger:focus-visible{outline:2px solid color-mix(in srgb,var(--color-token-text-primary) 36%,transparent);outline-offset:2px}',
+'.cru-trigger.available{border-color:color-mix(in srgb,var(--cru-success) 50%,transparent);background:color-mix(in srgb,var(--cru-success) 11%,transparent);color:var(--cru-success)}',
+'.cru-trigger.ready{border-color:color-mix(in srgb,var(--cru-success) 58%,transparent);background:color-mix(in srgb,var(--cru-success) 14%,transparent);color:var(--cru-success)}',
+'.cru-trigger.error{border-color:color-mix(in srgb,var(--cru-error) 55%,transparent);background:color-mix(in srgb,var(--cru-error) 12%,transparent);color:var(--cru-error)}',
+'.cru-trigger.checking,.cru-trigger.downloading,.cru-trigger.preparing{border-color:color-mix(in srgb,var(--color-token-border-default) 70%,transparent);background:color-mix(in srgb,var(--color-token-foreground) 6%,transparent);color:var(--color-token-text-primary)}',
+'.cru-trigger.downloading::after{content:"";position:absolute;left:8px;right:auto;bottom:1px;width:var(--cru-progress,0%);max-width:calc(100% - 16px);height:2px;border-radius:999px;background:var(--cru-success);transition:width .18s ease}',
+'.cru-mark{position:relative;width:7px;height:7px;flex:0 0 7px;border-radius:999px;background:currentColor;opacity:.82}',
+'.cru-trigger.checking .cru-mark,.cru-trigger.downloading .cru-mark,.cru-trigger.preparing .cru-mark{width:10px;height:10px;flex-basis:10px;border:2px solid currentColor;border-top-color:transparent;background:transparent;animation:cru-spin .85s linear infinite}',
+'.cru-label{min-width:0;overflow:hidden;text-overflow:ellipsis}',
+'.cru-popover{-webkit-app-region:no-drag;position:absolute;top:31px;left:0;z-index:60;width:min(328px,calc(100vw - 24px));border:1px solid color-mix(in srgb,var(--color-token-border-default) 78%,transparent);border-radius:10px;background:color-mix(in srgb,var(--color-token-main-surface-primary) 96%,black 4%);color:var(--color-token-text-primary);box-shadow:0 18px 48px rgb(0 0 0 / .28);padding:12px;box-sizing:border-box;backdrop-filter:blur(18px);animation:cru-pop .14s ease-out;cursor:default}',
+'.cru-head{display:flex;align-items:flex-start;gap:10px;margin-bottom:10px}',
+'.cru-badge{display:flex;width:22px;height:22px;align-items:center;justify-content:center;border-radius:8px;background:color-mix(in srgb,var(--color-token-foreground) 7%,transparent);color:var(--color-token-text-secondary);flex:0 0 22px}',
+'.cru-popover.available .cru-badge,.cru-popover.ready .cru-badge{background:color-mix(in srgb,var(--cru-success) 14%,transparent);color:var(--cru-success)}',
+'.cru-popover.error .cru-badge{background:color-mix(in srgb,var(--cru-error) 14%,transparent);color:var(--cru-error)}',
+'.cru-title{font-size:13px;font-weight:650;line-height:1.25;margin:0 0 3px}',
+'.cru-body{font-size:12px;line-height:1.45;color:var(--color-token-text-secondary);margin:0}',
+'.cru-grid{display:grid;gap:6px;margin-top:8px}',
+'.cru-row{display:flex;min-height:22px;align-items:center;justify-content:space-between;gap:14px;color:var(--color-token-text-secondary);font-size:12px}',
+'.cru-row strong{min-width:0;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;color:var(--color-token-text-primary);font-weight:550}',
+'.cru-meter{height:6px;border-radius:999px;background:color-mix(in srgb,var(--color-token-border-default) 46%,transparent);overflow:hidden;margin:10px 0 4px}',
+'.cru-meter span{display:block;height:100%;width:0;border-radius:inherit;background:var(--cru-success);transition:width .18s ease}',
+'.cru-error{margin-top:8px;border:1px solid color-mix(in srgb,var(--cru-error) 42%,transparent);border-radius:8px;background:color-mix(in srgb,var(--cru-error) 9%,transparent);padding:8px;color:var(--color-token-text-primary);font-size:12px;line-height:1.45;word-break:break-word}',
+'.cru-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}',
+'.cru-action{-webkit-app-region:no-drag;height:28px;border:0;border-radius:7px;padding:0 11px;background:color-mix(in srgb,var(--color-token-foreground) 8%,transparent);color:var(--color-token-text-primary);font-size:12px;font-weight:560;cursor:pointer;transition:background .14s ease,transform .12s ease}',
+'.cru-action:hover{background:color-mix(in srgb,var(--color-token-foreground) 13%,transparent)}',
+'.cru-action:active{transform:translateY(1px)}',
+'.cru-action.primary{background:var(--color-token-button-background,#15803d);color:var(--color-token-button-foreground,#fff)}.cru-action.primary:hover{background:var(--vscode-button-hoverBackground,#16a34a)}',
+'.cru-action.danger{background:color-mix(in srgb,var(--cru-error) 18%,transparent);color:var(--cru-error)}.cru-action.danger:hover{background:color-mix(in srgb,var(--cru-error) 25%,transparent)}',
+'.cru-live{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}',
+'@keyframes cru-spin{to{transform:rotate(360deg)}}',
+'@keyframes cru-pop{from{opacity:0;transform:translateY(-3px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}',
+'@media (max-width:600px){.cru-popover{position:fixed;top:42px;left:12px;right:12px;width:auto;max-height:calc(100vh - 54px);overflow:auto}}',
+'@media (prefers-reduced-motion: reduce){.cru-trigger,.cru-action,.cru-meter span,.cru-popover{transition:none;animation:none}.cru-trigger.checking .cru-mark,.cru-trigger.downloading .cru-mark,.cru-trigger.preparing .cru-mark{animation:none}}'
+].join('\\n'),document.head.appendChild(t)}
+function codexRebuildUpdaterFormatVersion(e){return e?String(e):'-'}
+function codexRebuildUpdaterFormatBytes(e){let t=Number(e);if(!Number.isFinite(t)||t<=0)return'-';let n=['B','KB','MB','GB'],r=t,i=0;for(;r>=1024&&i<n.length-1;)r/=1024,i+=1;let a=i===0?0:r>=100?0:r>=10?1:2;return r.toFixed(a)+' '+n[i]}
+function codexRebuildUpdaterFormatElapsed(e){let t=Number(e);if(!Number.isFinite(t)||t<0)return'-';let n=Math.floor(t/1000),r=Math.floor(n/60),i=n%60;return r>0?r+'分'+String(i).padStart(2,'0')+'秒':i+'秒'}
+function codexRebuildUpdaterMenuBarProgress(e){let t=Number(e?.activeDownloadSize||e?.updateSize),n=Number(e?.downloadedBytes);return!Number.isFinite(t)||t<=0||!Number.isFinite(n)||n<0?null:Math.max(0,Math.min(100,n/t*100))}
+function codexRebuildUpdaterMenuBarLabel(e){let t=e?.status||'idle';if(t==='checking')return'检查中...';if(t==='available')return'有新版本';if(t==='downloading'){let n=codexRebuildUpdaterMenuBarProgress(e);return n==null?'下载中':'下载中 '+Math.floor(n)+'%'}if(t==='preparing')return'准备中';if(t==='ready')return'重启安装';if(t==='no-update')return'已是最新';if(t==='error')return'检查失败';return'检查更新'}
+function codexRebuildUpdaterStatusText(e){let t=e?.status||'idle';if(t==='checking')return'正在检查更新';if(t==='available')return'发现新版本';if(t==='downloading')return'正在下载更新';if(t==='preparing')return'正在准备安装';if(t==='ready')return'更新已下载';if(t==='no-update')return'当前已是最新版本';if(t==='error')return'检查更新失败';return'检查更新'}
+function codexRebuildUpdaterDescription(e){let t=e?.status||'idle';if(t==='checking')return'正在连接更新源，请稍候。';if(t==='available')return'确认后开始下载，下载完成后可重启安装。';if(t==='downloading')return'下载会在后台继续，点击按钮可随时查看进度。';if(t==='preparing')return'下载已完成，正在准备安装包。';if(t==='ready')return'重启 Codex 后会自动完成安装。';if(t==='no-update')return'当前安装版本已经是最新。';if(t==='error')return'请重试，或取消后稍后再检查。';return'点击后立即检查是否有新版本。'}
+function codexRebuildUpdaterBuildPanel(e,t){let n=e||{status:'idle'},r=n.status||'idle',i=codexRebuildUpdaterMenuBarProgress(n),a=i==null?0:Math.floor(i),o=codexRebuildUpdaterStatusText(n),s=codexRebuildUpdaterDescription(n),c=(e,t)=>(0,Zr.jsxs)('div',{className:'cru-row',children:[(0,Zr.jsx)('span',{children:e}),(0,Zr.jsx)('strong',{children:t})]}),l=(e,n,r='')=>(0,Zr.jsx)('button',{type:'button',className:'cru-action '+r,onClick:e=>{e.stopPropagation(),t(n)},children:e}),u=[c('当前版本',codexRebuildUpdaterFormatVersion(n.version||n.appVersion))];n.updateVersion&&u.push(c('新版本',codexRebuildUpdaterFormatVersion(n.updateVersion)));(n.updateSize||n.activeDownloadSize)&&u.push(c('更新包',codexRebuildUpdaterFormatBytes(n.updateSize||n.activeDownloadSize)));(r==='downloading'||r==='preparing')&&u.push(c('已下载',codexRebuildUpdaterFormatBytes(n.downloadedBytes)+' / '+codexRebuildUpdaterFormatBytes(n.activeDownloadSize||n.updateSize)));(r==='downloading'||r==='preparing')&&u.push(c('耗时',codexRebuildUpdaterFormatElapsed(n.elapsedMs)));let d=[];r==='idle'&&d.push(l('立即检查','check','primary'));r==='available'&&d.push(l('下载更新','download','primary'),l('稍后','close'));r==='ready'&&d.push(l('重启安装','install','primary'),l('稍后','close'));r==='error'&&d.push(l('重试','retry','primary'),l('取消','clear','danger'));(r==='checking'||r==='downloading'||r==='preparing'||r==='no-update')&&d.push(l('收起','close'));let f=(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'});return(0,Zr.jsxs)('div',{className:'cru-popover '+r,role:'dialog','aria-label':'更新状态',onPointerDown:e=>e.stopPropagation(),children:[(0,Zr.jsx)('div',{className:'cru-live','aria-live':'polite',children:o}),(0,Zr.jsxs)('div',{className:'cru-head',children:[(0,Zr.jsx)('div',{className:'cru-badge','aria-hidden':'true',children:f}),(0,Zr.jsxs)('div',{children:[(0,Zr.jsx)('div',{className:'cru-title',children:o}),(0,Zr.jsx)('p',{className:'cru-body',children:s})]})]}),(r==='downloading'||r==='preparing')&&(0,Zr.jsx)('div',{className:'cru-meter','aria-label':'下载进度 '+a+'%',children:(0,Zr.jsx)('span',{style:{width:a+'%'}})}),(0,Zr.jsx)('div',{className:'cru-grid',children:u}),r==='error'&&(0,Zr.jsx)('div',{className:'cru-error',role:'alert',children:n.error||'未知错误'}),(0,Zr.jsx)('div',{className:'cru-actions',children:d})]})}
+function Yr(){let e=D(),[t,n]=(0,Xr.useState)(null),[r,i]=(0,Xr.useState)({status:'idle'}),[a,o]=(0,Xr.useState)(false),s=(0,Xr.useRef)(0),c=(0,Xr.useRef)(null);(0,Xr.useEffect)(()=>{codexRebuildUpdaterEnsureTitlebarStyle();let e=window.codexRebuildUpdater;if(!e)return;let t=e=>{i(e||{status:'idle'})};e.getState?.().then(t).catch(()=>{});let n=e.onState?.(t);return typeof n==='function'?n:void 0},[]),(0,Xr.useEffect)(()=>{if(!a)return;let e=e=>{c.current?.contains?.(e.target)||o(!1)},t=e=>{e.key==='Escape'&&o(!1)};return document.addEventListener('pointerdown',e,!0),document.addEventListener('keydown',t,!0),()=>{document.removeEventListener('pointerdown',e,!0),document.removeEventListener('keydown',t,!0)}},[a]);if(!qr())return null;let l=async(e,t)=>{let r=window.electronBridge?.showApplicationMenu;if(!r)return;let i=s.current+1;s.current=i,n(e);let a=t.currentTarget.getBoundingClientRect();try{await r(e,Math.round(a.left),Math.round(a.bottom))}finally{s.current===i&&n(null)}},u=(e,t={})=>i(n=>({...n,...t,status:e})),d=e=>{let t=window.codexRebuildUpdater;if(e==='close'){o(!1);return}if(e==='clear'){o(!1),t?.clearUpdateState?.().then(i).catch(()=>{});return}if(e==='check'||e==='retry'){o(!0),u('checking',{error:null}),t?.checkForUpdates?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='download'){o(!0),u('downloading',{error:null,downloadedBytes:0,elapsedMs:0}),t?.downloadUpdate?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='install'){t?.installUpdate?.().catch(e=>u('error',{error:e&&e.message?e.message:String(e)}))}},f=e=>{let t=r?.status||'idle';if(t==='idle'){d('check');return}o(e=>!e)},p=codexRebuildUpdaterMenuBarLabel(r),m=codexRebuildUpdaterMenuBarProgress(r),h=m==null?0:Math.floor(m);return(0,Zr.jsx)('div',{className:'flex items-center gap-0.5 pr-2 pl-1',children:$r.map(({id:s,message:u})=>{if(s==='${WEBVIEW_UPDATER_MENU_ID}')return(0,Zr.jsxs)('div',{ref:c,className:'cru-anchor',children:[(0,Zr.jsxs)('button',{type:'button','aria-expanded':a,'aria-haspopup':'dialog','aria-label':p,className:'cru-trigger '+(r?.status||'idle')+(a?' open':''),style:{'--cru-progress':h+'%'},onClick:f,children:[(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'}),(0,Zr.jsx)('span',{className:'cru-label',children:p})]}),a&&codexRebuildUpdaterBuildPanel(r,d)]},s);return(0,Zr.jsx)('button',{type:'button','aria-expanded':t===s,'aria-haspopup':'menu','aria-label':e.formatMessage(u),className:M('no-drag rounded-md border border-transparent px-2.5 py-1 text-base font-normal leading-none outline-none transition-colors',t===s?'bg-[var(--color-token-menubar-selection-background)] text-[var(--color-token-menubar-selection-foreground)]':'text-token-text-tertiary hover:bg-token-foreground/5 hover:text-token-description-foreground focus-visible:bg-token-foreground/5 focus-visible:text-token-description-foreground'),onClick:e=>{l(s,e)},children:(0,Zr.jsx)(w,{...u})},s)})})}`;
+}
+
+function patchWebviewMenuBarCode(code) {
+  let next = code;
+  const menuAnchor =
+    "$r=[{id:_.file,message:Qr.file},{id:_.edit,message:Qr.edit},{id:_.view,message:Qr.view},{id:_.help,message:Qr.help}]";
+  const menuReplacement =
+    "$r=[{id:_.file,message:Qr.file},{id:_.edit,message:Qr.edit},{id:_.view,message:Qr.view},{id:_.help,message:Qr.help}," +
+    WEBVIEW_MENU_BAR_ITEM +
+    "]";
+
+  if (!next.includes("{id:'codex-rebuild-updater-top',message:")) {
+    next = next.replace(menuAnchor, menuReplacement);
+  }
+
+  const functionEndAnchor = "}var Xr,Zr,Qr,$r,ei=";
+  let functionStart = next.indexOf("function codexRebuildUpdaterEnsureTitlebarStyle");
+  if (functionStart === -1) functionStart = next.indexOf("function codexRebuildUpdaterMenuBarProgress");
+  if (functionStart === -1) functionStart = next.indexOf("function Yr(){");
+  const functionEnd = functionStart === -1 ? -1 : next.indexOf(functionEndAnchor, functionStart);
+  if (functionStart !== -1 && functionEnd !== -1) {
+    next =
+      next.slice(0, functionStart) +
+      makeWebviewMenuBarFunctionPatch() +
+      next.slice(functionEnd + 1);
+  }
+
+  return next;
 }
 
 function unwrapPatchedBootstrap(code) {
@@ -716,6 +1018,68 @@ function patchPreload() {
   console.log(`  [ok] ${relPath(preloadPath)}: added updater UI bridge`);
 }
 
+function patchMainMenu() {
+  const buildDir = path.join(SRC_DIR, "win", "_asar", ".vite", "build");
+  if (!fs.existsSync(buildDir)) {
+    console.log("  [ok] Windows main bundle directory not found");
+    return;
+  }
+
+  const candidates = fs
+    .readdirSync(buildDir)
+    .filter((name) => /^main-.*\.js$/.test(name))
+    .map((name) => path.join(buildDir, name));
+  const mainPath = candidates.find((candidate) => {
+    const code = fs.readFileSync(candidate, "utf-8");
+    return code.includes(MAIN_MENU_START_MARKER) || code.includes("let _t=[]");
+  });
+  if (!mainPath) {
+    console.log("  [ok] Windows main menu extension point not found");
+    return;
+  }
+
+  const code = fs.readFileSync(mainPath, "utf-8");
+  const next = patchMainMenuCode(code);
+  if (next === code) {
+    console.log(`  [ok] ${relPath(mainPath)}: updater menu already patched`);
+    return;
+  }
+
+  fs.writeFileSync(mainPath, next, "utf-8");
+  console.log(`  [ok] ${relPath(mainPath)}: added updater menu entries`);
+}
+
+function patchWebviewMenuBar() {
+  const assetsDir = path.join(SRC_DIR, "win", "_asar", "webview", "assets");
+  if (!fs.existsSync(assetsDir)) {
+    console.log("  [ok] Windows webview assets directory not found");
+    return;
+  }
+
+  const candidates = fs
+    .readdirSync(assetsDir)
+    .filter((name) => /^app-shell-.*\.js$/.test(name))
+    .map((name) => path.join(assetsDir, name));
+  const menuBarPath = candidates.find((candidate) => {
+    const code = fs.readFileSync(candidate, "utf-8");
+    return code.includes("windowsMenuBar.help") && code.includes("$r=[{id:_.file");
+  });
+  if (!menuBarPath) {
+    console.log("  [ok] Windows webview menu bar extension point not found");
+    return;
+  }
+
+  const code = fs.readFileSync(menuBarPath, "utf-8");
+  const next = patchWebviewMenuBarCode(code);
+  if (next === code) {
+    console.log(`  [ok] ${relPath(menuBarPath)}: updater titlebar menu already patched`);
+    return;
+  }
+
+  fs.writeFileSync(menuBarPath, next, "utf-8");
+  console.log(`  [ok] ${relPath(menuBarPath)}: added updater titlebar menu`);
+}
+
 function main() {
   const args = process.argv.slice(2);
   const platform = args.find((a) => ["mac-arm64", "mac-x64", "win", "unix"].includes(a));
@@ -727,6 +1091,8 @@ function main() {
   updatePackageMetadata();
   patchBootstrap();
   patchPreload();
+  patchMainMenu();
+  patchWebviewMenuBar();
 }
 
 main();
