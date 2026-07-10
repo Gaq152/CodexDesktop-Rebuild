@@ -11,9 +11,9 @@ const {
 const LATEST_NATIVE_APP_MAIN =
   "let routes={\"delete-archived-conversation\":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t))}";
 const LATEST_NATIVE_DATA_CONTROLS =
-  "let label={id:`settings.dataControls.archivedChats.delete`};async function D(e,t){await e(`delete-archived-conversation`,{conversationId:t});await e(`delete-archived-conversation`,{conversationId:t});return e(`thread/delete`,{threadId:t})}";
+  "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};async function D(e,t){await e(`delete-archived-conversation`,{conversationId:t});await e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)}";
 const LEGACY_DATA_CONTROLS =
-  "let button={route:`delete-conversation`,codexConfirmDelete:`true`}";
+  "function legacy(event,send,conversationId,hostId){if(event.currentTarget.dataset.codexConfirmDelete!==`true`)return;send(`delete-conversation`,{conversationId,hostId})}";
 
 test("recognizes the latest native archive-delete path without injecting a redundant route", () => {
   assert.equal(
@@ -85,7 +85,7 @@ test("rejects malformed native, zero, and ambiguous archive route anchors", () =
       patchAppMainSource(
         "let routes={\"delete-archived-conversation\":q7((e,{conversationId:t})=>e.archiveConversation(t))}",
       ),
-    /route.*expected exactly 1.*found 0/i,
+    /native archive route.*(?:malformed|expected exactly 1.*found 0)/i,
   );
   assert.throws(
     () => patchAppMainSource("let routes={}"),
@@ -109,7 +109,7 @@ test("rejects malformed native, zero, and ambiguous archive route anchors", () =
       patchDataControlsSource(
         `${LATEST_NATIVE_DATA_CONTROLS};e(\`delete-archived-conversation\`,{conversationId:t})`,
       ),
-    /native archive-delete UI route.*expected exactly 2.*found 3/i,
+    /native archive-delete UI.*(?:malformed|expected exactly 2.*found 3)/i,
   );
   const legacyRoute =
     "\"delete-conversation\":K7(async(e,{conversationId:t})=>{await e.sendRequest(\"thread/delete\",{threadId:t})})";
@@ -124,5 +124,33 @@ test("rejects malformed native, zero, and ambiguous archive route anchors", () =
         dataControlsSource: LEGACY_DATA_CONTROLS,
       }),
     /archive route\/UI mode mismatch/i,
+  );
+});
+
+test("rejects simultaneous structural native and legacy archive routes", () => {
+  const nativeRoute =
+    '"delete-archived-conversation":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t))';
+  const legacyRoute =
+    '"delete-conversation":K7(async(e,{conversationId:t})=>{await e.sendRequest("thread/delete",{threadId:t})})';
+  assert.throws(
+    () =>
+      patchArchiveContracts({
+        appMainSource: `let routes={${nativeRoute},${legacyRoute}}`,
+        dataControlsSource: LATEST_NATIVE_DATA_CONTROLS,
+      }),
+    /mixed|mutually exclusive|native.*legacy|archive/i,
+  );
+});
+
+test("rejects detached native archive UI tokens", () => {
+  const detachedUi = [
+    "const label=`settings.dataControls.archivedChats.delete`;",
+    "const one=`delete-archived-conversation`;",
+    "const two=`delete-archived-conversation`;",
+    "const protocol=`thread/delete`;",
+  ].join("");
+  assert.throws(
+    () => patchDataControlsSource(detachedUi),
+    /native|UI|structural|attached|archive/i,
   );
 });

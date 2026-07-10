@@ -133,6 +133,58 @@ function hasApiKeyAlternative(node, source, operand) {
   return found;
 }
 
+function flattenLogical(node, operator, terms = []) {
+  if (node?.type === "LogicalExpression" && node.operator === operator) {
+    flattenLogical(node.left, operator, terms);
+    flattenLogical(node.right, operator, terms);
+  } else {
+    terms.push(node);
+  }
+  return terms;
+}
+
+function authComparisonOperand(node, source, operator, value) {
+  if (node?.type !== "BinaryExpression" || node.operator !== operator) return null;
+  if (isStringLiteral(node.right, value)) return sourceFor(source, node.left);
+  if (isStringLiteral(node.left, value)) return sourceFor(source, node.right);
+  return null;
+}
+
+function exactAuthPair(node, source, logicalOperator, comparisonOperator) {
+  if (node?.type !== "LogicalExpression" || node.operator !== logicalOperator) return null;
+  const terms = flattenLogical(node, logicalOperator);
+  if (terms.length !== 2) return null;
+  const chat = terms
+    .map((term) => authComparisonOperand(term, source, comparisonOperator, CHATGPT_AUTH))
+    .find(Boolean);
+  const apiKey = terms
+    .map((term) => authComparisonOperand(term, source, comparisonOperator, APIKEY_AUTH))
+    .find(Boolean);
+  return chat != null && chat === apiKey ? chat : null;
+}
+
+function isRejectingConsequent(node) {
+  const statement =
+    node?.type === "BlockStatement" && node.body.length === 1 ? node.body[0] : node;
+  return (
+    statement?.type === "ReturnStatement" &&
+    statement.argument?.type === "UnaryExpression" &&
+    statement.argument.operator === "!" &&
+    statement.argument.argument?.type === "Literal" &&
+    statement.argument.argument.value === 1
+  );
+}
+
+function exactRequestMarkerAfter(node, source, comments) {
+  return comments.filter(
+    (comment) =>
+      comment.type === "Block" &&
+      (comment.start === node.end ||
+        (comment.start === node.end + 1 && source[node.end] === ")")) &&
+      comment.value.trim() === "CodexRebuildFastModeRequestAuth",
+  ).length === 1;
+}
+
 function isAlreadyExpandedToApiKey(parent, source, operand) {
   return (
     parent?.type === "LogicalExpression" &&
@@ -199,16 +251,19 @@ function collectPatches(ast, source) {
   return patches;
 }
 
-function collectAlreadyPatchedGates(ast, source) {
+function collectAlreadyPatchedGates(ast, source, comments) {
   const already = [];
-  walk(ast, (node) => {
+  walk(ast, (node, parent) => {
     if (!isFunctionNode(node)) return;
     const fnSrc = sourceFor(source, node);
     if (!fnSrc.includes("fast_mode")) return;
-    walk(node, (child, parent) => {
-      if (child.type === "BinaryExpression" && child.operator === "===") {
-        const operand = expressionSourceForChatGptSide(child, source);
-        if (operand == null || !isAlreadyExpandedToApiKey(parent, source, operand)) return;
+    walk(node, (child, childParent) => {
+      if (
+        child.type === "LogicalExpression" &&
+        child.operator === "||" &&
+        !(childParent?.type === "LogicalExpression" && childParent.operator === "||")
+      ) {
+        if (exactAuthPair(child, source, "||", "===") == null) return;
         addPatch(already, {
           id: "fast_mode_settings_auth_gate",
           start: child.start,
@@ -217,8 +272,9 @@ function collectAlreadyPatchedGates(ast, source) {
       }
       if (
         child.type === "IfStatement" &&
-        isPatchedRequestAuthGate(child.test, source) &&
-        source.slice(child.test.end, child.consequent.start).includes(REQUEST_AUTH_MARKER)
+        exactAuthPair(child.test, source, "&&", "!==") != null &&
+        exactRequestMarkerAfter(child.test, source, comments) &&
+        isRejectingConsequent(child.consequent)
       ) {
         addPatch(already, {
           id: "fast_mode_request_auth_gate",
@@ -232,13 +288,60 @@ function collectAlreadyPatchedGates(ast, source) {
 
 function analyzeFastModeSource(source) {
   let ast;
+  const comments = [];
   try {
-    ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+    ast = parse(source, {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      onComment: comments,
+    });
   } catch (error) {
     throw new Error(`fast_mode parse failed: ${error.message}`);
   }
   const patches = collectPatches(ast, source);
-  const already = collectAlreadyPatchedGates(ast, source);
+  const already = collectAlreadyPatchedGates(ast, source, comments);
+  const requestComments = comments.filter((comment) =>
+    comment.value.includes("CodexRebuildFastModeRequestAuth"),
+  );
+  const exactRequestComments = requestComments.filter(
+    (comment) =>
+      comment.type === "Block" &&
+      comment.value.trim() === "CodexRebuildFastModeRequestAuth",
+  );
+  if (
+    requestComments.length !== exactRequestComments.length ||
+    exactRequestComments.length > 1
+  ) {
+    throw new Error("fast_mode request auth marker postcondition is malformed");
+  }
+  let malformedAuthAlternative = false;
+  walk(ast, (node, parent) => {
+    if (!isFunctionNode(node) || !sourceFor(source, node).includes("fast_mode")) return;
+    walk(node, (child, childParent) => {
+      if (
+        malformedAuthAlternative ||
+        child.type !== "LogicalExpression" ||
+        child.operator !== "||" ||
+        (childParent?.type === "LogicalExpression" && childParent.operator === "||")
+      ) return;
+      const terms = flattenLogical(child, "||");
+      const operands = new Map();
+      for (const term of terms) {
+        for (const value of [CHATGPT_AUTH, APIKEY_AUTH]) {
+          const operand = authComparisonOperand(term, source, "===", value);
+          if (operand != null) operands.set(value, operand);
+        }
+      }
+      if (
+        operands.get(CHATGPT_AUTH) != null &&
+        operands.get(CHATGPT_AUTH) === operands.get(APIKEY_AUTH) &&
+        terms.length !== 2
+      ) malformedAuthAlternative = true;
+    });
+  });
+  if (malformedAuthAlternative) {
+    throw new Error("fast_mode settings auth postcondition has extra alternatives");
+  }
   const total = patches.length + already.length;
 
   let code = source;
@@ -362,4 +465,9 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { collectPatches, patchFastModeSource, planFastModeTargets };
+module.exports = {
+  collectPatches,
+  analyzeFastModeSource,
+  patchFastModeSource,
+  planFastModeTargets,
+};

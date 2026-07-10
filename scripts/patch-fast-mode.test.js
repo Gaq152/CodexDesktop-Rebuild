@@ -58,6 +58,36 @@ test("request-time fast_mode authorization still rejects non-OpenAI auth kinds",
   assert.equal(requestFastMode(null), false);
 });
 
+test("rejects a third settings auth alternative", () => {
+  assert.throws(
+    () =>
+      patchFastModeSource(
+        "function settings(auth,requirements){return requirements.fast_mode&&(auth===`chatgpt`||auth===`apikey`||auth===`amazonBedrock`)}",
+      ),
+    /fast_mode|auth gate|postcondition|exact/i,
+  );
+});
+
+test("rejects duplicate request markers in already evidence", () => {
+  assert.throws(
+    () =>
+      patchFastModeSource(
+        "function read(auth,requirements){if((auth!==`chatgpt`&&auth!==`apikey`)/* CodexRebuildFastModeRequestAuth *//* CodexRebuildFastModeRequestAuth */)return!1;return requirements.fast_mode}",
+      ),
+    /fast_mode|auth gate|marker|postcondition|exact/i,
+  );
+});
+
+test("rejects a marked request gate whose consequent does not reject", () => {
+  assert.throws(
+    () =>
+      patchFastModeSource(
+        "function read(auth,requirements){if((auth!==`chatgpt`&&auth!==`apikey`)/* CodexRebuildFastModeRequestAuth */){return!0}return requirements.fast_mode}",
+      ),
+    /fast_mode|auth gate|consequent|postcondition|exact/i,
+  );
+});
+
 test("rejects parse failures and zero or ambiguous fast_mode anchors", () => {
   assert.equal(typeof patchFastModeSource, "function");
   assert.throws(() => patchFastModeSource("function {"), /parse failed/i);

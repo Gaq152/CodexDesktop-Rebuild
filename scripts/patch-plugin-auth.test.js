@@ -93,7 +93,7 @@ test("rejects main-only, missing, and ambiguous plugin contracts", () => {
       patchPluginWebviewSource(
         LATEST_WEBVIEW_FIXTURE.replace("a=v(`410065390`)", "a=!1"),
       ),
-    /statsig.*expected exactly 3.*found 2/i,
+    /statsig.*browser_use_external.*expected exactly 1 gate.*found 0/i,
   );
   assert.throws(
     () =>
@@ -111,7 +111,66 @@ test("rejects detached plugin Statsig markers", () => {
     ";const decoyA=!0/* CodexRebuildPluginStatsig */,decoyB=!0/* CodexRebuildPluginStatsig */,decoyC=!0/* CodexRebuildPluginStatsig */";
   assert.throws(
     () => patchPluginWebviewSource(detached),
-    /statsig.*expected exactly 3.*found 0/i,
+    /statsig.*browser_use.*expected exactly 1 gate.*found 0/i,
+  );
+});
+
+test("rejects a plugin filter marker detached from the intended filter", () => {
+  const main = patchPluginMainSource(LATEST_MAIN_FIXTURE).code;
+  const detachedFilter =
+    main.replace("/* CodexRebuildPluginFilter */", "") +
+    ";const filterDecoy=!0/* CodexRebuildPluginFilter */";
+  assert.throws(
+    () => patchPluginMainSource(detachedFilter),
+    /filter|marker|attached|postcondition/i,
+  );
+});
+
+test("rejects duplicate plugin Statsig marker evidence", () => {
+  const webview =
+    patchPluginWebviewSource(LATEST_WEBVIEW_FIXTURE).code +
+    ";const statsigDecoy=!0/* CodexRebuildPluginStatsig */";
+  assert.throws(
+    () => patchPluginWebviewSource(webview),
+    /statsig|marker|attached|postcondition/i,
+  );
+});
+
+test("requires the exact availability map for every feature context", () => {
+  const patched = patchPluginWebviewSource(LATEST_WEBVIEW_FIXTURE).code;
+  const misplacedAvailability = patched
+    .replace("return{available:!0,isFetching", "return{allowed:!0,available:!0,isFetching")
+    .replace("return{allowed:!0,available:!0,isLoading:f", "return{available:!0,isLoading:f");
+  assert.throws(
+    () => patchPluginWebviewSource(misplacedAvailability),
+    /availability|computer_use|browser_use_external|postcondition/i,
+  );
+});
+
+test("requires exactly one attached Statsig gate per feature context", () => {
+  const patched = patchPluginWebviewSource(LATEST_WEBVIEW_FIXTURE).code;
+  const marker = "/* CodexRebuildPluginStatsig */";
+  const misplacedStatsig = patched
+    .replaceAll(marker, "")
+    .replace(
+      "return{available:!0,isFetching:b,isLoading:x,reason:_}",
+      `let A=!0${marker},B=!0${marker},C=!0${marker};return{available:!0,isFetching:b,isLoading:x,reason:_}`,
+    );
+  assert.throws(
+    () => patchPluginWebviewSource(misplacedStatsig),
+    /statsig|computer_use|browser_use|postcondition/i,
+  );
+});
+
+test("rejects a third plugin webview auth alternative", () => {
+  const patched = patchPluginWebviewSource(LATEST_WEBVIEW_FIXTURE).code;
+  const thirdAlternative = patched.replace(
+    "?.authMethod===`apikey`",
+    "?.authMethod===`apikey`||(0,B.useContext)(x)?.authMethod===`amazonBedrock`",
+  );
+  assert.throws(
+    () => patchPluginWebviewSource(thirdAlternative),
+    /auth|alternative|postcondition|exact/i,
   );
 });
 

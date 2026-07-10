@@ -456,6 +456,143 @@ function sequenceMemberAlias(node, property) {
   return null;
 }
 
+function parseSidebarDocument(code, label) {
+  const comments = [];
+  let ast;
+  try {
+    ast = acorn.parse(code, {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      onComment: comments,
+    });
+  } catch (error) {
+    throw new Error(`${label} parse failed: ${error.message}`);
+  }
+  return { ast, comments };
+}
+
+function exactSidebarComments(comments, name) {
+  return comments.filter(
+    (comment) => comment.type === "Block" && comment.value.trim() === name,
+  );
+}
+
+function patternBinding(pattern, name) {
+  if (pattern?.type !== "ObjectPattern") return null;
+  const property = pattern.properties.find(
+    (item) => item.type === "Property" && propertyName(item) === name,
+  );
+  return property?.value?.type === "Identifier" ? property.value.name : null;
+}
+
+function objectProperty(object, name) {
+  return object?.type === "ObjectExpression"
+    ? object.properties.find((property) => propertyName(property) === name)
+    : null;
+}
+
+function inspectThreadActionsPostcondition(code) {
+  const { ast, comments } = parseSidebarDocument(code, "sidebar thread-actions");
+  const markerComments = exactSidebarComments(comments, "CodexSidebarDeleteAction");
+  if (
+    markerComments.length !== 1 ||
+    comments.some(
+      (comment) =>
+        comment.value.includes("CodexSidebarDeleteAction") &&
+        (comment.type !== "Block" || comment.value.trim() !== "CodexSidebarDeleteAction"),
+    )
+  ) throw new Error("sidebar thread-actions marker postcondition is malformed");
+
+  const messageObjects = [];
+  const actionDeclarations = [];
+  const deleteBindings = [];
+  const functions = [];
+  walk(ast, (node) => {
+    if (node.type === "FunctionDeclaration") functions.push(node);
+    if (node.type === "ObjectExpression") {
+      const archive = objectProperty(node, "archiveThread");
+      const archiveId = objectProperty(archive?.value, "id");
+      if (literalValue(archiveId?.value) === "sidebarElectron.archiveThread") {
+        const expected = new Map([
+          ["deleteThread", "sidebarElectron.deleteThread"],
+          ["deleteThreadConfirmAction", "sidebarElectron.deleteThreadConfirmAction"],
+          ["deleteThreadError", "sidebarElectron.deleteThreadError"],
+        ]);
+        if (
+          [...expected].every(([name, id]) =>
+            literalValue(objectProperty(objectProperty(node, name)?.value, "id")?.value) === id,
+          )
+        ) messageObjects.push(node);
+      }
+    }
+    if (node.type === "VariableDeclaration") {
+      for (const declaration of node.declarations) {
+        if (declaration.id.type === "Identifier" && declaration.id.name === "CodexSidebarDeleteAction") {
+          actionDeclarations.push({ declaration, statement: node });
+        }
+      }
+    }
+    if (
+      node.type === "Property" &&
+      propertyName(node) === "deleteThread" &&
+      node.value?.type === "Identifier" &&
+      node.value.name === "CodexSidebarDeleteAction"
+    ) deleteBindings.push(node);
+  });
+  if (messageObjects.length !== 1) {
+    throw new Error(`sidebar messages postcondition expected exactly 1 object, found ${messageObjects.length}`);
+  }
+  if (actionDeclarations.length !== 1 || deleteBindings.length !== 1) {
+    throw new Error("sidebar thread-actions action/binding postcondition is incomplete");
+  }
+  const { declaration, statement } = actionDeclarations[0];
+  if (markerComments[0].end !== statement.start) {
+    throw new Error("sidebar thread-actions action marker is detached");
+  }
+  if (declaration.init?.type !== "ArrowFunctionExpression" || declaration.init.params.length !== 1) {
+    throw new Error("sidebar thread-actions delete action is not executable");
+  }
+  const parameter = declaration.init.params[0];
+  const bindingPatterns = [];
+  walk(declaration.init.body, (node) => {
+    if (
+      node.type === "VariableDeclarator" &&
+      node.id.type === "ObjectPattern" &&
+      node.init?.type === "Identifier" &&
+      parameter.type === "Identifier" &&
+      node.init.name === parameter.name
+    ) bindingPatterns.push(node.id);
+  });
+  if (bindingPatterns.length !== 1) throw new Error("sidebar thread-actions delete parameters are missing");
+  const conversationId = patternBinding(bindingPatterns[0], "conversationId");
+  const hostId = patternBinding(bindingPatterns[0], "hostId");
+  const routeCalls = [];
+  walk(declaration.init.body, (node) => {
+    if (
+      node.type === "CallExpression" &&
+      literalValue(node.arguments[0]) === "delete-archived-conversation" &&
+      node.arguments[1]?.type === "ObjectExpression"
+    ) routeCalls.push(node);
+  });
+  if (routeCalls.length !== 1 || !conversationId || !hostId) {
+    throw new Error("sidebar thread-actions delete route postcondition is incomplete");
+  }
+  const routeOptions = routeCalls[0].arguments[1];
+  const conversationProperty = objectProperty(routeOptions, "conversationId");
+  const hostProperty = objectProperty(routeOptions, "hostId");
+  if (
+    !conversationProperty ||
+    !hostProperty ||
+    sourceFor(code, conversationProperty.value) !== conversationId ||
+    sourceFor(code, hostProperty.value) !== hostId
+  ) throw new Error("sidebar thread-actions delete route bindings are mismatched");
+  const enclosing = functions.filter(
+    (fn) => fn.start < statement.start && fn.end > statement.end && fn.start < deleteBindings[0].start && fn.end > deleteBindings[0].end,
+  );
+  if (enclosing.length !== 1) throw new Error("sidebar thread-actions delete binding is detached");
+  return { status: "already" };
+}
+
 function patchThreadActionsSource(code) {
   const messageMarker = "id:`sidebarElectron.deleteThread`";
   const actionMarker = "/* CodexSidebarDeleteAction */";
@@ -463,19 +600,7 @@ function patchThreadActionsSource(code) {
   const actionCount = countOccurrences(code, actionMarker);
   const bindingCount = countOccurrences(code, "deleteThread:CodexSidebarDeleteAction");
   if (messageCount > 0 || actionCount > 0 || bindingCount > 0) {
-    if (messageCount !== 1) {
-      throw new Error(
-        `sidebar messages expected exactly 1 target, found ${messageCount}`,
-      );
-    }
-    if (actionCount !== 1 || bindingCount !== 1) {
-      throw new Error(
-        `sidebar action expected exactly 1 target, found ${Math.max(actionCount, bindingCount)}`,
-      );
-    }
-    if (!code.includes("delete-archived-conversation")) {
-      throw new Error("sidebar thread-actions patch is only partially present");
-    }
+    inspectThreadActionsPostcondition(code);
     return {
       code,
       status: "already",
@@ -540,12 +665,14 @@ function patchThreadActionsSource(code) {
   const action =
     `${actionMarker}let CodexSidebarDeleteAction=e=>{let{conversationId:n,hostId:i,onDeleteStart:a,onDeleteSuccess:o,onDeleteError:s}=e;` +
     `a?.(),${sendFunction}(\`delete-archived-conversation\`,{conversationId:n,hostId:i}).then(()=>o?.()).catch(()=>s?.())};`;
-  return {
-    code: applySourceReplacements(code, [
+  const next = applySourceReplacements(code, [
       { start: archiveMessages[0].end, end: archiveMessages[0].end, text: messages },
       { start: resultObjects[0].start + 1, end: resultObjects[0].start + 1, text: "deleteThread:CodexSidebarDeleteAction," },
       { start: finalReturn.start, end: finalReturn.start, text: action },
-    ]),
+    ]);
+  inspectThreadActionsPostcondition(next);
+  return {
+    code: next,
     status: "patched",
     counts: {
       messages: sidebarCount(1, 0, "sidebar messages"),
@@ -709,22 +836,198 @@ function analyzeRowFunction(code, node, hoverFunctionName) {
   };
 }
 
+function functionContaining(functions, node) {
+  return functions.filter((fn) => fn.start < node.start && fn.end > node.end);
+}
+
+function callToIdentifier(root, name, predicate = () => true) {
+  const calls = [];
+  walk(root, (node) => {
+    if (
+      node.type === "CallExpression" &&
+      node.callee.type === "Identifier" &&
+      node.callee.name === name &&
+      predicate(node)
+    ) calls.push(node);
+  });
+  return calls;
+}
+
+function inspectSidebarPostcondition(code) {
+  const { ast, comments } = parseSidebarDocument(code, "sidebar UI");
+  const hoverComments = exactSidebarComments(comments, "CodexSidebarDeleteHover");
+  const rowComments = exactSidebarComments(comments, "CodexSidebarDeleteRow");
+  if (hoverComments.length !== 1 || rowComments.length !== 1) {
+    throw new Error("sidebar hover/row marker postcondition is malformed");
+  }
+  if (
+    comments.some(
+      (comment) =>
+        (comment.value.includes("CodexSidebarDeleteHover") ||
+          comment.value.includes("CodexSidebarDeleteRow")) &&
+        !["CodexSidebarDeleteHover", "CodexSidebarDeleteRow"].includes(comment.value.trim()),
+    )
+  ) throw new Error("sidebar hover/row marker postcondition is malformed");
+  const functions = [];
+  const hoverDeclarations = [];
+  walk(ast, (node) => {
+    if (node.type === "FunctionDeclaration") functions.push(node);
+    if (node.type === "VariableDeclaration") {
+      for (const declaration of node.declarations) {
+        if (declaration.id.type === "Identifier" && declaration.id.name === "CodexSidebarDeleteActions") {
+          hoverDeclarations.push({ declaration, statement: node });
+        }
+      }
+    }
+  });
+  if (hoverDeclarations.length !== 1) {
+    throw new Error("sidebar hover action postcondition is missing");
+  }
+  const hoverDeclaration = hoverDeclarations[0];
+  if (hoverComments[0].end !== hoverDeclaration.statement.start) {
+    throw new Error("sidebar hover action marker is detached");
+  }
+  const hoverFunctions = functionContaining(functions, hoverDeclaration.statement);
+  if (hoverFunctions.length !== 1) throw new Error("sidebar hover action is detached");
+  const hoverFunction = hoverFunctions[0];
+  const deleteActionBindings = [];
+  walk(hoverFunction, (node) => {
+    if (node.type === "ObjectPattern") {
+      const binding = patternBinding(node, "deleteAction");
+      if (binding === "CodexDeleteAction") deleteActionBindings.push(node);
+    }
+  });
+  const expectedActions = new Map([
+    ["thread-delete-action", "onRequest"],
+    ["thread-delete-confirm-action", "onConfirm"],
+  ]);
+  const actionObjects = new Map();
+  walk(hoverDeclaration.declaration.init, (node) => {
+    if (node.type !== "ObjectExpression") return;
+    const id = literalValue(objectProperty(node, "id")?.value);
+    if (expectedActions.has(id)) actionObjects.set(id, node);
+  });
+  if (deleteActionBindings.length !== 1 || actionObjects.size !== expectedActions.size) {
+    throw new Error("sidebar hover action wiring is incomplete");
+  }
+  for (const [id, method] of expectedActions) {
+    const onClick = objectProperty(actionObjects.get(id), "onClick")?.value;
+    if (
+      onClick?.type !== "MemberExpression" ||
+      onClick.object?.type !== "Identifier" ||
+      onClick.object.name !== "CodexDeleteAction" ||
+      onClick.property?.name !== method
+    ) throw new Error(`sidebar hover ${id} handler is detached`);
+  }
+  let spreadIntoRenderedActions = 0;
+  walk(hoverFunction, (node) => {
+    if (
+      node.type === "Property" &&
+      propertyName(node) === "actions" &&
+      node.value?.type === "ArrayExpression" &&
+      node.value.elements.some(
+        (element) =>
+          element?.type === "SpreadElement" &&
+          element.argument?.type === "Identifier" &&
+          element.argument.name === "CodexSidebarDeleteActions",
+      )
+    ) spreadIntoRenderedActions += 1;
+  });
+  if (spreadIntoRenderedActions !== 1) {
+    throw new Error("sidebar hover delete actions are not attached to the rendered action list");
+  }
+
+  const rowFunctions = functions.filter(
+    (fn) => fn.body.start < rowComments[0].start && fn.body.end > rowComments[0].end,
+  );
+  if (rowFunctions.length !== 1 || rowComments[0].start !== rowFunctions[0].body.start + 1) {
+    throw new Error("sidebar row marker is detached");
+  }
+  const rowFunction = rowFunctions[0];
+  let deleteThreadBinding = 0;
+  let stateBinding = 0;
+  const rowDeclarations = new Map();
+  const deleteMenuItems = [];
+  const deleteActionProps = [];
+  const hoverCounts = [];
+  const mouseLeaves = [];
+  walk(rowFunction, (node) => {
+    if (node.type === "ObjectPattern" && patternBinding(node, "deleteThread") === "CodexDeleteThread") {
+      deleteThreadBinding += 1;
+    }
+    if (
+      node.type === "VariableDeclarator" &&
+      node.id.type === "ArrayPattern" &&
+      node.id.elements[0]?.name === "CodexDeleteConfirm" &&
+      node.id.elements[1]?.name === "CodexSetDeleteConfirm"
+    ) stateBinding += 1;
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier") {
+      rowDeclarations.set(node.id.name, node.init);
+    }
+    if (node.type === "ObjectExpression") {
+      if (literalValue(objectProperty(node, "id")?.value) === "delete-thread") deleteMenuItems.push(node);
+      const deleteAction = objectProperty(node, "deleteAction");
+      if (deleteAction) deleteActionProps.push(deleteAction.value);
+      const hoverCount = objectProperty(node, "additionalHoverActionCount");
+      if (hoverCount) hoverCounts.push(hoverCount.value);
+      const mouseLeave = objectProperty(node, "onMouseLeave");
+      if (mouseLeave) mouseLeaves.push(mouseLeave.value);
+    }
+  });
+  const requestDelete = rowDeclarations.get("CodexRequestDelete");
+  const confirmDelete = rowDeclarations.get("CodexConfirmDelete");
+  if (
+    deleteThreadBinding !== 1 ||
+    stateBinding !== 1 ||
+    !requestDelete ||
+    !confirmDelete ||
+    deleteMenuItems.length !== 1 ||
+    deleteActionProps.length !== 1 ||
+    hoverCounts.length !== 1 ||
+    mouseLeaves.length !== 1
+  ) throw new Error("sidebar row delete state/action wiring is incomplete");
+  const menuOnSelect = objectProperty(deleteMenuItems[0], "onSelect")?.value;
+  if (menuOnSelect?.type !== "Identifier" || menuOnSelect.name !== "CodexRequestDelete") {
+    throw new Error("sidebar row delete menu item is detached");
+  }
+  const deleteAction = deleteActionProps[0];
+  const expectedDeleteActionBindings = new Map([
+    ["confirming", "CodexDeleteConfirm"],
+    ["onRequest", "CodexRequestDelete"],
+    ["onConfirm", "CodexConfirmDelete"],
+  ]);
+  if (
+    deleteAction?.type !== "ObjectExpression" ||
+    [...expectedDeleteActionBindings].some(([name, binding]) => {
+      const value = objectProperty(deleteAction, name)?.value;
+      return value?.type !== "Identifier" || value.name !== binding;
+    })
+  ) throw new Error("sidebar row deleteAction prop is malformed");
+  if (
+    hoverCounts[0]?.type !== "BinaryExpression" ||
+    hoverCounts[0].operator !== "+" ||
+    literalValue(hoverCounts[0].right) !== 1
+  ) throw new Error("sidebar row additional hover action count is not incremented");
+  const confirmCalls = callToIdentifier(confirmDelete, "CodexDeleteThread", (call) =>
+    call.arguments[0]?.type === "ObjectExpression" &&
+    ["conversationId", "hostId"].every((name) => objectProperty(call.arguments[0], name)),
+  );
+  if (
+    callToIdentifier(requestDelete, "CodexSetDeleteConfirm", (call) => sourceFor(code, call.arguments[0]) === "!0").length !== 1 ||
+    callToIdentifier(confirmDelete, "CodexSetDeleteConfirm", (call) => sourceFor(code, call.arguments[0]) === "!1").length !== 1 ||
+    confirmCalls.length !== 1 ||
+    callToIdentifier(mouseLeaves[0], "CodexSetDeleteConfirm", (call) => sourceFor(code, call.arguments[0]) === "!1").length !== 1
+  ) throw new Error("sidebar row request/confirm/reset handlers are not wired");
+  return { status: "already" };
+}
+
 function patchSidebarSource(code) {
   const hoverMarker = "/* CodexSidebarDeleteHover */";
   const rowMarker = "/* CodexSidebarDeleteRow */";
   const hoverCount = countOccurrences(code, hoverMarker);
   const rowCount = countOccurrences(code, rowMarker);
   if (hoverCount > 0 || rowCount > 0) {
-    if (hoverCount !== 1) {
-      throw new Error(`sidebar hover expected exactly 1 target, found ${hoverCount}`);
-    }
-    if (rowCount !== 1) {
-      throw new Error(`sidebar row expected exactly 1 target, found ${rowCount}`);
-    }
-    if (
-      !code.includes("thread-delete-confirm-action") ||
-      !code.includes("id:`delete-thread`")
-    ) throw new Error("sidebar delete UI patch is only partially present");
+    inspectSidebarPostcondition(code);
     return {
       code,
       status: "already",
@@ -830,8 +1133,10 @@ function patchSidebarSource(code) {
       text: ",onMouseLeave:()=>CodexSetDeleteConfirm(!1)",
     },
   ];
+  const next = applySourceReplacements(code, replacements);
+  inspectSidebarPostcondition(next);
   return {
-    code: applySourceReplacements(code, replacements),
+    code: next,
     status: "patched",
     counts: {
       hover: sidebarCount(1, 0, "sidebar hover"),
@@ -912,4 +1217,10 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { patchThreadActionsSource, patchSidebarSource, patchSidebarContracts };
+module.exports = {
+  inspectThreadActionsPostcondition,
+  inspectSidebarPostcondition,
+  patchThreadActionsSource,
+  patchSidebarSource,
+  patchSidebarContracts,
+};

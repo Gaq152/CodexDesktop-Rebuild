@@ -27,6 +27,66 @@ const {
   executeLocalUpdater,
 } = require("./patch-local-updater");
 
+const LATEST_LOCAL_MAIN_SOURCE =
+  "let Rt=[],zt=[{label:`File`},{role:`help`,id:n.To.help,submenu:[ot,...Rt,...t?[]:[{type:`separator`},je]]}],Bt=c.Menu.buildFromTemplate(zt);";
+const LATEST_LOCAL_WEBVIEW_SOURCE = withRealQuotedKeys(
+  "function Ti(){let e=S(),[t,n]=(0,Ei.useState)(null),r=(0,Ei.useRef)(0);if(!Ci())return null;let i=async(e,t)=>{let i=window.electronBridge?.showApplicationMenu;if(!i)return;let a=r.current+1;r.current=a,n(e);let o=t.currentTarget.getBoundingClientRect();try{await i(e,Math.round(o.left),Math.round(o.bottom))}finally{r.current===a&&n(null)}};return(0,Di.jsx)(`div`,{className:`flex items-center gap-0.5 pr-2 pl-1`,children:ki.map(({id:n,message:r})=>(0,Di.jsx)(`button`,{type:`button`,`aria-expanded`:t===n,`aria-haspopup`:`menu`,`aria-label`:e.formatMessage(r),className:M(`no-drag`,t===n?`selected`:`idle`),onClick:e=>{i(n,e)},children:(0,Di.jsx)(T,{...r})},n))})}var Ei,Di,Oi,ki,Ai=e((()=>{Ei=t(n(),1),Di=g(),Oi=C({file:{id:`windowsMenuBar.file`},edit:{id:`windowsMenuBar.edit`},view:{id:`windowsMenuBar.view`},help:{id:`windowsMenuBar.help`}}),ki=[{id:_.file,message:Oi.file},{id:_.edit,message:Oi.edit},{id:_.view,message:Oi.view},{id:_.help,message:Oi.help}]}));(0,Di.jsx)(Ti,{});",
+);
+
+function makeCleanLocalUpdaterSources() {
+  return {
+    packageSource: JSON.stringify({
+      name: "openai-codex-electron",
+      main: ".vite/build/early-bootstrap.js",
+    }),
+    files: {
+      ".vite/build/early-bootstrap.js":
+        "require(`./src-BZqs_tzA.js`),Promise.resolve().then(()=>require(`./bootstrap-BXjiq4qE.js`));",
+      ".vite/build/bootstrap-BXjiq4qE.js": "require(`./src-BZqs_tzA.js`);",
+      ".vite/build/preload.js":
+        "let q=require(`electron`);\n//# sourceMappingURL=preload.js.map",
+      ".vite/build/main-CZpDUN17.js": LATEST_LOCAL_MAIN_SOURCE,
+      "webview/assets/app-shell-CVVppk_a.js": LATEST_LOCAL_WEBVIEW_SOURCE,
+      "webview/assets/app-shell-ref-BQ-lb9Hp.js":
+        "export const appShellRef={current:null};",
+      "webview/assets/app-shell-state-16Itmyrv.js":
+        "export const state={ready:true};",
+    },
+  };
+}
+
+function applyLocalUpdaterPlan(sources) {
+  const plan = planLocalUpdaterSources(sources);
+  const next = {
+    packageSource: sources.packageSource,
+    files: { ...sources.files },
+  };
+  for (const change of plan.changes) {
+    if (change.path === "package.json") next.packageSource = change.code;
+    else next.files[change.path] = change.code;
+  }
+  return { ...next, plan };
+}
+
+function writeLocalUpdaterSources(asarRoot, sources) {
+  const write = (relative, text) => {
+    const file = path.join(asarRoot, ...relative.split("/"));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, text);
+  };
+  write("package.json", sources.packageSource);
+  for (const [relative, source] of Object.entries(sources.files)) write(relative, source);
+}
+
+function snapshotLocalUpdaterTargets(asarRoot, relativePaths) {
+  return new Map(
+    relativePaths.map((relative) => [
+      relative,
+      fs.readFileSync(path.join(asarRoot, ...relative.split("/")), "utf8"),
+    ]),
+  );
+}
+
 {
   const bootstrap = makeBootstrapPrefix();
 
@@ -132,7 +192,9 @@ const {
 {
   const source =
     "function Yr(){let e=D(),[t,n]=(0,Xr.useState)(null),r=(0,Xr.useRef)(0);if(!qr())return null;let i=async(e,t)=>{let i=window.electronBridge?.showApplicationMenu;if(!i)return;let a=r.current+1;r.current=a,n(e);let o=t.currentTarget.getBoundingClientRect();try{await i(e,Math.round(o.left),Math.round(o.bottom))}finally{r.current===a&&n(null)}};return(0,Zr.jsx)(`div`,{className:`flex items-center gap-0.5 pr-2 pl-1`,children:$r.map(({id:n,message:r})=>(0,Zr.jsx)(`button`,{type:`button`,`aria-expanded`:t===n,`aria-haspopup`:`menu`,`aria-label`:e.formatMessage(r),className:M(`no-drag rounded-md border border-transparent px-2.5 py-1 text-base font-normal leading-none outline-none transition-colors`,t===n?`bg-[var(--color-token-menubar-selection-background)] text-[var(--color-token-menubar-selection-foreground)]`:`text-token-text-tertiary hover:bg-token-foreground/5 hover:text-token-description-foreground focus-visible:bg-token-foreground/5 focus-visible:text-token-description-foreground`),onClick:e=>{i(n,e)},children:(0,Zr.jsx)(w,{...r})},n))})}var Xr,Zr,Qr,$r,ei=e((()=>{j(),v(),Xr=t(n(),1),C(),Jr(),Zr=r(),Qr=T({file:{id:`windowsMenuBar.file`,defaultMessage:`File`,description:`Label for the File menu in the desktop application menu bar`},edit:{id:`windowsMenuBar.edit`,defaultMessage:`Edit`,description:`Label for the Edit menu in the desktop application menu bar`},view:{id:`windowsMenuBar.view`,defaultMessage:`View`,description:`Label for the View menu in the desktop application menu bar`},help:{id:`windowsMenuBar.help`,defaultMessage:`Help`,description:`Label for the Help menu in the desktop application menu bar`}}),$r=[{id:_.file,message:Qr.file},{id:_.edit,message:Qr.edit},{id:_.view,message:Qr.view},{id:_.help,message:Qr.help}]}));";
-  const patched = patchWebviewMenuBarCode(withRealQuotedKeys(source));
+  const patched = patchWebviewMenuBarCode(
+    withRealQuotedKeys(`${source}(0,Zr.jsx)(Yr,{});`),
+  );
 
   assert.ok(patched.includes("id:'codex-rebuild-updater-top'"));
   assert.ok(patched.includes("defaultMessage:`检查更新`"));
@@ -179,7 +241,9 @@ test("patchWebviewMenuBarCode adapts the latest titlebar aliases structurally", 
   const source =
     "import{a as dep}from\"./dep.js\";function Ti(){let e=S(),[t,n]=(0,Ei.useState)(null),r=(0,Ei.useRef)(0);if(!Ci())return null;let i=async(e,t)=>{let i=window.electronBridge?.showApplicationMenu;if(!i)return;let a=r.current+1;r.current=a,n(e);let o=t.currentTarget.getBoundingClientRect();try{await i(e,Math.round(o.left),Math.round(o.bottom))}finally{r.current===a&&n(null)}};return(0,Di.jsx)(`div`,{className:`flex items-center gap-0.5 pr-2 pl-1`,children:ki.map(({id:n,message:r})=>(0,Di.jsx)(`button`,{type:`button`,`aria-expanded`:t===n,`aria-haspopup`:`menu`,`aria-label`:e.formatMessage(r),className:M(`no-drag`,t===n?`selected`:`idle`),onClick:e=>{i(n,e)},children:(0,Di.jsx)(T,{...r})},n))})}var Ei,Di,Oi,ki,Ai=e((()=>{Ei=t(n(),1),Di=g(),Oi=C({file:{id:`windowsMenuBar.file`},edit:{id:`windowsMenuBar.edit`},view:{id:`windowsMenuBar.view`},help:{id:`windowsMenuBar.help`}}),ki=[{id:_.file,message:Oi.file},{id:_.edit,message:Oi.edit},{id:_.view,message:Oi.view},{id:_.help,message:Oi.help}]}));";
 
-  const patched = patchWebviewMenuBarCode(withRealQuotedKeys(source));
+  const patched = patchWebviewMenuBarCode(
+    withRealQuotedKeys(`${source}(0,Di.jsx)(Ti,{});`),
+  );
 
   assert.match(patched, /id:'codex-rebuild-updater-top'/);
   assert.match(patched, /function Ti\(\)/);
@@ -256,6 +320,95 @@ test("patches the latest preload electron binding without a hard-coded alias", (
   );
 });
 
+test("rejects a marker-complete but inert backend shell", () => {
+  const patched = applyLocalUpdaterPlan(makeCleanLocalUpdaterSources());
+  patched.files[".vite/build/bootstrap-BXjiq4qE.js"] = [
+    "/* CodexRebuildLocalUpdater:start */",
+    "const channel=`codex_rebuild:update-command`;",
+    "/* CodexRebuildLocalUpdater:end */",
+    "if(!CodexRebuildWindowsBootstrap()){require(`./src-BZqs_tzA.js`)}",
+    "/* CodexRebuildLocalUpdater:file-end */",
+  ].join("\n");
+
+  assert.throws(
+    () => planLocalUpdaterSources(patched),
+    /backend|bootstrap|canonical|postcondition/i,
+  );
+});
+
+test("rejects a marker-complete main-menu block that is not attached to the live template", () => {
+  const patched = applyLocalUpdaterPlan(makeCleanLocalUpdaterSources());
+  patched.files[".vite/build/main-CZpDUN17.js"] =
+    `${LATEST_LOCAL_MAIN_SOURCE};const detachedUpdater=${makeMainMenuPatch("c")};`;
+
+  assert.throws(
+    () => planLocalUpdaterSources(patched),
+    /main menu|canonical|attached|postcondition/i,
+  );
+});
+
+test("rejects empty and unrendered titlebar helper and descriptor shells", () => {
+  const patched = applyLocalUpdaterPlan(makeCleanLocalUpdaterSources());
+  patched.files["webview/assets/app-shell-CVVppk_a.js"] =
+    `${LATEST_LOCAL_WEBVIEW_SOURCE};function codexRebuildUpdaterEnsureTitlebarStyle(){}` +
+    ";const detached=[{id:'codex-rebuild-updater-top',message:{}}];";
+
+  assert.throws(
+    () => planLocalUpdaterSources(patched),
+    /titlebar|webview|canonical|rendered|postcondition/i,
+  );
+});
+
+test("rejects stale or mismatched canonical updater block versions", () => {
+  const patched = applyLocalUpdaterPlan(makeCleanLocalUpdaterSources());
+  patched.files[".vite/build/bootstrap-BXjiq4qE.js"] +=
+    "\n/* CodexRebuildLocalUpdater:v0:start */\n";
+
+  assert.throws(
+    () => planLocalUpdaterSources(patched),
+    /backend|bootstrap|canonical|version|postcondition/i,
+  );
+});
+
+test("rejects a preload bridge detached from executable Program-scope exposure", () => {
+  const patched = applyLocalUpdaterPlan(makeCleanLocalUpdaterSources());
+  const canonical = makePreloadPatch("q").split("\n");
+  patched.files[".vite/build/preload.js"] = [
+    "let q=require(`electron`);",
+    canonical[0],
+    "function hidden(){q.contextBridge.exposeInMainWorld('codexRebuildUpdater',{})}",
+    canonical.at(-1),
+    "//# sourceMappingURL=preload.js.map",
+  ].join("\n");
+
+  assert.throws(
+    () => planLocalUpdaterSources(patched),
+    /preload|canonical|Program|exposure|postcondition/i,
+  );
+});
+
+test("resolves only the live top-level early-bootstrap target", () => {
+  const packageSource = JSON.stringify({ main: ".vite/build/early-bootstrap.js" });
+  const files = {
+    ".vite/build/early-bootstrap.js": [
+      "// require(`./bootstrap-COMMENT.js`)",
+      "const text='require(`./bootstrap-STRING.js`)'",
+      "function dead(){require(`./bootstrap-DEAD.js`)}",
+      "Promise.resolve().then(()=>require(`./bootstrap-LIVE.js`));",
+    ].join("\n"),
+    ".vite/build/bootstrap-LIVE.js": "require(`./src.js`);",
+  };
+
+  assert.deepEqual(
+    resolveRuntimeBootstrap(packageSource, (file) => files[file]),
+    {
+      entryPath: ".vite/build/early-bootstrap.js",
+      runtimePath: ".vite/build/bootstrap-LIVE.js",
+      viaEarlyBootstrap: true,
+    },
+  );
+});
+
 test("plans all five updater layers before writing and keeps failed plans at zero writes", (t) => {
   assert.equal(typeof patchPackageMetadataSource, "function");
   assert.equal(typeof planLocalUpdaterSources, "function");
@@ -279,6 +432,7 @@ test("plans all five updater layers before writing and keeps failed plans at zer
   const webviewSource = withRealQuotedKeys(
     "function Ti(){let e=S(),[t,n]=(0,Ei.useState)(null),r=(0,Ei.useRef)(0);if(!Ci())return null;let i=async(e,t)=>{let i=window.electronBridge?.showApplicationMenu;if(!i)return;let a=r.current+1;r.current=a,n(e);let o=t.currentTarget.getBoundingClientRect();try{await i(e,Math.round(o.left),Math.round(o.bottom))}finally{r.current===a&&n(null)}};return(0,Di.jsx)(`div`,{className:`flex items-center gap-0.5 pr-2 pl-1`,children:ki.map(({id:n,message:r})=>(0,Di.jsx)(`button`,{type:`button`,`aria-expanded`:t===n,`aria-haspopup`:`menu`,`aria-label`:e.formatMessage(r),className:M(`no-drag`,t===n?`selected`:`idle`),onClick:e=>{i(n,e)},children:(0,Di.jsx)(T,{...r})},n))})}var Ei,Di,Oi,ki,Ai=e((()=>{Ei=t(n(),1),Di=g(),Oi=C({file:{id:`windowsMenuBar.file`},edit:{id:`windowsMenuBar.edit`},view:{id:`windowsMenuBar.view`},help:{id:`windowsMenuBar.help`}}),ki=[{id:_.file,message:Oi.file},{id:_.edit,message:Oi.edit},{id:_.view,message:Oi.view},{id:_.help,message:Oi.help}]}));",
   );
+  const renderedWebviewSource = `${webviewSource}(0,Di.jsx)(Ti,{});`;
   write("package.json", packageSource);
   write(".vite/build/early-bootstrap.js", earlySource);
   write(".vite/build/bootstrap-BXjiq4qE.js", bootstrapSource);
@@ -286,21 +440,61 @@ test("plans all five updater layers before writing and keeps failed plans at zer
   write(".vite/build/main-CZpDUN17.js", mainSource);
   fs.mkdirSync(path.join(asarRoot, "webview", "assets"), { recursive: true });
 
-  assert.throws(() => executeLocalUpdater({ asarRoot }), /webview.*expected exactly 1.*found 0/i);
+  let planningFailureWrites = 0;
+  assert.throws(
+    () =>
+      executeLocalUpdater({
+        asarRoot,
+        writeFileSync() {
+          planningFailureWrites += 1;
+        },
+      }),
+    /webview.*expected exactly 1.*found 0/i,
+  );
+  assert.equal(planningFailureWrites, 0, "planning failure must attempt zero writes");
   assert.equal(fs.readFileSync(path.join(asarRoot, "package.json"), "utf8"), packageSource);
   assert.equal(
     fs.readFileSync(path.join(asarRoot, ".vite", "build", "preload.js"), "utf8"),
     preloadSource,
   );
 
-  write("webview/assets/app-shell-CVVppk_a.js", webviewSource);
+  write("webview/assets/app-shell-CVVppk_a.js", renderedWebviewSource);
   write("webview/assets/app-shell-ref-BQ-lb9Hp.js", "export const appShellRef={current:null};");
   write("webview/assets/app-shell-state-16Itmyrv.js", "export const state={ready:true};");
   write("webview/assets/app-shell-tab-controller-DuSW58a4.js", "export function tabs(){return []}");
   const beforeCheck = fs.readFileSync(path.join(asarRoot, "package.json"), "utf8");
-  const check = executeLocalUpdater({ asarRoot, check: true });
+  let checkWrites = 0;
+  const check = executeLocalUpdater({
+    asarRoot,
+    check: true,
+    writeFileSync() {
+      checkWrites += 1;
+    },
+  });
   assert.equal(check.status, "patched");
   assert.equal(check.changes.length, 5);
+  assert.equal(checkWrites, 0, "--check must invoke no writer");
+  assert.deepEqual(
+    check.changes.map((change) => change.path),
+    [
+      "package.json",
+      ".vite/build/bootstrap-BXjiq4qE.js",
+      ".vite/build/preload.js",
+      ".vite/build/main-CZpDUN17.js",
+      "webview/assets/app-shell-CVVppk_a.js",
+    ],
+  );
+  assert.deepEqual(
+    [
+      check.layers.metadata.path,
+      check.layers.backend.path,
+      check.layers.preload.path,
+      check.layers.mainMenu.path,
+      check.layers.webview.path,
+    ],
+    check.changes.map((change) => change.path),
+    "the five planned layers must map to exactly the five write targets",
+  );
   assert.equal(fs.readFileSync(path.join(asarRoot, "package.json"), "utf8"), beforeCheck);
 
   const originals = new Map(
@@ -335,7 +529,93 @@ test("plans all five updater layers before writing and keeps failed plans at zer
   assert.equal(first.layers.backend.path, ".vite/build/bootstrap-BXjiq4qE.js");
   assert.equal(first.layers.entry.path, ".vite/build/early-bootstrap.js");
   assert.equal(first.layers.entry.status, "native");
-  const second = executeLocalUpdater({ asarRoot, check: true });
+  const targetPaths = first.changes.map((change) => change.path);
+  const beforeSecond = snapshotLocalUpdaterTargets(asarRoot, targetPaths);
+  let secondWrites = 0;
+  const second = executeLocalUpdater({
+    asarRoot,
+    writeFileSync() {
+      secondWrites += 1;
+    },
+  });
   assert.equal(second.status, "already");
   assert.equal(second.changes.length, 0);
+  assert.equal(secondWrites, 0, "normal second pass must invoke no writer");
+  assert.deepEqual(snapshotLocalUpdaterTargets(asarRoot, targetPaths), beforeSecond);
+});
+
+test("restores current and prior files for first, middle, and last write failures", async (t) => {
+  for (const failAt of [1, 3, 5]) {
+    await t.test(`write ${failAt}`, (t) => {
+      const asarRoot = fs.mkdtempSync(path.join(os.tmpdir(), "patch-local-updater-write-"));
+      t.after(() => fs.rmSync(asarRoot, { recursive: true, force: true }));
+      writeLocalUpdaterSources(asarRoot, makeCleanLocalUpdaterSources());
+      const plan = executeLocalUpdater({ asarRoot, check: true });
+      const targets = plan.changes.map((change) => change.path);
+      const before = snapshotLocalUpdaterTargets(asarRoot, targets);
+      let forwardAttempts = 0;
+      let failed = false;
+
+      assert.throws(
+        () =>
+          executeLocalUpdater({
+            asarRoot,
+            writeFileSync(filePath, code, encoding) {
+              if (!failed) {
+                forwardAttempts += 1;
+                fs.writeFileSync(filePath, code, encoding);
+                if (forwardAttempts === failAt) {
+                  failed = true;
+                  throw new Error(`forward write ${failAt}`);
+                }
+                return;
+              }
+              fs.writeFileSync(filePath, code, encoding);
+            },
+          }),
+        /write failed and was rolled back/i,
+      );
+      assert.equal(forwardAttempts, failAt);
+      assert.deepEqual(snapshotLocalUpdaterTargets(asarRoot, targets), before);
+    });
+  }
+});
+
+test("surfaces every affected path when rollback is incomplete", (t) => {
+  const asarRoot = fs.mkdtempSync(path.join(os.tmpdir(), "patch-local-updater-rollback-"));
+  t.after(() => fs.rmSync(asarRoot, { recursive: true, force: true }));
+  writeLocalUpdaterSources(asarRoot, makeCleanLocalUpdaterSources());
+  let forwardAttempts = 0;
+  let rollingBack = false;
+  const rollbackFailures = new Set([
+    "package.json",
+    ".vite/build/preload.js",
+  ]);
+
+  assert.throws(
+    () =>
+      executeLocalUpdater({
+        asarRoot,
+        writeFileSync(filePath, code, encoding) {
+          const relative = path.relative(asarRoot, filePath).split(path.sep).join("/");
+          if (!rollingBack) {
+            forwardAttempts += 1;
+            fs.writeFileSync(filePath, code, encoding);
+            if (forwardAttempts === 3) {
+              rollingBack = true;
+              throw new Error("forward write failed");
+            }
+            return;
+          }
+          if (rollbackFailures.has(relative)) throw new Error(`rollback blocked ${relative}`);
+          fs.writeFileSync(filePath, code, encoding);
+        },
+      }),
+    (error) => {
+      assert.match(error.message, /rollback incomplete/i);
+      assert.match(error.message, /package\.json/);
+      assert.match(error.message, /\.vite[\\/]build[\\/]preload\.js/);
+      return true;
+    },
+  );
 });

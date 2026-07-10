@@ -40,7 +40,7 @@ test("patches task-worded thread actions with the native delete route idempotent
       patchThreadActionsSource(
         `${first.code};/* CodexSidebarDeleteAction */`,
       ),
-    /sidebar action.*expected exactly 1.*found 2/i,
+    /sidebar thread-actions marker postcondition is malformed|sidebar action.*expected exactly 1.*found 2/i,
   );
 });
 
@@ -65,7 +65,7 @@ test("adds delete and inline-confirmation actions to the latest sidebar aliases 
       patchSidebarSource(
         `${first.code};/* CodexSidebarDeleteHover */`,
       ),
-    /sidebar hover.*expected exactly 1.*found 2/i,
+    /sidebar hover\/row marker postcondition is malformed|sidebar hover.*expected exactly 1.*found 2/i,
   );
 });
 
@@ -90,5 +90,28 @@ test("rejects missing, ambiguous, and half-present sidebar contracts", () => {
         `${LATEST_SIDEBAR};${LATEST_SIDEBAR.replaceAll("Ac", "Bc").replaceAll("jc", "kc")}`,
       ),
     /hover.*found 2/i,
+  );
+});
+
+test("rejects an inert thread-actions marker and token shell", () => {
+  assert.throws(
+    () =>
+      patchThreadActionsSource(
+        "const messages={deleteThread:1,deleteThreadConfirmAction:1,deleteThreadError:1};" +
+          "/* CodexSidebarDeleteAction */const CodexSidebarDeleteAction=1;" +
+          "const route=`delete-archived-conversation`;",
+      ),
+    /thread-actions|messages|action|structural|postcondition/i,
+  );
+});
+
+test("rejects an inert sidebar hover and row marker shell", () => {
+  assert.throws(
+    () =>
+      patchSidebarSource(
+        "/* CodexSidebarDeleteHover *//* CodexSidebarDeleteRow */" +
+          "const confirm=`thread-delete-confirm-action`,item={id:`delete-thread`};",
+      ),
+    /sidebar|hover|row|structural|postcondition/i,
   );
 });

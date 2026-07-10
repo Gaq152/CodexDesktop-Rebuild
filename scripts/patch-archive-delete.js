@@ -304,38 +304,165 @@ function archiveCount(patchable, already, native, label) {
   return { patchable, already, native, total };
 }
 
-function patchAppMainSource(source) {
-  const nativeRouteRe = /(["'`])delete-archived-conversation\1\s*:\s*(\w+)\(\s*(?:async\s*)?\(\s*(\w+)\s*,\s*\{\s*conversationId\s*:\s*(\w+)\s*\}\s*\)\s*=>\s*\3\.deleteArchivedConversation\(\s*\4\s*\)\s*\)/g;
-  const nativeMatches = [...source.matchAll(nativeRouteRe)];
-  const nativeTokens = [...source.matchAll(/(["'`])delete-archived-conversation\1/g)];
-  if (nativeTokens.length > 0) {
-    if (nativeMatches.length !== 1) {
-      throw new Error(
-        `native archive route expected exactly 1 target, found ${nativeMatches.length}`,
-      );
+function walkArchive(node, visitor) {
+  if (!node || typeof node !== "object") return;
+  if (node.type) visitor(node);
+  for (const [key, child] of Object.entries(node)) {
+    if (key === "type" || key === "start" || key === "end") continue;
+    if (Array.isArray(child)) {
+      for (const item of child) walkArchive(item, visitor);
+    } else {
+      walkArchive(child, visitor);
     }
-    return {
-      code: source,
-      status: "native",
-      mode: "native",
-      counts: archiveCount(0, 0, 1, "archive route"),
-    };
   }
+}
 
-  const legacyRouteRe = /(["'`])delete-conversation\1\s*:\s*(\w+)\(\s*(?:async\s*)?\(\s*(\w+)\s*,\s*\{\s*conversationId\s*:\s*(\w+)\s*\}\s*\)\s*=>\s*\{\s*await\s+\3\.sendRequest\(\s*(["'`])thread\/delete\5\s*,\s*\{\s*threadId\s*:\s*\4\s*\}\s*\)\s*\}\s*\)/g;
-  const legacyMatches = [...source.matchAll(legacyRouteRe)];
-  const legacyTokens = [...source.matchAll(/(["'`])delete-conversation\1/g)];
-  if (legacyTokens.length > 0) {
-    if (legacyMatches.length !== 1) {
-      throw new Error(
-        `legacy archive route expected exactly 1 target, found ${legacyMatches.length}`,
-      );
+function archiveLiteral(node) {
+  if (node?.type === "Literal") return node.value;
+  if (node?.type === "TemplateLiteral" && node.expressions.length === 0) {
+    return node.quasis[0].value.cooked;
+  }
+  return null;
+}
+
+function archivePropertyName(node) {
+  if (node?.type !== "Property") return null;
+  if (!node.computed && node.key.type === "Identifier") return node.key.name;
+  return archiveLiteral(node.key);
+}
+
+function parseArchiveSource(source, label) {
+  try {
+    return acorn.parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  } catch (error) {
+    throw new Error(`${label} parse failed: ${error.message}`);
+  }
+}
+
+function objectPatternBinding(pattern, name) {
+  if (pattern?.type !== "ObjectPattern") return null;
+  const property = pattern.properties.find(
+    (item) => item.type === "Property" && archivePropertyName(item) === name,
+  );
+  return property?.value?.type === "Identifier" ? property.value.name : null;
+}
+
+function callbackForWrappedRoute(property) {
+  const value = property?.value;
+  if (value?.type !== "CallExpression" || value.arguments.length !== 1) return null;
+  const callback = value.arguments[0];
+  if (
+    callback?.type !== "ArrowFunctionExpression" &&
+    callback?.type !== "FunctionExpression"
+  ) return null;
+  return callback;
+}
+
+function directCallbackCalls(callback) {
+  const calls = [];
+  function visit(node) {
+    if (!node || typeof node !== "object") return;
+    if (node !== callback && ["ArrowFunctionExpression", "FunctionExpression", "FunctionDeclaration"].includes(node.type)) return;
+    if (node.type === "CallExpression") calls.push(node);
+    for (const [key, child] of Object.entries(node)) {
+      if (key === "type" || key === "start" || key === "end") continue;
+      if (Array.isArray(child)) child.forEach(visit);
+      else visit(child);
     }
+  }
+  visit(callback.body);
+  return calls;
+}
+
+function inspectArchiveAppMainSource(source) {
+  const ast = parseArchiveSource(source, "archive app-main");
+  const properties = { native: [], legacy: [] };
+  const tokens = { native: 0, legacy: 0 };
+  walkArchive(ast, (node) => {
+    const value = archiveLiteral(node);
+    if (value === "delete-archived-conversation") tokens.native += 1;
+    if (value === "delete-conversation") tokens.legacy += 1;
+    if (node.type !== "Property") return;
+    const name = archivePropertyName(node);
+    if (name === "delete-archived-conversation") properties.native.push(node);
+    if (name === "delete-conversation") properties.legacy.push(node);
+  });
+  const native = properties.native.filter((property) => {
+    const callback = callbackForWrappedRoute(property);
+    if (!callback || callback.params.length !== 2 || callback.params[0].type !== "Identifier") return false;
+    const manager = callback.params[0].name;
+    const conversationId = objectPatternBinding(callback.params[1], "conversationId");
+    if (!conversationId) return false;
+    const calls = directCallbackCalls(callback).filter(
+      (call) =>
+        call.callee?.type === "MemberExpression" &&
+        !call.callee.computed &&
+        call.callee.object?.type === "Identifier" &&
+        call.callee.object.name === manager &&
+        call.callee.property?.name === "deleteArchivedConversation" &&
+        call.arguments.length === 1 &&
+        call.arguments[0]?.type === "Identifier" &&
+        call.arguments[0].name === conversationId,
+    );
+    return calls.length === 1;
+  });
+  const legacy = properties.legacy.filter((property) => {
+    const callback = callbackForWrappedRoute(property);
+    if (!callback || callback.params.length !== 2 || callback.params[0].type !== "Identifier") return false;
+    const manager = callback.params[0].name;
+    const conversationId = objectPatternBinding(callback.params[1], "conversationId");
+    if (!conversationId) return false;
+    const calls = directCallbackCalls(callback).filter((call) => {
+      if (
+        call.callee?.type !== "MemberExpression" ||
+        call.callee.object?.type !== "Identifier" ||
+        call.callee.object.name !== manager ||
+        call.callee.property?.name !== "sendRequest" ||
+        archiveLiteral(call.arguments[0]) !== "thread/delete" ||
+        call.arguments[1]?.type !== "ObjectExpression"
+      ) return false;
+      const threadId = call.arguments[1].properties.find(
+        (item) => archivePropertyName(item) === "threadId",
+      )?.value;
+      return threadId?.type === "Identifier" && threadId.name === conversationId;
+    });
+    return calls.length === 1;
+  });
+  if (properties.native.length !== native.length || tokens.native !== properties.native.length) {
+    if (properties.native.length > 0 || tokens.native > 0) {
+      throw new Error("native archive route evidence is detached or structurally malformed");
+    }
+  }
+  if (properties.legacy.length !== legacy.length || tokens.legacy !== properties.legacy.length) {
+    if (properties.legacy.length > 0 || tokens.legacy > 0) {
+      throw new Error("legacy archive route evidence is detached or structurally malformed");
+    }
+  }
+  if (native.length > 0 && legacy.length > 0) {
+    throw new Error("archive native and legacy route modes are mutually exclusive");
+  }
+  if (native.length > 0) {
+    if (native.length !== 1) throw new Error(`native archive route expected exactly 1 target, found ${native.length}`);
+    return { mode: "native", status: "native" };
+  }
+  if (legacy.length > 0) {
+    if (legacy.length !== 1) throw new Error(`legacy archive route expected exactly 1 target, found ${legacy.length}`);
+    return { mode: "legacy", status: "already" };
+  }
+  return null;
+}
+
+function patchAppMainSource(source) {
+  const inspection = inspectArchiveAppMainSource(source);
+  if (inspection) {
     return {
       code: source,
-      status: "already",
-      mode: "legacy",
-      counts: archiveCount(0, 1, 0, "archive route"),
+      status: inspection.status,
+      mode: inspection.mode,
+      counts:
+        inspection.mode === "native"
+          ? archiveCount(0, 0, 1, "archive route")
+          : archiveCount(0, 1, 0, "archive route"),
     };
   }
 
@@ -351,36 +478,99 @@ function patchAppMainSource(source) {
   const conversationId = match[4];
   const end = match.index + match[0].length;
   const injection = `,${quote}delete-conversation${quote}:${wrapper}(async(${manager},{conversationId:${conversationId}})=>{await ${manager}.sendRequest(${quote}thread/delete${quote},{threadId:${conversationId}})})`;
+  const code = source.slice(0, end) + injection + source.slice(end);
+  const patchedInspection = inspectArchiveAppMainSource(code);
+  if (patchedInspection?.mode !== "legacy") {
+    throw new Error("legacy archive route postcondition was not established");
+  }
   return {
-    code: source.slice(0, end) + injection + source.slice(end),
+    code,
     status: "patched",
     mode: "legacy",
     counts: archiveCount(1, 0, 0, "archive route"),
   };
 }
 
+function inspectArchiveDataControlsSource(source) {
+  const ast = parseArchiveSource(source, "archive data-controls");
+  const tokenCounts = new Map([
+    ["delete-archived-conversation", 0],
+    ["settings.dataControls.archivedChats.delete", 0],
+    ["thread/delete", 0],
+    ["delete-conversation", 0],
+  ]);
+  walkArchive(ast, (node) => {
+    const value = archiveLiteral(node);
+    if (tokenCounts.has(value)) tokenCounts.set(value, tokenCounts.get(value) + 1);
+  });
+  const labelProperties = [];
+  walkArchive(ast, (node) => {
+    if (node.type !== "Property" || archivePropertyName(node) !== "delete") return;
+    const id = node.value?.type === "ObjectExpression"
+      ? node.value.properties.find((item) => archivePropertyName(item) === "id")
+      : null;
+    if (archiveLiteral(id?.value) === "settings.dataControls.archivedChats.delete") {
+      labelProperties.push(node);
+    }
+  });
+  const nativeFunctions = [];
+  const legacyFunctions = [];
+  walkArchive(ast, (node) => {
+    if (node.type !== "FunctionDeclaration" && node.type !== "FunctionExpression") return;
+    const nativeCalls = [];
+    const threadDeleteCalls = [];
+    const legacyCalls = [];
+    let confirmMembers = 0;
+    walkArchive(node.body, (inner) => {
+      if (inner.type === "MemberExpression" && (inner.property?.name ?? archiveLiteral(inner.property)) === "codexConfirmDelete") {
+        confirmMembers += 1;
+      }
+      if (inner.type !== "CallExpression") return;
+      if (
+        archiveLiteral(inner.arguments[0]) === "delete-archived-conversation" &&
+        inner.arguments[1]?.type === "ObjectExpression" &&
+        inner.arguments[1].properties.some((item) => archivePropertyName(item) === "conversationId")
+      ) nativeCalls.push(inner);
+      if (inner.arguments.some((argument) => archiveLiteral(argument) === "thread/delete")) {
+        threadDeleteCalls.push(inner);
+      }
+      if (
+        archiveLiteral(inner.arguments[0]) === "delete-conversation" &&
+        inner.arguments[1]?.type === "ObjectExpression" &&
+        ["conversationId", "hostId"].every((name) =>
+          inner.arguments[1].properties.some((item) => archivePropertyName(item) === name),
+        )
+      ) legacyCalls.push(inner);
+    });
+    if (nativeCalls.length === 2 && threadDeleteCalls.length === 1) nativeFunctions.push(node);
+    if (legacyCalls.length === 1 && confirmMembers > 0) legacyFunctions.push(node);
+  });
+  const nativeEvidence =
+    labelProperties.length === 1 &&
+    nativeFunctions.length === 1 &&
+    tokenCounts.get("delete-archived-conversation") === 2 &&
+    tokenCounts.get("settings.dataControls.archivedChats.delete") === 1 &&
+    tokenCounts.get("thread/delete") === 1;
+  const legacyEvidence =
+    legacyFunctions.length === 1 && tokenCounts.get("delete-conversation") === 1;
+  const anyNativeToken =
+    tokenCounts.get("delete-archived-conversation") > 0 ||
+    tokenCounts.get("settings.dataControls.archivedChats.delete") > 0 ||
+    tokenCounts.get("thread/delete") > 0;
+  const anyLegacyToken = tokenCounts.get("delete-conversation") > 0;
+  if (nativeEvidence && legacyEvidence) {
+    throw new Error("archive native and legacy UI modes are mutually exclusive");
+  }
+  if (nativeEvidence) return { mode: "native", status: "native" };
+  if (legacyEvidence) return { mode: "legacy", status: "already" };
+  if (anyNativeToken) throw new Error("native archive-delete UI evidence is detached or structurally malformed");
+  if (anyLegacyToken) throw new Error("legacy archive-delete UI evidence is detached or structurally malformed");
+  return null;
+}
+
 function patchDataControlsSource(source) {
-  const nativeRouteCount = [...source.matchAll(/(["'`])delete-archived-conversation\1/g)].length;
-  const nativeLabelCount = [
-    ...source.matchAll(/(["'`])settings\.dataControls\.archivedChats\.delete\1/g),
-  ].length;
-  const threadDeleteCount = [...source.matchAll(/(["'`])thread\/delete\1/g)].length;
-  if (nativeRouteCount > 0 || nativeLabelCount > 0) {
-    if (nativeRouteCount !== 2) {
-      throw new Error(
-        `native archive-delete UI route expected exactly 2 targets, found ${nativeRouteCount}`,
-      );
-    }
-    if (nativeLabelCount !== 1) {
-      throw new Error(
-        `native archive-delete UI label expected exactly 1 target, found ${nativeLabelCount}`,
-      );
-    }
-    if (threadDeleteCount !== 1) {
-      throw new Error(
-        `native archive-delete UI thread/delete expected exactly 1 target, found ${threadDeleteCount}`,
-      );
-    }
+  const inspection = inspectArchiveDataControlsSource(source);
+  if (inspection?.mode === "native") {
     return {
       code: source,
       status: "native",
@@ -388,16 +578,7 @@ function patchDataControlsSource(source) {
       counts: archiveCount(0, 0, 1, "archive button"),
     };
   }
-  const legacyRouteCount = [...source.matchAll(/(["'`])delete-conversation\1/g)].length;
-  if (legacyRouteCount > 0) {
-    if (legacyRouteCount !== 1) {
-      throw new Error(
-        `legacy archive-delete button expected exactly 1 target, found ${legacyRouteCount}`,
-      );
-    }
-    if (!source.includes("codexConfirmDelete")) {
-      throw new Error("legacy archive-delete button is missing inline confirmation");
-    }
+  if (inspection?.mode === "legacy") {
     return {
       code: source,
       status: "already",
@@ -492,4 +673,10 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { patchAppMainSource, patchDataControlsSource, patchArchiveContracts };
+module.exports = {
+  inspectArchiveAppMainSource,
+  inspectArchiveDataControlsSource,
+  patchAppMainSource,
+  patchDataControlsSource,
+  patchArchiveContracts,
+};

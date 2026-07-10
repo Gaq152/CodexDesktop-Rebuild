@@ -394,6 +394,65 @@ function parsePluginSource(source, label) {
   }
 }
 
+function parsePluginDocument(source, label) {
+  const comments = [];
+  let ast;
+  try {
+    ast = parse(source, {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      onComment: comments,
+    });
+  } catch (error) {
+    throw new Error(`${label} parse failed: ${error.message}`);
+  }
+  return { ast, comments };
+}
+
+function walkOwnFunction(root, visitor) {
+  function visit(node) {
+    if (!node || typeof node !== "object") return;
+    if (node !== root && (node.type === "FunctionDeclaration" || node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression")) return;
+    if (node.type) visitor(node);
+    for (const [key, child] of Object.entries(node)) {
+      if (key === "type" || key === "start" || key === "end") continue;
+      if (Array.isArray(child)) {
+        for (const item of child) visit(item);
+      } else {
+        visit(child);
+      }
+    }
+  }
+  visit(root);
+}
+
+function flattenLogical(node, operator, terms = []) {
+  if (node?.type === "LogicalExpression" && node.operator === operator) {
+    flattenLogical(node.left, operator, terms);
+    flattenLogical(node.right, operator, terms);
+  } else {
+    terms.push(node);
+  }
+  return terms;
+}
+
+function exactMarkerComments(comments, markerText) {
+  const markerBody = markerText.slice(2, -2).trim();
+  return comments.filter(
+    (comment) => comment.type === "Block" && comment.value.trim() === markerBody,
+  );
+}
+
+function isAlwaysTrueExpression(node) {
+  return (
+    (node?.type === "Literal" && node.value === true) ||
+    (node?.type === "UnaryExpression" &&
+      node.operator === "!" &&
+      node.argument?.type === "Literal" &&
+      node.argument.value === 0)
+  );
+}
+
 function dedupePatches(patches) {
   const byRange = new Map();
   for (const patch of patches) byRange.set(`${patch.start}:${patch.end}`, patch);
@@ -442,17 +501,35 @@ function collectWebviewAuth(source, ast) {
   const patches = [];
   const already = [];
   walkWithParent(ast, (node, parent) => {
-    if (node.type !== "BinaryExpression" || node.operator !== "===") return;
-    const operand = expressionForChatGptSide(node, source);
-    if (operand == null || !source.slice(node.start, node.end).includes("authMethod")) return;
     if (
-      parent?.type === "LogicalExpression" &&
-      parent.operator === "||" &&
-      logicalExpressionHasApiKey(parent, source, operand)
+      node.type === "LogicalExpression" &&
+      node.operator === "||" &&
+      !(parent?.type === "LogicalExpression" && parent.operator === "||")
     ) {
+      const terms = flattenLogical(node, "||");
+      const chatTerms = terms
+        .map((term) => ({ term, operand: expressionForChatGptSide(term, source) }))
+        .filter(({ operand }) => operand?.includes("authMethod"));
+      const apiTerms = terms
+        .map((term) => {
+          if (term?.type !== "BinaryExpression" || term.operator !== "===") return null;
+          if (getLiteralValue(term.right) === "apikey") return source.slice(term.left.start, term.left.end);
+          if (getLiteralValue(term.left) === "apikey") return source.slice(term.right.start, term.right.end);
+          return null;
+        })
+        .filter(Boolean);
+      if (chatTerms.length === 0 || apiTerms.length === 0) return;
+      const operand = chatTerms[0].operand;
+      if (terms.length !== 2 || chatTerms.length !== 1 || apiTerms.length !== 1 || apiTerms[0] !== operand) {
+        throw new Error("plugin webview auth postcondition has extra or mismatched alternatives");
+      }
       already.push(node.start);
       return;
     }
+    if (node.type !== "BinaryExpression" || node.operator !== "===") return;
+    const operand = expressionForChatGptSide(node, source);
+    if (operand == null || !operand.includes("authMethod")) return;
+    if (parent?.type === "LogicalExpression" && parent.operator === "||") return;
     const original = source.slice(node.start, node.end);
     patches.push({
       id: "plugin_webview_auth",
@@ -465,71 +542,159 @@ function collectWebviewAuth(source, ast) {
   return { patches: dedupePatches(patches), already: new Set(already).size };
 }
 
+const AVAILABILITY_PROPERTIES_BY_CONTEXT = new Map([
+  ["computer_use", ["available"]],
+  ["browser_use_external", ["allowed", "available"]],
+  ["browser_use", ["allowed", "available"]],
+]);
+
+function featureContextsInFunction(node) {
+  const contexts = new Set();
+  walkOwnFunction(node, (inner) => {
+    const value = getLiteralValue(inner);
+    if (FEATURE_CONTEXTS.has(value)) contexts.add(value);
+  });
+  return [...contexts];
+}
+
 function collectAvailability(source, ast) {
   const patches = [];
   const already = [];
+  const contexts = new Map([...FEATURE_CONTEXTS].map((context) => [context, []]));
   walk(ast, (node) => {
     if (node.type !== "FunctionDeclaration" && node.type !== "FunctionExpression") return;
-    const functionSource = source.slice(node.start, node.end);
-    if (![...FEATURE_CONTEXTS].some((feature) => functionSource.includes(feature))) return;
-    walk(node, (inner) => {
+    const functionContexts = featureContextsInFunction(node);
+    if (functionContexts.length === 0) return;
+    if (functionContexts.length !== 1) {
+      throw new Error("plugin webview availability function has ambiguous feature context");
+    }
+    const objects = [];
+    walkOwnFunction(node, (inner) => {
       if (inner.type !== "ObjectExpression") return;
       const names = inner.properties.map((property) => property.key?.name ?? property.key?.value);
-      if (!names.includes("available") || !names.includes("isLoading")) return;
-      for (const property of inner.properties) {
-        const name = property.key?.name ?? property.key?.value;
-        if (name !== "allowed" && name !== "available") continue;
-        const value = source.slice(property.value.start, property.value.end);
-        if (value === "!0") already.push(property.value.start);
-        else {
-          patches.push({
-            id: `plugin_webview_${name}`,
-            start: property.value.start,
-            end: property.value.end,
-            original: value,
-            replacement: "!0",
-          });
-        }
-      }
+      if (names.includes("available") && names.includes("isLoading")) objects.push(inner);
     });
+    if (objects.length > 0) contexts.get(functionContexts[0]).push(...objects);
   });
+  for (const [context, expectedNames] of AVAILABILITY_PROPERTIES_BY_CONTEXT) {
+    const objects = contexts.get(context);
+    if (objects.length !== 1) {
+      throw new Error(
+        `plugin webview availability ${context} expected exactly 1 object, found ${objects.length}`,
+      );
+    }
+    const object = objects[0];
+    const properties = object.properties.filter((property) => property.type === "Property");
+    const availabilityProperties = properties.filter((property) =>
+      ["allowed", "available"].includes(property.key?.name ?? property.key?.value),
+    );
+    const names = availabilityProperties.map(
+      (property) => property.key?.name ?? property.key?.value,
+    );
+    if (
+      names.length !== expectedNames.length ||
+      expectedNames.some((name) => names.filter((candidate) => candidate === name).length !== 1)
+    ) {
+      throw new Error(
+        `plugin webview availability ${context} expected exact properties ${expectedNames.join(",")}`,
+      );
+    }
+    for (const property of availabilityProperties) {
+      const name = property.key?.name ?? property.key?.value;
+      const value = source.slice(property.value.start, property.value.end);
+      if (value === "!0") already.push(property.value.start);
+      else {
+        patches.push({
+          id: `plugin_webview_${context}_${name}`,
+          start: property.value.start,
+          end: property.value.end,
+          original: value,
+          replacement: "!0",
+        });
+      }
+    }
+  }
   return { patches: dedupePatches(patches), already: new Set(already).size };
 }
 
-function collectStatsig(source, ast) {
-  const raw = dedupePatches(findStatsigGatePatches(ast, source));
-  const patches = raw.map((patch) => ({
-    ...patch,
-    replacement: `!0${PLUGIN_STATSIG_MARKER}`,
-  }));
-  const attached = new Set();
+function collectStatsig(source, ast, comments) {
+  const markerComments = exactMarkerComments(comments, PLUGIN_STATSIG_MARKER);
+  const markerBody = PLUGIN_STATSIG_MARKER.slice(2, -2).trim();
+  if (
+    comments.some(
+      (comment) =>
+        comment.value.includes("CodexRebuildPluginStatsig") &&
+        (comment.type !== "Block" || comment.value.trim() !== markerBody),
+    )
+  ) {
+    throw new Error("plugin webview statsig marker is malformed");
+  }
+  const patches = [];
+  const attached = [];
+  const contextFunctions = new Map([...FEATURE_CONTEXTS].map((context) => [context, []]));
   walk(ast, (node) => {
-    if (node.type !== "FunctionDeclaration" && node.type !== "FunctionExpression") {
-      return;
+    if (node.type !== "FunctionDeclaration" && node.type !== "FunctionExpression") return;
+    const contexts = featureContextsInFunction(node);
+    if (contexts.length === 0) return;
+    if (contexts.length !== 1) {
+      throw new Error("plugin webview statsig function has ambiguous feature context");
     }
-    const functionSource = source.slice(node.start, node.end);
-    if (![...FEATURE_CONTEXTS].some((feature) => functionSource.includes(feature))) {
-      return;
+    contextFunctions.get(contexts[0]).push(node);
+  });
+  for (const context of FEATURE_CONTEXTS) {
+    const functions = contextFunctions.get(context);
+    if (functions.length !== 1) {
+      throw new Error(
+        `plugin webview statsig ${context} expected exactly 1 function, found ${functions.length}`,
+      );
     }
-    walk(node, (inner) => {
+    const targets = [];
+    walkOwnFunction(functions[0], (inner) => {
       if (
-        source.slice(inner.start, inner.end) === "!0" &&
-        source.slice(inner.end, inner.end + PLUGIN_STATSIG_MARKER.length) ===
-          PLUGIN_STATSIG_MARKER
+        inner.type === "CallExpression" &&
+        inner.callee?.type === "Identifier" &&
+        inner.arguments?.length === 1 &&
+        /^\d{6,}$/.test(String(getLiteralValue(inner.arguments[0]) ?? ""))
       ) {
-        attached.add(inner.start);
+        targets.push({ kind: "patch", node: inner });
+      }
+      if (
+        isAlwaysTrueExpression(inner) &&
+        markerComments.some((comment) => comment.start === inner.end)
+      ) {
+        targets.push({ kind: "already", node: inner });
       }
     });
-  });
-  const already = attached.size;
-  return { patches, already };
+    if (targets.length !== 1) {
+      throw new Error(
+        `plugin webview statsig ${context} expected exactly 1 gate, found ${targets.length}`,
+      );
+    }
+    const target = targets[0];
+    if (target.kind === "already") attached.push(target.node.start);
+    else {
+      patches.push({
+        id: `statsig_gate_${context}`,
+        start: target.node.start,
+        end: target.node.end,
+        replacement: `!0${PLUGIN_STATSIG_MARKER}`,
+        original: source.slice(target.node.start, target.node.end),
+      });
+    }
+  }
+  if (markerComments.length !== attached.length) {
+    throw new Error(
+      `plugin webview statsig attached markers expected ${attached.length}, found ${markerComments.length}`,
+    );
+  }
+  return { patches: dedupePatches(patches), already: new Set(attached).size };
 }
 
 function patchPluginWebviewSource(source) {
-  const ast = parsePluginSource(source, "plugin webview");
+  const { ast, comments } = parsePluginDocument(source, "plugin webview");
   const auth = collectWebviewAuth(source, ast);
   const availability = collectAvailability(source, ast);
-  const statsig = collectStatsig(source, ast);
+  const statsig = collectStatsig(source, ast, comments);
   const counts = {
     auth: makeCount(auth.patches.length, auth.already, 1, "plugin webview auth"),
     availability: makeCount(
@@ -603,8 +768,26 @@ function collectMainDefaults(source, ast) {
   };
 }
 
-function collectMainFilter(source, ast) {
+function collectMainFilter(source, ast, comments) {
   const patches = [];
+  const already = [];
+  const declarations = new Map();
+  walk(ast, (node) => {
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && node.init) {
+      declarations.set(node.id.name, node.init);
+    }
+  });
+  const markerComments = exactMarkerComments(comments, PLUGIN_FILTER_MARKER);
+  const markerBody = PLUGIN_FILTER_MARKER.slice(2, -2).trim();
+  if (
+    comments.some(
+      (comment) =>
+        comment.value.includes("CodexRebuildPluginFilter") &&
+        (comment.type !== "Block" || comment.value.trim() !== markerBody),
+    )
+  ) {
+    throw new Error("plugin bundled filter marker is malformed");
+  }
   walk(ast, (node) => {
     if (
       node.type !== "CallExpression" ||
@@ -613,20 +796,46 @@ function collectMainFilter(source, ast) {
       node.arguments.length !== 1 ||
       node.arguments[0].type !== "ArrowFunctionExpression"
     ) return;
+    if (node.callee.object.type !== "Identifier") return;
+    const collection = declarations.get(node.callee.object.name);
+    if (
+      collection?.type !== "ArrayExpression" ||
+      !collection.elements.some(
+        (element) =>
+          element?.type === "ObjectExpression" &&
+          element.properties.some(
+            (property) => (property.key?.name ?? property.key?.value) === "isAvailable",
+          ),
+      )
+    ) return;
     const callback = node.arguments[0];
     const callbackSource = source.slice(callback.start, callback.end);
-    if (!callbackSource.includes("isAvailable") || !callbackSource.includes("features")) return;
-    patches.push({
-      id: "bundled_plugins_filter_bypass",
-      start: node.start,
-      end: node.end,
-      original: source.slice(node.start, node.end),
-      replacement: `${source.slice(node.start, callback.start)}()=>!0)${PLUGIN_FILTER_MARKER}`,
-    });
+    if (callbackSource.includes("isAvailable") && callbackSource.includes("features")) {
+      patches.push({
+        id: "bundled_plugins_filter_bypass",
+        start: node.start,
+        end: node.end,
+        original: source.slice(node.start, node.end),
+        replacement: `${source.slice(node.start, callback.start)}()=>!0)${PLUGIN_FILTER_MARKER}`,
+      });
+      return;
+    }
+    if (
+      callback.params.length === 0 &&
+      isAlwaysTrueExpression(callback.body) &&
+      markerComments.some((comment) => comment.start === node.end)
+    ) {
+      already.push(node.start);
+    }
   });
+  if (markerComments.length !== already.length) {
+    throw new Error(
+      `plugin bundled filter attached markers expected ${already.length}, found ${markerComments.length}`,
+    );
+  }
   return {
     patches: dedupePatches(patches),
-    already: (source.match(/\/\* CodexRebuildPluginFilter \*\//g) ?? []).length,
+    already: new Set(already).size,
   };
 }
 
@@ -661,9 +870,9 @@ function collectMainPeer(source, ast) {
 }
 
 function patchPluginMainSource(source) {
-  const ast = parsePluginSource(source, "plugin main");
+  const { ast, comments } = parsePluginDocument(source, "plugin main");
   const defaults = collectMainDefaults(source, ast);
-  const filter = collectMainFilter(source, ast);
+  const filter = collectMainFilter(source, ast, comments);
   const peer = collectMainPeer(source, ast);
   const counts = {
     defaults: makeCount(defaults.patches.length, defaults.already, FEATURE_KEYS.length + 1, "plugin defaults"),

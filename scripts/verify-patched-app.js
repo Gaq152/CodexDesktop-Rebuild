@@ -2,6 +2,14 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { parse } = require("acorn");
+const { planFastModeTargets } = require("./patch-fast-mode");
+const {
+  classifyPluginTarget,
+  patchPluginContracts,
+} = require("./patch-plugin-auth");
+const { patchArchiveContracts } = require("./patch-archive-delete");
+const { patchSidebarContracts } = require("./patch-sidebar-delete");
+const { validateLocalUpdaterSources } = require("./patch-local-updater");
 
 const PROJECT_ROOT = path.join(__dirname, "..");
 const TEXT_BUNDLE_EXTENSIONS = new Set([
@@ -750,235 +758,175 @@ function hasPatchedPluginWebviewAvailability(source) {
   return found;
 }
 
-function normalizeAsarEntry(value) {
-  if (typeof value !== "string" || value.length === 0) return null;
-  const normalized = path.posix.normalize(value.replaceAll("\\", "/").replace(/^\.\//, ""));
-  if (normalized === ".." || normalized.startsWith("../") || path.posix.isAbsolute(normalized)) {
-    return null;
-  }
-  return normalized;
+function inspectionFailure(error) {
+  return { detail: error instanceof Error ? error.message : String(error) };
 }
 
-function resolveUpdaterBackendFile(packageJson, sources) {
-  const entryPath = normalizeAsarEntry(packageJson?.main);
-  if (!entryPath) return null;
-  const entryName = path.posix.basename(entryPath);
-  let runtimePath = entryPath;
-  if (entryName === "early-bootstrap.js") {
-    const entryFile = `src/win/_asar/${entryPath}`;
-    const entrySource = sources.find(({ file }) => file === entryFile)?.source;
-    if (typeof entrySource !== "string") return null;
-    const targets = [
-      ...new Set(
-        [...entrySource.matchAll(/require\(\s*(["'`])(\.\/bootstrap(?:-[A-Za-z0-9_$-]+)?\.js)\1\s*\)/g)].map(
-          (match) => match[2],
-        ),
-      ),
-    ];
-    if (targets.length !== 1) return null;
-    runtimePath = normalizeAsarEntry(path.posix.join(path.posix.dirname(entryPath), targets[0]));
-  } else if (!/^bootstrap(?:-[A-Za-z0-9_$-]+)?\.js$/.test(entryName)) {
-    return null;
+function requireExactlyOneSource(sources, pattern, label) {
+  const matches = sources.filter(({ file }) => pattern.test(file));
+  if (matches.length !== 1) {
+    throw new Error(`${label} expected exactly 1 bundle, found ${matches.length}`);
   }
-  if (!runtimePath || path.posix.basename(runtimePath) === "early-bootstrap.js") return null;
-  return `src/win/_asar/${runtimePath}`;
+  return matches[0];
 }
 
-function hasUpdaterMetadata(source, file) {
-  if (file !== "src/win/_asar/package.json") return false;
+function inspectFastContract(sources) {
   try {
-    const metadata = JSON.parse(source);
-    return (
-      typeof metadata.codexRebuildWindowsUpdateUrl === "string" &&
-      metadata.codexRebuildWindowsUpdateUrl.trim().length > 0
+    const candidates = sources
+      .filter(({ file }) =>
+        /\/use-service-tier-settings-[^/]+\.js$/.test(file) ||
+        /\/read-service-tier-for-request-[^/]+\.js$/.test(file),
+      )
+      .map(({ file, source }) => ({
+        file,
+        fileName: path.posix.basename(file),
+        source,
+      }));
+    const plans = planFastModeTargets(candidates, "win verifier");
+    if (
+      plans.some(
+        (plan) =>
+          plan.result.status !== "already" ||
+          plan.result.counts.patchable !== 0 ||
+          plan.result.counts.already !== 1,
+      )
+    ) throw new Error("Fast mode targets are patchable instead of fully patched");
+    return { files: plans.map((plan) => plan.file).sort() };
+  } catch (error) {
+    return inspectionFailure(error);
+  }
+}
+
+function inspectPluginContract(sources) {
+  try {
+    const candidates = sources.filter(({ source, file }) => {
+      const relative = file.replace(/^src\/win\/_asar\//, "");
+      if (!/^(?:\.vite\/build|webview\/assets)\//.test(relative)) return false;
+      return classifyPluginTarget(path.posix.basename(file), source) != null;
+    });
+    const main = candidates.filter(
+      ({ source, file }) => classifyPluginTarget(path.posix.basename(file), source) === "main",
     );
-  } catch {
-    return false;
+    const webview = candidates.filter(
+      ({ source, file }) => classifyPluginTarget(path.posix.basename(file), source) === "webview",
+    );
+    if (main.length !== 1 || webview.length !== 1) {
+      throw new Error(
+        `plugin main/webview expected exactly 1/1 bundle, found ${main.length}/${webview.length}`,
+      );
+    }
+    const result = patchPluginContracts({
+      mainSource: main[0].source,
+      webviewSource: webview[0].source,
+    });
+    if (
+      result.status !== "already" ||
+      result.main.status !== "already" ||
+      result.webview.status !== "already"
+    ) throw new Error("plugin targets are patchable instead of fully patched");
+    return { files: [main[0].file, webview[0].file].sort() };
+  } catch (error) {
+    return inspectionFailure(error);
   }
 }
 
-function occurrenceCount(source, token) {
-  return source.split(token).length - 1;
+function inspectSharedArchiveContract(sources) {
+  try {
+    const appMain = requireExactlyOneSource(
+      sources,
+      /\/webview\/assets\/app-main-[^/]+\.js$/,
+      "archive app-main",
+    );
+    const dataControls = requireExactlyOneSource(
+      sources,
+      /\/webview\/assets\/data-controls-[^/]+\.js$/,
+      "archive data-controls",
+    );
+    const result = patchArchiveContracts({
+      appMainSource: appMain.source,
+      dataControlsSource: dataControls.source,
+    });
+    if (!['native', 'already'].includes(result.status)) {
+      throw new Error("archive-delete targets are patchable instead of complete");
+    }
+    return { files: [appMain.file, dataControls.file].sort() };
+  } catch (error) {
+    return inspectionFailure(error);
+  }
 }
 
-function hasUpdaterBackend(source, file, context) {
-  if (file !== context.updaterBackendFile) return false;
-  const start = "/* CodexRebuildLocalUpdater:start */";
-  const end = "/* CodexRebuildLocalUpdater:end */";
-  const fileEnd = "/* CodexRebuildLocalUpdater:file-end */";
-  if (
-    occurrenceCount(source, start) !== 1 ||
-    occurrenceCount(source, end) !== 1 ||
-    occurrenceCount(source, fileEnd) !== 1 ||
-    !source.startsWith(start)
-  ) {
-    return false;
+function inspectSidebarContract(sources) {
+  try {
+    const threadActions = requireExactlyOneSource(
+      sources,
+      /\/webview\/assets\/thread-actions-[^/]+\.js$/,
+      "sidebar thread-actions",
+    );
+    const sidebar = requireExactlyOneSource(
+      sources,
+      /\/webview\/assets\/sidebar-flat-sections-[^/]+\.js$/,
+      "sidebar-flat-sections",
+    );
+    const result = patchSidebarContracts({
+      threadActionsSource: threadActions.source,
+      sidebarSource: sidebar.source,
+    });
+    if (result.status !== "already") {
+      throw new Error("sidebar-delete targets are patchable instead of fully patched");
+    }
+    return { files: [threadActions.file, sidebar.file].sort() };
+  } catch (error) {
+    return inspectionFailure(error);
   }
-  const endIndex = source.indexOf(end);
-  const commandIndex = source.indexOf("codex_rebuild:update-command");
-  const wrapperIndex = source.indexOf("if(!CodexRebuildWindowsBootstrap())", endIndex);
-  const fileEndIndex = source.indexOf(fileEnd);
-  return (
-    commandIndex > 0 &&
-    commandIndex < endIndex &&
-    wrapperIndex > endIndex &&
-    fileEndIndex > wrapperIndex
-  );
 }
 
-function hasUpdaterPreloadBridge(source, file) {
-  if (!isBuildFile(file, "preload.js")) return false;
-  const start = "/* CodexRebuildUpdaterPreload:start */";
-  const end = "/* CodexRebuildUpdaterPreload:end */";
-  if (occurrenceCount(source, start) !== 1 || occurrenceCount(source, end) !== 1) {
-    return false;
+function inspectLocalUpdaterContract(sources) {
+  try {
+    const prefix = "src/win/_asar/";
+    const packageEntry = requireExactlyOneSource(
+      sources,
+      /^src\/win\/_asar\/package\.json$/,
+      "updater package metadata",
+    );
+    const files = Object.fromEntries(
+      sources
+        .filter(({ file }) => file.startsWith(prefix))
+        .map(({ file, source }) => [file.slice(prefix.length), source]),
+    );
+    const validation = validateLocalUpdaterSources({
+      packageSource: packageEntry.source,
+      files,
+    });
+    return {
+      files: validation.evidence
+        .map(({ path: relative }) => `${prefix}${relative}`)
+        .sort(),
+    };
+  } catch (error) {
+    return inspectionFailure(error);
   }
-  const startIndex = source.indexOf(start);
-  const endIndex = source.indexOf(end);
-  const bridgeIndex = source.search(
-    /exposeInMainWorld\(\s*["'`]codexRebuildUpdater["'`]/,
-  );
-  return startIndex < bridgeIndex && bridgeIndex < endIndex;
-}
-
-function hasUpdaterMainMenu(source, file) {
-  if (!/^src\/win\/_asar\/\.vite\/build\/main-.*\.js$/.test(file)) return false;
-  const start = "/* CodexRebuildUpdaterMainMenu:start */";
-  const end = "/* CodexRebuildUpdaterMainMenu:end */";
-  if (occurrenceCount(source, start) !== 1 || occurrenceCount(source, end) !== 1) {
-    return false;
-  }
-  const startIndex = source.indexOf(start);
-  const endIndex = source.indexOf(end);
-  const itemIndex = source.indexOf("codex-rebuild-updater-top", startIndex);
-  return startIndex < itemIndex && itemIndex < endIndex;
-}
-
-function hasUpdaterTitlebar(source, file) {
-  if (!/^src\/win\/_asar\/webview\/assets\/app-shell-.*\.js$/.test(file)) {
-    return false;
-  }
-  return (
-    occurrenceCount(source, "function codexRebuildUpdaterEnsureTitlebarStyle") === 1 &&
-    occurrenceCount(source, "{id:'codex-rebuild-updater-top',message:") === 1
-  );
 }
 
 const CONTRACT_DEFINITIONS = [
   {
     id: "fast",
-    groups: [
-      {
-        label: "service-tier settings",
-        markers: [
-          {
-            label: "fast_mode",
-            matches: (source) => source.includes("fast_mode"),
-          },
-          {
-            label: "API-key authorization postcondition",
-            matches: hasPatchedFastModeAuthorization,
-          },
-        ],
-      },
-      {
-        label: "request service tier",
-        markers: [
-          {
-            label: "request bundle",
-            matches: (_source, file) =>
-              /\/read-service-tier-for-request-[^/]+\.js$/.test(file),
-          },
-          {
-            label: "request API-key authorization postcondition",
-            matches: hasPatchedFastModeRequestAuthorization,
-          },
-        ],
-      },
-    ],
+    inspect: inspectFastContract,
   },
   {
     id: "plugin",
-    groups: [
-      {
-        label: "main process",
-        markers: [
-          {
-            label: "browser/computer default-feature object postcondition",
-            matches: hasPatchedDesktopFeatureDefaults,
-          },
-          {
-            label: "bundled plugin availability postcondition",
-            matches: hasPatchedBundledPluginFilter,
-          },
-        ],
-      },
-      {
-        label: "use-is-plugins-enabled webview",
-        markers: [
-          {
-            label: "plugin API-key authorization postcondition",
-            matches: (source, file) =>
-              isPluginWebviewAsset(file) && hasPatchedPluginWebviewAuth(source),
-          },
-          {
-            label: "plugin allowed/available postcondition",
-            matches: (source, file) =>
-              isPluginWebviewAsset(file) && hasPatchedPluginWebviewAvailability(source),
-          },
-          {
-            label: "plugin Statsig bypass postcondition",
-            matches: (source, file) =>
-              isPluginWebviewAsset(file) && hasPatchedPluginStatsig(source),
-          },
-        ],
-      },
-    ],
+    inspect: inspectPluginContract,
   },
   {
     id: "archive-delete",
-    inspect: inspectArchiveDelete,
+    inspect: inspectSharedArchiveContract,
   },
   {
     id: "sidebar-delete",
-    sameBundle: true,
-    markers: [
-      {
-        label: "delete-thread",
-        matches: (source) => source.includes("delete-thread"),
-      },
-      {
-        label: "inline confirmation action",
-        matches: (source) =>
-          source.includes("thread-delete-confirm-action") ||
-          source.includes("deleteThreadConfirmAction"),
-      },
-    ],
+    inspect: inspectSidebarContract,
   },
   {
     id: "updater",
-    markers: [
-      {
-        label: "codexRebuildWindowsUpdateUrl metadata",
-        matches: hasUpdaterMetadata,
-      },
-      {
-        label: "resolved CodexRebuildLocalUpdater backend",
-        matches: hasUpdaterBackend,
-      },
-      {
-        label: "CodexRebuildUpdaterMainMenu",
-        matches: hasUpdaterMainMenu,
-      },
-      {
-        label: "codexRebuildUpdater preload bridge",
-        matches: hasUpdaterPreloadBridge,
-      },
-      {
-        label: "codex-rebuild-updater-top",
-        matches: hasUpdaterTitlebar,
-      },
-    ],
+    inspect: inspectLocalUpdaterContract,
   },
 ];
 
@@ -1095,10 +1043,7 @@ function verifyPatchedApp(root, platform, expectedVersion) {
     });
   }
 
-  const context = {
-    packageJson: packageInspection.packageJson,
-    updaterBackendFile: resolveUpdaterBackendFile(packageInspection.packageJson, sources),
-  };
+  const context = { packageJson: packageInspection.packageJson };
   const contracts = {};
   for (const definition of CONTRACT_DEFINITIONS) {
     if (definition.inspect) {

@@ -10,10 +10,11 @@
 const fs = require("fs");
 const path = require("path");
 const acorn = require("acorn");
-const { relPath, SRC_DIR } = require("./patch-util");
+const { SRC_DIR } = require("./patch-util");
 
 const DEFAULT_WINDOWS_UPDATE_URL =
   "https://github.com/Gaq152/CodexDesktop-Rebuild/releases/download/windows-update-feed";
+const LOCAL_UPDATER_CONTRACT_VERSION = 1;
 const START_MARKER = "/* CodexRebuildLocalUpdater:start */";
 const END_MARKER = "/* CodexRebuildLocalUpdater:end */";
 const FILE_END_MARKER = "/* CodexRebuildLocalUpdater:file-end */";
@@ -21,32 +22,28 @@ const PRELOAD_START_MARKER = "/* CodexRebuildUpdaterPreload:start */";
 const PRELOAD_END_MARKER = "/* CodexRebuildUpdaterPreload:end */";
 const MAIN_MENU_START_MARKER = "/* CodexRebuildUpdaterMainMenu:start */";
 const MAIN_MENU_END_MARKER = "/* CodexRebuildUpdaterMainMenu:end */";
+const WEBVIEW_COMPONENT_START_MARKER =
+  "/* CodexRebuildUpdaterTitlebar:component:start */";
+const WEBVIEW_COMPONENT_END_MARKER =
+  "/* CodexRebuildUpdaterTitlebar:component:end */";
+const WEBVIEW_DESCRIPTOR_START_MARKER =
+  "/* CodexRebuildUpdaterTitlebar:descriptor:start */";
+const WEBVIEW_DESCRIPTOR_END_MARKER =
+  "/* CodexRebuildUpdaterTitlebar:descriptor:end */";
 const WEBVIEW_UPDATER_MENU_ID = "codex-rebuild-updater-top";
+const WEBVIEW_MENU_BAR_MESSAGE =
+  "{id:`windowsMenuBar.checkUpdates`,defaultMessage:`检查更新`,description:`Label for the update menu in the desktop application menu bar`}";
 const WEBVIEW_MENU_BAR_ITEM =
-  "{id:'codex-rebuild-updater-top',message:{id:`windowsMenuBar.checkUpdates`,defaultMessage:`检查更新`,description:`Label for the update menu in the desktop application menu bar`}}";
+  `{id:'codex-rebuild-updater-top',message:${WEBVIEW_MENU_BAR_MESSAGE}}`;
 
-function updatePackageMetadata() {
-  const pkgPath = path.join(SRC_DIR, "win", "_asar", "package.json");
-  if (!fs.existsSync(pkgPath)) {
-    console.log("  [ok] Windows ASAR package metadata not found");
-    return;
-  }
-
-  const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-  const updateUrl = (process.env.CODEX_REBUILD_UPDATE_URL || DEFAULT_WINDOWS_UPDATE_URL).trim();
-  if (pkg.codexRebuildWindowsUpdateUrl === updateUrl) {
-    console.log(`  [ok] ${relPath(pkgPath)}: update URL already present`);
-    return;
-  }
-
-  pkg.codexRebuildWindowsUpdateUrl = updateUrl;
-  fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n", "utf-8");
-  console.log(`  [ok] ${relPath(pkgPath)}: added update URL metadata`);
+function layerVersionMarker(layer, version = LOCAL_UPDATER_CONTRACT_VERSION) {
+  return `/* CodexRebuildLocalUpdater:${layer}:v${version} */`;
 }
 
-function makeBootstrapPrefix() {
+function makeBootstrapPrefix(version = LOCAL_UPDATER_CONTRACT_VERSION) {
+  const versionLine = version == null ? "" : `${layerVersionMarker("backend", version)}\n`;
   return `${START_MARKER}
-function CodexRebuildWindowsBootstrap(){
+${versionLine}function CodexRebuildWindowsBootstrap(){
   if(process.platform!==\`win32\`)return!1;
   let electron,path,childProcess;
   try{
@@ -397,9 +394,13 @@ if(!CodexRebuildWindowsBootstrap()){
 `;
 }
 
-function makePreloadPatch(electronAlias = "e") {
+function makePreloadPatch(
+  electronAlias = "e",
+  version = LOCAL_UPDATER_CONTRACT_VERSION,
+) {
+  const versionLine = version == null ? "" : `${layerVersionMarker("preload", version)}\n`;
   return `${PRELOAD_START_MARKER}
-;(()=>{try{
+${versionLine};(()=>{try{
   const channelState='codex_rebuild:update-state';
   const channelCommand='codex_rebuild:update-command';
   const listeners=new Set;
@@ -416,275 +417,15 @@ function makePreloadPatch(electronAlias = "e") {
   try{${electronAlias}.contextBridge.exposeInMainWorld('codexRebuildUpdater',updaterApi)}catch{}
 }catch{}})();
 ${PRELOAD_END_MARKER}`;
-  return `${PRELOAD_START_MARKER}
-;(()=>{try{
-  const channelState='codex_rebuild:update-state';
-  const channelCommand='codex_rebuild:update-command';
-  const listeners=new Set;
-  const invoke=command=>e.ipcRenderer.invoke(channelCommand,{command});
-  const updaterApi={
-    getState:()=>invoke('get-state'),
-    checkForUpdates:()=>invoke('check'),
-    downloadUpdate:()=>invoke('download'),
-    installUpdate:()=>invoke('install'),
-    onState:t=>{if(typeof t!=='function')return()=>{};listeners.add(t);return()=>listeners.delete(t)}
-  };
-  e.ipcRenderer.on(channelState,(_event,state)=>{for(const listener of listeners){try{listener(state)}catch{}}});
-  try{e.contextBridge.exposeInMainWorld('codexRebuildUpdater',updaterApi)}catch{}
-  const ready=t=>{document.readyState==='loading'?window.addEventListener('DOMContentLoaded',t,{once:true}):t()};
-  ready(()=>{
-    if(window.__codexRebuildUpdaterUiInstalled)return;
-    window.__codexRebuildUpdaterUiInstalled=true;
-    const zh=((navigator.language||'zh').toLowerCase()).startsWith('zh');
-    const text=zh?{
-      idle:'检查更新',
-      checking:'检查中...',
-      available:'有新版本',
-      downloading:'正在下载更新...',
-      preparing:'正在准备更新...',
-      ready:'重启安装',
-      noUpdate:'已是最新版本',
-      error:'检查失败',
-      tooltipIdle:'检查 Codex 更新',
-      tooltipChecking:'正在检查更新',
-      tooltipAvailable:'发现新版本，点击查看',
-      tooltipDownloading:'正在下载更新，点击查看进度',
-      tooltipPreparing:'下载完成，正在准备更新',
-      tooltipReady:'更新已就绪，点击查看',
-      tooltipNoUpdate:'当前已经是最新版本',
-      tooltipError:'更新检查失败，点击查看',
-      titleChecking:'正在检查更新',
-      titleAvailable:'发现新版本',
-      titleDownloading:'正在下载更新',
-      titlePreparing:'正在准备更新',
-      titleReady:'更新已下载',
-      titleError:'检查更新失败',
-      currentVersion:'当前版本',
-      newVersion:'新版本',
-      packageSize:'更新包',
-      progress:'进度',
-      downloaded:'已下载',
-      elapsed:'耗时',
-      update:'更新',
-      cancel:'取消',
-      close:'收起',
-      retry:'重试',
-      install:'重启安装',
-      later:'稍后',
-      unknown:'-',
-      availableBody:'确认后开始下载，下载完成后再重启安装。',
-      preparingBody:'下载已完成，正在合并差分包并准备安装。',
-      readyBody:'重启 Codex 后会自动完成安装。'
-    }:{
-      idle:'Check updates',
-      checking:'Checking...',
-      available:'Update available',
-      downloading:'Downloading update...',
-      preparing:'Preparing update...',
-      ready:'Restart to update',
-      noUpdate:'Up to date',
-      error:'Update failed',
-      tooltipIdle:'Check for Codex updates',
-      tooltipChecking:'Checking for updates',
-      tooltipAvailable:'Update available. Click for details',
-      tooltipDownloading:'Downloading update. Click for progress',
-      tooltipPreparing:'Download complete. Preparing update',
-      tooltipReady:'Update ready. Click for details',
-      tooltipNoUpdate:'Codex is up to date',
-      tooltipError:'Update check failed. Click for details',
-      titleChecking:'Checking for updates',
-      titleAvailable:'Update available',
-      titleDownloading:'Downloading update',
-      titlePreparing:'Preparing update',
-      titleReady:'Update downloaded',
-      titleError:'Update check failed',
-      currentVersion:'Current version',
-      newVersion:'New version',
-      packageSize:'Package',
-      progress:'Progress',
-      downloaded:'Downloaded',
-      elapsed:'Elapsed',
-      update:'Update',
-      cancel:'Cancel',
-      close:'Close',
-      retry:'Retry',
-      install:'Restart to update',
-      later:'Later',
-      unknown:'-',
-      availableBody:'Download starts only after you confirm. Restart after the download finishes.',
-      preparingBody:'Download complete. Preparing the update package.',
-      readyBody:'Restart Codex to finish installing the update.'
-    };
-    const escapeHtml=value=>String(value==null?text.unknown:value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-    const formatVersion=value=>value?String(value):text.unknown;
-    const formatBytes=value=>{
-      const n=Number(value);
-      if(!Number.isFinite(n)||n<=0)return text.unknown;
-      const units=['B','KB','MB','GB'];
-      let size=n,index=0;
-      while(size>=1024&&index<units.length-1){size/=1024;index+=1}
-      const digits=index===0?0:size>=100?0:size>=10?1:2;
-      return size.toFixed(digits)+' '+units[index];
-    };
-    const formatElapsed=value=>{
-      const ms=Number(value);
-      if(!Number.isFinite(ms)||ms<0)return text.unknown;
-      const total=Math.floor(ms/1000);
-      const minutes=Math.floor(total/60);
-      const seconds=total%60;
-      if(zh)return minutes>0?minutes+'分'+String(seconds).padStart(2,'0')+'秒':seconds+'秒';
-      return minutes>0?minutes+'m '+String(seconds).padStart(2,'0')+'s':seconds+'s';
-    };
-    const progressOf=state=>{
-      const total=Number(state.activeDownloadSize||state.updateSize);
-      const done=Number(state.downloadedBytes);
-      if(!Number.isFinite(total)||total<=0||!Number.isFinite(done)||done<0)return null;
-      return Math.max(0,Math.min(100,done/total*100));
-    };
-    const row=(label,value)=>'<div class="row"><span>'+escapeHtml(label)+'</span><strong>'+escapeHtml(value)+'</strong></div>';
-    const action=(kind,label,variant)=>'<button class="action '+(variant||'')+'" type="button" data-action="'+kind+'">'+escapeHtml(label)+'</button>';
-    const host=document.createElement('div');
-    host.id='codex-rebuild-updater';
-    const root=host.attachShadow?host.attachShadow({mode:'open'}):host;
-    const style=document.createElement('style');
-    style.textContent=[
-      ':host([hidden]){display:none!important}',
-      ':host{position:fixed;right:20px;bottom:20px;z-index:2147483647;pointer-events:none;-webkit-app-region:no-drag;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;width:min(220px,calc(100vw - 40px));}',
-      '.trigger{-webkit-app-region:no-drag;user-select:none;pointer-events:auto;height:30px;width:100%;display:inline-flex;align-items:center;justify-content:flex-start;gap:8px;border-radius:7px;border:1px solid color-mix(in srgb,var(--color-token-border-default,#4b5563) 70%,transparent);background:color-mix(in srgb,var(--color-token-main-surface-primary,#111827) 86%,transparent);color:var(--color-token-text-secondary,#c4c7c5);box-shadow:0 8px 24px rgba(0,0,0,.18);backdrop-filter:blur(10px);font-size:12px;font-weight:500;line-height:1;padding:0 10px;opacity:.72;transition:opacity .16s ease,background .16s ease,border-color .16s ease,color .16s ease;overflow:hidden;cursor:pointer}',
-      '.trigger:hover,.trigger.open{opacity:1;background:color-mix(in srgb,var(--color-token-main-surface-primary,#111827) 96%,white 4%)}',
-      '.mark{width:7px;height:7px;border-radius:999px;background:currentColor;opacity:.75;flex:0 0 auto}',
-      '.label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.checking,.downloading,.preparing{color:var(--color-token-text-primary,#f3f4f6);opacity:.9}',
-      '.checking .mark,.downloading .mark,.preparing .mark{width:10px;height:10px;border:2px solid currentColor;border-top-color:transparent;background:transparent;animation:codex-rebuild-spin .8s linear infinite}',
-      '.available{color:#f59e0b;border-color:color-mix(in srgb,#f59e0b 55%,transparent);background:color-mix(in srgb,#f59e0b 12%,var(--color-token-main-surface-primary,#111827));opacity:1}',
-      '.ready{color:#10b981;border-color:color-mix(in srgb,#10b981 55%,transparent);background:color-mix(in srgb,#10b981 14%,var(--color-token-main-surface-primary,#111827));opacity:1}',
-      '.no-update{color:#60a5fa;border-color:color-mix(in srgb,#60a5fa 45%,transparent);opacity:1}',
-      '.error{color:#ef4444;border-color:color-mix(in srgb,#ef4444 55%,transparent);background:color-mix(in srgb,#ef4444 12%,var(--color-token-main-surface-primary,#111827));opacity:1}',
-      '.panel{position:absolute;bottom:38px;right:0;width:min(324px,calc(100vw - 40px));max-height:calc(100vh - 128px);overflow:auto;pointer-events:auto;border:1px solid color-mix(in srgb,var(--color-token-border-default,#4b5563) 76%,transparent);border-radius:8px;background:color-mix(in srgb,var(--color-token-main-surface-primary,#111827) 96%,black 4%);color:var(--color-token-text-primary,#f3f4f6);box-shadow:0 18px 48px rgba(0,0,0,.34);padding:12px;box-sizing:border-box;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .14s ease,visibility .14s ease,transform .14s ease;backdrop-filter:blur(14px)}',
-      '.panel.open{opacity:1;visibility:visible;transform:translateY(0)}',
-      '.title{font-size:13px;font-weight:650;line-height:1.3;margin:0 0 8px;color:var(--color-token-text-primary,#f3f4f6)}',
-      '.body{font-size:12px;line-height:1.45;margin:0 0 10px;color:var(--color-token-text-secondary,#c4c7c5)}',
-      '.row{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:22px;font-size:12px;color:var(--color-token-text-secondary,#c4c7c5)}',
-      '.row strong{min-width:0;max-width:176px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;color:var(--color-token-text-primary,#f3f4f6);font-weight:550}',
-      '.meter{height:6px;border-radius:999px;overflow:hidden;background:color-mix(in srgb,var(--color-token-border-default,#4b5563) 48%,transparent);margin:9px 0 8px}',
-      '.meter span{display:block;height:100%;width:0;background:#10b981;transition:width .18s ease}',
-      '.actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}',
-      '.action{-webkit-app-region:no-drag;border:0;border-radius:7px;height:28px;padding:0 11px;font-size:12px;font-weight:550;background:color-mix(in srgb,var(--color-token-main-surface-secondary,#1f2937) 86%,white 8%);color:var(--color-token-text-primary,#f3f4f6);cursor:pointer}',
-      '.action:hover{background:color-mix(in srgb,var(--color-token-main-surface-secondary,#1f2937) 76%,white 16%)}',
-      '.action.primary{background:#0f766e;color:white}.action.primary:hover{background:#0d9488}',
-      '.action.subtle{color:var(--color-token-text-secondary,#c4c7c5)}',
-      '@keyframes codex-rebuild-spin{to{transform:rotate(360deg)}}',
-      '@media(max-width:720px){:host{right:10px;bottom:10px;width:min(220px,calc(100vw - 20px))}.panel{right:0;width:min(324px,calc(100vw - 20px))}}'
-    ].join('\\n');
-    const button=document.createElement('button');
-    button.type='button';
-    button.className='trigger';
-    button.innerHTML='<span class="mark" aria-hidden="true"></span><span class="label"></span>';
-    button.setAttribute('aria-haspopup','dialog');
-    const panel=document.createElement('div');
-    panel.className='panel';
-    panel.setAttribute('role','dialog');
-    host.hidden=true;
-    root.append(style,button,panel);
-    document.documentElement.appendChild(host);
-    const label=button.querySelector('.label');
-    let open=false;
-    let current={status:'idle'};
-    const visibleStatuses=new Set(['checking','available','downloading','preparing','ready','no-update','error']);
-    const buildPanel=state=>{
-      const status=state.status||'idle';
-      const currentVersion=formatVersion(state.version||state.appVersion);
-      const updateVersion=formatVersion(state.updateVersion);
-      const total=state.activeDownloadSize||state.updateSize;
-      if(status==='available'){
-        return '<div class="title">'+escapeHtml(text.titleAvailable)+'</div><p class="body">'+escapeHtml(text.availableBody)+'</p>'+row(text.currentVersion,currentVersion)+row(text.newVersion,updateVersion)+row(text.packageSize,formatBytes(state.updateSize))+'<div class="actions">'+action('close',text.cancel,'subtle')+action('download',text.update,'primary')+'</div>';
-      }
-      if(status==='downloading'||status==='preparing'){
-        const pct=progressOf(state);
-        const pctText=pct==null?text.unknown:Math.floor(pct)+'%';
-        const width=pct==null?8:pct;
-        const preparing=status==='preparing';
-        return '<div class="title">'+escapeHtml(preparing?text.titlePreparing:text.titleDownloading)+'</div>'+(preparing?'<p class="body">'+escapeHtml(text.preparingBody)+'</p>':'')+row(text.currentVersion,currentVersion)+row(text.newVersion,updateVersion)+row(text.progress,pctText)+'<div class="meter" aria-hidden="true"><span style="width:'+Math.max(3,Math.min(100,width))+'%"></span></div>'+row(text.downloaded,formatBytes(state.downloadedBytes)+' / '+formatBytes(total))+row(text.elapsed,formatElapsed(state.elapsedMs))+'<div class="actions">'+action('close',text.close,'subtle')+'</div>';
-      }
-      if(status==='ready'){
-        return '<div class="title">'+escapeHtml(text.titleReady)+'</div><p class="body">'+escapeHtml(text.readyBody)+'</p>'+row(text.currentVersion,currentVersion)+row(text.newVersion,updateVersion)+'<div class="actions">'+action('close',text.later,'subtle')+action('install',text.install,'primary')+'</div>';
-      }
-      if(status==='error'){
-        return '<div class="title">'+escapeHtml(text.titleError)+'</div><p class="body">'+escapeHtml(state.error||text.tooltipError)+'</p><div class="actions">'+action('close',text.cancel,'subtle')+action('retry',text.retry,'primary')+'</div>';
-      }
-      if(status==='checking'){
-        return '<div class="title">'+escapeHtml(text.titleChecking)+'</div>'+row(text.currentVersion,currentVersion)+'<div class="actions">'+action('close',text.close,'subtle')+'</div>';
-      }
-      return '';
-    };
-    const render=state=>{
-      current=state||current||{status:'idle'};
-      const status=current.status||'idle';
-      const visible=visibleStatuses.has(status);
-      host.toggleAttribute('hidden',!visible);
-      if(!visible){open=false;panel.innerHTML=''}
-      const canOpen=status==='available'||status==='downloading'||status==='preparing'||status==='ready'||status==='error'||status==='checking';
-      if(!canOpen)open=false;
-      button.className='trigger '+status+(open?' open':'');
-      const statusLabel=status==='no-update'?text.noUpdate:text[status]||text.idle;
-      const tooltipByStatus={idle:text.tooltipIdle,checking:text.tooltipChecking,available:text.tooltipAvailable,downloading:text.tooltipDownloading,preparing:text.tooltipPreparing,ready:text.tooltipReady,'no-update':text.tooltipNoUpdate,error:text.tooltipError};
-      label.textContent=statusLabel;
-      button.title=current.error&&status==='error'?text.tooltipError+': '+current.error:(tooltipByStatus[status]||text.tooltipIdle);
-      button.setAttribute('aria-label',button.title);
-      button.setAttribute('aria-expanded',open?'true':'false');
-      panel.className='panel '+(open&&canOpen?'open':'');
-      panel.innerHTML=open&&canOpen?buildPanel(current):'';
-    };
-    button.addEventListener('click',()=>{
-      const status=current?.status||'idle';
-      if(status==='available'||status==='downloading'||status==='preparing'||status==='ready'||status==='error'||status==='checking'){
-        open=!open;
-        render(current);
-        return;
-      }
-      updaterApi.checkForUpdates().catch(()=>{});
-    });
-    panel.addEventListener('click',event=>{
-      const target=event.target&&event.target.closest?event.target.closest('[data-action]'):null;
-      const command=target?.getAttribute?.('data-action');
-      if(!command)return;
-      if(command==='close'){
-        open=false;
-        render(current);
-      }else if(command==='download'){
-        open=true;
-        updaterApi.downloadUpdate().then(render).catch(()=>{});
-      }else if(command==='install'){
-        updaterApi.installUpdate().catch(()=>{});
-      }else if(command==='retry'){
-        open=false;
-        render(current);
-        updaterApi.checkForUpdates().then(render).catch(()=>{});
-      }
-    });
-    document.addEventListener('pointerdown',event=>{
-      if(!open)return;
-      const path=event.composedPath?event.composedPath():[];
-      if(path.includes(host))return;
-      open=false;
-      render(current);
-    });
-    updaterApi.onState(render);
-    let attempts=0;
-    const requestInitialState=()=>updaterApi.getState().then(render).catch(()=>{
-      attempts+=1;
-      if(attempts<20)setTimeout(requestInitialState,250);
-      else host.remove();
-    });
-    requestInitialState();
-  });
-}catch{}})();
-${PRELOAD_END_MARKER}`;
 }
 
-function makeMainMenuPatch(electronAlias = "a") {
+function makeMainMenuPatch(
+  electronAlias = "a",
+  version = LOCAL_UPDATER_CONTRACT_VERSION,
+) {
+  const versionLine = version == null ? "" : `${layerVersionMarker("main-menu", version)}\n`;
   const patch = `${MAIN_MENU_START_MARKER}
-(()=>{
+${versionLine}(()=>{
   let codexRebuildUpdaterIds={
     top:'codex-rebuild-updater-top',
     status:'codex-rebuild-updater-status',
@@ -844,6 +585,35 @@ function walkAst(node, visit) {
   }
 }
 
+function walkAstWithAncestors(node, visit, ancestors = []) {
+  if (!node || typeof node.type !== "string") return;
+  visit(node, ancestors);
+  const nextAncestors = [...ancestors, node];
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "start" || key === "end" || key === "type") continue;
+    if (Array.isArray(value)) {
+      for (const child of value) walkAstWithAncestors(child, visit, nextAncestors);
+    } else {
+      walkAstWithAncestors(value, visit, nextAncestors);
+    }
+  }
+}
+
+function nearestLexicalScope(ancestors) {
+  for (let index = ancestors.length - 1; index >= 0; index -= 1) {
+    const node = ancestors[index];
+    if (
+      node.type === "Program" ||
+      node.type === "FunctionDeclaration" ||
+      node.type === "FunctionExpression" ||
+      node.type === "ArrowFunctionExpression"
+    ) {
+      return node;
+    }
+  }
+  return null;
+}
+
 function propertyName(node) {
   if (!node || node.type !== "Property") return null;
   if (!node.computed && node.key.type === "Identifier") return node.key.name;
@@ -931,29 +701,200 @@ function applyReplacements(code, replacements) {
   return next;
 }
 
+function firstDifferenceIndex(left, right) {
+  const length = Math.min(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    if (left[index] !== right[index]) return index;
+  }
+  return left.length === right.length ? -1 : length;
+}
+
 function countOccurrences(source, token) {
   return source.split(token).length - 1;
 }
 
+function memberProperty(node) {
+  if (node?.type !== "MemberExpression") return null;
+  if (!node.computed && node.property.type === "Identifier") return node.property.name;
+  return literalValue(node.property);
+}
+
+function isMemberOf(node, objectName, property) {
+  return (
+    node?.type === "MemberExpression" &&
+    node.object.type === "Identifier" &&
+    node.object.name === objectName &&
+    memberProperty(node) === property
+  );
+}
+
+function hasMainMenuSignature(code) {
+  return [
+    MAIN_MENU_START_MARKER,
+    MAIN_MENU_END_MARKER,
+    layerVersionMarker("main-menu"),
+    "codex-rebuild-updater-top",
+    "__CodexRebuildUpdaterMenuSetState",
+  ].some((signature) => code.includes(signature));
+}
+
+function inspectUpdaterMainMenuSource(code, { allowLegacy = false } = {}) {
+  if (typeof code !== "string" || code.trim() === "") {
+    throw new Error("Windows main menu source is empty");
+  }
+  const range = markerRange(
+    code,
+    MAIN_MENU_START_MARKER,
+    MAIN_MENU_END_MARKER,
+    "Windows main menu",
+  );
+  const ast = parseJavaScript(code, "Windows main menu", "script");
+  const declarations = [];
+  walkAstWithAncestors(ast, (node, ancestors) => {
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier") {
+      declarations.push({ declaration: node, scope: nearestLexicalScope(ancestors) });
+    }
+  });
+  const extensionDeclarations = declarations.filter(
+    ({ declaration, scope }) =>
+      declaration.init &&
+      declaration.init.start >= range.start &&
+      declaration.init.end <= range.end &&
+      !(scope && scope.start >= range.start && scope.end <= range.end),
+  );
+  if (extensionDeclarations.length !== 1) {
+    throw new Error(
+      `Windows main menu canonical block expected one executable binding, found ${extensionDeclarations.length}`,
+    );
+  }
+  const { declaration: extension, scope: extensionScope } = extensionDeclarations[0];
+  const extensionName = extension.id.name;
+  const attachments = [];
+  walkAstWithAncestors(ast, (node, ancestors) => {
+    if (
+      node.type !== "CallExpression" ||
+      node.callee.type !== "MemberExpression" ||
+      memberProperty(node.callee) !== "buildFromTemplate" ||
+      node.callee.object.type !== "MemberExpression" ||
+      memberProperty(node.callee.object) !== "Menu" ||
+      node.callee.object.object.type !== "Identifier" ||
+      node.arguments.length !== 1 ||
+      node.arguments[0].type !== "Identifier"
+    ) {
+      return;
+    }
+    const callScope = nearestLexicalScope(ancestors);
+    if (callScope !== extensionScope) return;
+    const templates = declarations.filter(
+      ({ declaration, scope }) =>
+        scope === extensionScope &&
+        declaration.id.name === node.arguments[0].name &&
+        declaration.init?.type === "ArrayExpression",
+    );
+    for (const { declaration: template } of templates) {
+      const topSpreads = template.init.elements.filter(
+        (element) =>
+          element?.type === "SpreadElement" &&
+          isMemberOf(element.argument, extensionName, "topItems"),
+      );
+      const helpSpreads = [];
+      for (const element of template.init.elements) {
+        if (element?.type !== "ObjectExpression") continue;
+        const isHelp = element.properties.some(
+          (property) =>
+            propertyName(property) === "role" && literalValue(property.value) === "help",
+        );
+        if (!isHelp) continue;
+        const submenu = element.properties.find(
+          (property) => propertyName(property) === "submenu",
+        )?.value;
+        if (submenu?.type !== "ArrayExpression") continue;
+        helpSpreads.push(
+          ...submenu.elements.filter(
+            (item) =>
+              item?.type === "SpreadElement" &&
+              isMemberOf(item.argument, extensionName, "helpItems"),
+          ),
+        );
+      }
+      if (topSpreads.length === 1 && helpSpreads.length === 1) {
+        attachments.push({
+          electronAlias: node.callee.object.object.name,
+          templateName: template.id.name,
+        });
+      }
+    }
+  });
+  if (attachments.length !== 1) {
+    throw new Error(
+      `Windows main menu canonical block is not attached to exactly one live template (found ${attachments.length})`,
+    );
+  }
+  const electronAlias = attachments[0].electronAlias;
+  const candidates = [
+    {
+      dialect: "current",
+      version: LOCAL_UPDATER_CONTRACT_VERSION,
+      block: makeMainMenuPatch(electronAlias),
+      versionMarker: layerVersionMarker("main-menu"),
+    },
+  ];
+  if (allowLegacy) {
+    candidates.push(
+      {
+        dialect: "v0",
+        version: 0,
+        block: makeMainMenuPatch(electronAlias, 0),
+        versionMarker: layerVersionMarker("main-menu", 0),
+      },
+      {
+        dialect: "versionless",
+        version: null,
+        block: makeMainMenuPatch(electronAlias, null),
+      },
+    );
+  }
+  const candidate = candidates.find((item) => item.block === range.code);
+  if (!candidate) {
+    throw new Error("Windows main menu canonical block bytes or version do not match");
+  }
+  const versions = updaterVersionSignatures(code);
+  const expectedVersions = candidate.versionMarker ? [candidate.versionMarker] : [];
+  if (
+    versions.length !== expectedVersions.length ||
+    versions.some((version, index) => version !== expectedVersions[index])
+  ) {
+    throw new Error("Windows main menu canonical block version is stale or mismatched");
+  }
+  const canonicalBlock = makeMainMenuPatch(electronAlias);
+  return {
+    layer: "mainMenu",
+    version: candidate.version,
+    dialect: candidate.dialect,
+    electronAlias,
+    extensionName,
+    canonicalSource:
+      code.slice(0, range.start) + canonicalBlock + code.slice(range.end),
+  };
+}
+
+function validateUpdaterMainMenuSource(code) {
+  return inspectUpdaterMainMenuSource(code);
+}
+
 function patchMainMenuCode(code) {
-  const startCount = countOccurrences(code, MAIN_MENU_START_MARKER);
-  const endCount = countOccurrences(code, MAIN_MENU_END_MARKER);
-  if (startCount > 0 || endCount > 0) {
-    if (startCount !== 1) {
-      throw new Error(
-        `Windows main menu start marker expected exactly 1 target, found ${startCount}`,
-      );
-    }
-    if (endCount !== 1) {
-      throw new Error(
-        `Windows main menu end marker expected exactly 1 target, found ${endCount}`,
-      );
-    }
-    return code;
+  if (typeof code !== "string" || code.trim() === "") {
+    throw new Error("Windows main menu source is empty");
+  }
+  if (hasMainMenuSignature(code)) {
+    const inspection = inspectUpdaterMainMenuSource(code, { allowLegacy: true });
+    if (inspection.dialect === "current") return code;
+    validateUpdaterMainMenuSource(inspection.canonicalSource);
+    return inspection.canonicalSource;
   }
   const shape = analyzeMainMenuCode(code);
   const patch = makeMainMenuPatch(shape.electronAlias);
-  return applyReplacements(code, [
+  const next = applyReplacements(code, [
     { start: shape.extensionInit.start, end: shape.extensionInit.end, text: patch },
     {
       start: shape.extensionSpread.start,
@@ -966,9 +907,11 @@ function patchMainMenuCode(code) {
       text: `,...${shape.extensionName}.topItems`,
     },
   ]);
+  validateUpdaterMainMenuSource(next);
+  return next;
 }
 
-function makeWebviewMenuBarFunctionPatch() {
+function makeWebviewMenuBarFunctionBody() {
   return `function codexRebuildUpdaterEnsureTitlebarStyle(){let e='codex-rebuild-updater-titlebar-style';if(document.getElementById(e))return;let t=document.createElement('style');t.id=e,t.textContent=[
 '.cru-anchor{--cru-success:var(--color-token-charts-green,#22c55e);--cru-error:var(--color-token-error-foreground,#ef4444);position:relative;display:inline-flex;align-items:center;-webkit-app-region:no-drag}',
 '.cru-trigger{-webkit-app-region:no-drag;height:24px;min-width:72px;max-width:154px;display:inline-flex;align-items:center;gap:6px;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--color-token-text-tertiary);padding:0 9px;font:500 12px/1 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;white-space:nowrap;overflow:hidden;cursor:pointer;transition:background .16s ease,border-color .16s ease,color .16s ease,box-shadow .16s ease,transform .12s ease}',
@@ -1017,6 +960,27 @@ function codexRebuildUpdaterStatusText(e){let t=e?.status||'idle';if(t==='checki
 function codexRebuildUpdaterDescription(e){let t=e?.status||'idle';if(t==='checking')return'正在连接更新源，请稍候。';if(t==='available')return'确认后开始下载，下载完成后可重启安装。';if(t==='downloading')return'下载会在后台继续，点击按钮可随时查看进度。';if(t==='preparing')return'下载已完成，正在准备安装包。';if(t==='ready')return'重启 Codex 后会自动完成安装。';if(t==='no-update')return'当前安装版本已经是最新。';if(t==='error')return'请重试，或取消后稍后再检查。';return'点击后立即检查是否有新版本。'}
 function codexRebuildUpdaterBuildPanel(e,t){let n=e||{status:'idle'},r=n.status||'idle',i=codexRebuildUpdaterMenuBarProgress(n),a=i==null?0:Math.floor(i),o=codexRebuildUpdaterStatusText(n),s=codexRebuildUpdaterDescription(n),c=(e,t)=>(0,Zr.jsxs)('div',{className:'cru-row',children:[(0,Zr.jsx)('span',{children:e}),(0,Zr.jsx)('strong',{children:t})]}),l=(e,n,r='')=>(0,Zr.jsx)('button',{type:'button',className:'cru-action '+r,onClick:e=>{e.stopPropagation(),t(n)},children:e}),u=[c('当前版本',codexRebuildUpdaterFormatVersion(n.version||n.appVersion))];n.updateVersion&&u.push(c('新版本',codexRebuildUpdaterFormatVersion(n.updateVersion)));(n.updateSize||n.activeDownloadSize)&&u.push(c('更新包',codexRebuildUpdaterFormatBytes(n.updateSize||n.activeDownloadSize)));(r==='downloading'||r==='preparing')&&u.push(c('已下载',codexRebuildUpdaterFormatBytes(n.downloadedBytes)+' / '+codexRebuildUpdaterFormatBytes(n.activeDownloadSize||n.updateSize)));(r==='downloading'||r==='preparing')&&u.push(c('耗时',codexRebuildUpdaterFormatElapsed(n.elapsedMs)));let d=[];r==='idle'&&d.push(l('立即检查','check','primary'));r==='available'&&d.push(l('下载更新','download','primary'),l('稍后','close'));r==='ready'&&d.push(l('重启安装','install','primary'),l('稍后','close'));r==='error'&&d.push(l('重试','retry','primary'),l('取消','clear','danger'));(r==='checking'||r==='downloading'||r==='preparing'||r==='no-update')&&d.push(l('收起','close'));let f=(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'});return(0,Zr.jsxs)('div',{className:'cru-popover '+r,role:'dialog','aria-label':'更新状态',onPointerDown:e=>e.stopPropagation(),children:[(0,Zr.jsx)('div',{className:'cru-live','aria-live':'polite',children:o}),(0,Zr.jsxs)('div',{className:'cru-head',children:[(0,Zr.jsx)('div',{className:'cru-badge','aria-hidden':'true',children:f}),(0,Zr.jsxs)('div',{children:[(0,Zr.jsx)('div',{className:'cru-title',children:o}),(0,Zr.jsx)('p',{className:'cru-body',children:s})]})]}),(r==='downloading'||r==='preparing')&&(0,Zr.jsx)('div',{className:'cru-meter','aria-label':'下载进度 '+a+'%',children:(0,Zr.jsx)('span',{style:{width:a+'%'}})}),(0,Zr.jsx)('div',{className:'cru-grid',children:u}),r==='error'&&(0,Zr.jsx)('div',{className:'cru-error',role:'alert',children:n.error||'未知错误'}),(0,Zr.jsx)('div',{className:'cru-actions',children:d})]})}
 function Yr(){let e=D(),[t,n]=(0,Xr.useState)(null),[r,i]=(0,Xr.useState)({status:'idle'}),[a,o]=(0,Xr.useState)(false),s=(0,Xr.useRef)(0),c=(0,Xr.useRef)(null);(0,Xr.useEffect)(()=>{codexRebuildUpdaterEnsureTitlebarStyle();let e=window.codexRebuildUpdater;if(!e)return;let t=e=>{i(e||{status:'idle'})};e.getState?.().then(t).catch(()=>{});let n=e.onState?.(t);return typeof n==='function'?n:void 0},[]),(0,Xr.useEffect)(()=>{if(!a)return;let e=e=>{c.current?.contains?.(e.target)||o(!1)},t=e=>{e.key==='Escape'&&o(!1)};return document.addEventListener('pointerdown',e,!0),document.addEventListener('keydown',t,!0),()=>{document.removeEventListener('pointerdown',e,!0),document.removeEventListener('keydown',t,!0)}},[a]);if(!qr())return null;let l=async(e,t)=>{let r=window.electronBridge?.showApplicationMenu;if(!r)return;let i=s.current+1;s.current=i,n(e);let a=t.currentTarget.getBoundingClientRect();try{await r(e,Math.round(a.left),Math.round(a.bottom))}finally{s.current===i&&n(null)}},u=(e,t={})=>i(n=>({...n,...t,status:e})),d=e=>{let t=window.codexRebuildUpdater;if(e==='close'){o(!1);return}if(e==='clear'){o(!1),t?.clearUpdateState?.().then(i).catch(()=>{});return}if(e==='check'||e==='retry'){o(!0),u('checking',{error:null}),t?.checkForUpdates?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='download'){o(!0),u('downloading',{error:null,downloadedBytes:0,elapsedMs:0}),t?.downloadUpdate?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='install'){t?.installUpdate?.().catch(e=>u('error',{error:e&&e.message?e.message:String(e)}))}},f=e=>{let t=r?.status||'idle';if(t==='idle'){d('check');return}o(e=>!e)},p=codexRebuildUpdaterMenuBarLabel(r),m=codexRebuildUpdaterMenuBarProgress(r),h=m==null?0:Math.floor(m);return(0,Zr.jsx)('div',{className:'flex items-center gap-0.5 pr-2 pl-1',children:$r.map(({id:s,message:u})=>{if(s==='${WEBVIEW_UPDATER_MENU_ID}')return(0,Zr.jsxs)('div',{ref:c,className:'cru-anchor',children:[(0,Zr.jsxs)('button',{type:'button','aria-expanded':a,'aria-haspopup':'dialog','aria-label':p,className:'cru-trigger '+(r?.status||'idle')+(a?' open':''),style:{'--cru-progress':h+'%'},onClick:f,children:[(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'}),(0,Zr.jsx)('span',{className:'cru-label',children:p})]}),a&&codexRebuildUpdaterBuildPanel(r,d)]},s);return(0,Zr.jsx)('button',{type:'button','aria-expanded':t===s,'aria-haspopup':'menu','aria-label':e.formatMessage(u),className:M('no-drag rounded-md border border-transparent px-2.5 py-1 text-base font-normal leading-none outline-none transition-colors',t===s?'bg-[var(--color-token-menubar-selection-background)] text-[var(--color-token-menubar-selection-foreground)]':'text-token-text-tertiary hover:bg-token-foreground/5 hover:text-token-description-foreground focus-visible:bg-token-foreground/5 focus-visible:text-token-description-foreground'),onClick:e=>{l(s,e)},children:(0,Zr.jsx)(w,{...u})},s)})})}`;
+}
+
+function makeWebviewMenuBarFunctionPatch(version = LOCAL_UPDATER_CONTRACT_VERSION) {
+  const body = makeWebviewMenuBarFunctionBody();
+  if (version == null) return body;
+  return `${WEBVIEW_COMPONENT_START_MARKER}\n${layerVersionMarker(
+    "titlebar-component",
+    version,
+  )}\n${body}\n${WEBVIEW_COMPONENT_END_MARKER}`;
+}
+
+function makeWebviewMenuDescriptorPatch(version = LOCAL_UPDATER_CONTRACT_VERSION) {
+  if (version == null) return WEBVIEW_MENU_BAR_ITEM;
+  return `{id:'${WEBVIEW_UPDATER_MENU_ID}',message:${makeWebviewMenuDescriptorBlock(version)}}`;
+}
+
+function makeWebviewMenuDescriptorBlock(version = LOCAL_UPDATER_CONTRACT_VERSION) {
+  return `${WEBVIEW_DESCRIPTOR_START_MARKER}\n${layerVersionMarker(
+    "titlebar-descriptor",
+    version,
+  )}\n${WEBVIEW_MENU_BAR_MESSAGE}\n${WEBVIEW_DESCRIPTOR_END_MARKER}`;
 }
 
 function sequenceMember(node, property) {
@@ -1145,34 +1109,278 @@ function bindWebviewMenuBarPatch(patch, shape) {
   return next;
 }
 
-function patchWebviewMenuBarCode(code) {
+function hasTitlebarSignature(code) {
+  return [
+    WEBVIEW_COMPONENT_START_MARKER,
+    WEBVIEW_COMPONENT_END_MARKER,
+    WEBVIEW_DESCRIPTOR_START_MARKER,
+    WEBVIEW_DESCRIPTOR_END_MARKER,
+    "CodexRebuildLocalUpdater:titlebar-",
+    "function codexRebuildUpdaterEnsureTitlebarStyle",
+    "{id:'codex-rebuild-updater-top',message:",
+  ].some((signature) => code.includes(signature));
+}
+
+function updaterDescriptorElements(menuArray) {
+  return menuArray.elements.filter((element) => {
+    if (element?.type !== "ObjectExpression") return false;
+    return element.properties.some(
+      (property) =>
+        propertyName(property) === "id" &&
+        literalValue(property.value) === WEBVIEW_UPDATER_MENU_ID,
+    );
+  });
+}
+
+function assertRenderedTitlebarComponent(ast, shape) {
+  const programFunctions = ast.body.filter(
+    (statement) =>
+      statement.type === "FunctionDeclaration" &&
+      statement.start === shape.menuFunction.start &&
+      statement.end === shape.menuFunction.end,
+  );
+  if (programFunctions.length !== 1) {
+    throw new Error(
+      "Windows webview updater titlebar component is not an executable Program declaration",
+    );
+  }
+  const renderCalls = [];
+  walkAst(ast, (node) => {
+    if (
+      node.start >= shape.menuFunction.start &&
+      node.end <= shape.menuFunction.end
+    ) {
+      return;
+    }
+    if (
+      node.type === "CallExpression" &&
+      (sequenceMember(node, "jsx") || sequenceMember(node, "jsxs")) &&
+      node.arguments[0]?.type === "Identifier" &&
+      node.arguments[0].name === shape.functionName &&
+      node.arguments[1]?.type === "ObjectExpression"
+    ) {
+      renderCalls.push(node);
+    }
+  });
+  if (renderCalls.length !== 1) {
+    throw new Error(
+      `Windows webview updater titlebar component expected exactly one rendered JSX attachment, found ${renderCalls.length}`,
+    );
+  }
+}
+
+function inspectUpdaterTitlebarSource(code, { allowLegacy = false } = {}) {
+  if (typeof code !== "string" || code.trim() === "") {
+    throw new Error("Windows webview updater titlebar source is empty");
+  }
   const functionCount = countOccurrences(
     code,
     "function codexRebuildUpdaterEnsureTitlebarStyle",
   );
-  const itemCount = countOccurrences(
-    code,
-    "{id:'codex-rebuild-updater-top',message:",
+  const itemCount = countOccurrences(code, "{id:'codex-rebuild-updater-top',message:");
+  if (functionCount !== 1) {
+    throw new Error(
+      `Windows webview updater function expected exactly 1 target, found ${functionCount}`,
+    );
+  }
+  if (itemCount !== 1) {
+    throw new Error(`Windows webview updater item expected exactly 1 target, found ${itemCount}`);
+  }
+
+  const ast = parseJavaScript(code, "Windows webview updater titlebar", "module");
+  const shape = analyzeWebviewMenuBarCode(code);
+  const updaterDescriptors = [];
+  walkAst(ast, (node) => {
+    if (
+      node.type === "ObjectExpression" &&
+      node.properties.some(
+        (property) =>
+          propertyName(property) === "id" &&
+          literalValue(property.value) === WEBVIEW_UPDATER_MENU_ID,
+      )
+    ) {
+      updaterDescriptors.push(node);
+    }
+  });
+  if (updaterDescriptors.length !== 1) {
+    throw new Error(
+      `Windows webview updater descriptor expected exactly 1 AST target, found ${updaterDescriptors.length}`,
+    );
+  }
+  const descriptorElements = updaterDescriptorElements(shape.menuArray);
+  if (descriptorElements.length !== 1) {
+    throw new Error(
+      `Windows webview updater descriptor expected one attached menu item, found ${descriptorElements.length}`,
+    );
+  }
+  const descriptorElement = descriptorElements[0];
+  assertRenderedTitlebarComponent(ast, shape);
+
+  const hasBoundaries = [
+    WEBVIEW_COMPONENT_START_MARKER,
+    WEBVIEW_COMPONENT_END_MARKER,
+    WEBVIEW_DESCRIPTOR_START_MARKER,
+    WEBVIEW_DESCRIPTOR_END_MARKER,
+  ].some((marker) => code.includes(marker));
+  let componentRange;
+  let descriptorRange;
+  let candidates;
+  if (hasBoundaries) {
+    componentRange = markerRange(
+      code,
+      WEBVIEW_COMPONENT_START_MARKER,
+      WEBVIEW_COMPONENT_END_MARKER,
+      "Windows webview updater component",
+    );
+    descriptorRange = markerRange(
+      code,
+      WEBVIEW_DESCRIPTOR_START_MARKER,
+      WEBVIEW_DESCRIPTOR_END_MARKER,
+      "Windows webview updater descriptor",
+    );
+    candidates = [
+      {
+        dialect: "current",
+        version: LOCAL_UPDATER_CONTRACT_VERSION,
+        component: bindWebviewMenuBarPatch(makeWebviewMenuBarFunctionPatch(), shape),
+        descriptor: makeWebviewMenuDescriptorBlock(),
+        descriptorItem: makeWebviewMenuDescriptorPatch(),
+        versionMarkers: [
+          layerVersionMarker("titlebar-component"),
+          layerVersionMarker("titlebar-descriptor"),
+        ],
+      },
+    ];
+    if (allowLegacy) {
+      candidates.push({
+        dialect: "v0",
+        version: 0,
+        component: bindWebviewMenuBarPatch(makeWebviewMenuBarFunctionPatch(0), shape),
+        descriptor: makeWebviewMenuDescriptorBlock(0),
+        descriptorItem: makeWebviewMenuDescriptorPatch(0),
+        versionMarkers: [
+          layerVersionMarker("titlebar-component", 0),
+          layerVersionMarker("titlebar-descriptor", 0),
+        ],
+      });
+    }
+  } else {
+    if (!allowLegacy) {
+      throw new Error("Windows webview updater titlebar canonical version markers are missing");
+    }
+    const legacyComponentStart = code.indexOf(
+      "function codexRebuildUpdaterEnsureTitlebarStyle",
+    );
+    if (legacyComponentStart < 0 || legacyComponentStart >= shape.menuFunction.start) {
+      throw new Error("Windows webview updater legacy component block is detached");
+    }
+    componentRange = {
+      start: legacyComponentStart,
+      end: shape.menuFunction.end,
+      code: code.slice(legacyComponentStart, shape.menuFunction.end),
+    };
+    descriptorRange = {
+      start: descriptorElement.start,
+      end: descriptorElement.end,
+      code: code.slice(descriptorElement.start, descriptorElement.end),
+    };
+    candidates = [
+      {
+        dialect: "versionless",
+        version: null,
+        component: bindWebviewMenuBarPatch(makeWebviewMenuBarFunctionPatch(null), shape),
+        descriptor: makeWebviewMenuDescriptorPatch(null),
+        descriptorItem: makeWebviewMenuDescriptorPatch(null),
+        versionMarkers: [],
+      },
+    ];
+  }
+
+  if (
+    shape.menuFunction.start < componentRange.start ||
+    shape.menuFunction.end > componentRange.end
+  ) {
+    throw new Error("Windows webview updater component canonical block is detached");
+  }
+  if (
+    descriptorRange.start < descriptorElement.start ||
+    descriptorRange.end > descriptorElement.end
+  ) {
+    throw new Error("Windows webview updater descriptor canonical block is detached");
+  }
+  const candidate = candidates.find(
+    (item) =>
+      item.component === componentRange.code &&
+      item.descriptor === descriptorRange.code &&
+      item.descriptorItem === code.slice(descriptorElement.start, descriptorElement.end),
   );
-  if (functionCount > 0 || itemCount > 0) {
-    if (functionCount !== 1) {
-      throw new Error(
-        `Windows webview updater function expected exactly 1 target, found ${functionCount}`,
-      );
-    }
-    if (itemCount !== 1) {
-      throw new Error(
-        `Windows webview updater item expected exactly 1 target, found ${itemCount}`,
-      );
-    }
-    return code;
+  if (!candidate) {
+    const expected = candidates[0];
+    throw new Error(
+      "Windows webview updater titlebar canonical bytes or version do not match " +
+        `(component diff ${firstDifferenceIndex(componentRange.code, expected.component)}, ` +
+        `descriptor diff ${firstDifferenceIndex(descriptorRange.code, expected.descriptor)})`,
+    );
+  }
+  const versions = updaterVersionSignatures(code);
+  const sortedVersions = [...versions].sort();
+  const sortedExpectedVersions = [...candidate.versionMarkers].sort();
+  if (
+    sortedVersions.length !== sortedExpectedVersions.length ||
+    sortedVersions.some((version, index) => version !== sortedExpectedVersions[index])
+  ) {
+    throw new Error("Windows webview updater titlebar version is stale or mismatched");
+  }
+
+  const canonicalComponent = bindWebviewMenuBarPatch(
+    makeWebviewMenuBarFunctionPatch(),
+    shape,
+  );
+  const canonicalDescriptor = hasBoundaries
+    ? makeWebviewMenuDescriptorBlock()
+    : makeWebviewMenuDescriptorPatch();
+  const canonicalSource = applyReplacements(code, [
+    {
+      start: componentRange.start,
+      end: componentRange.end,
+      text: canonicalComponent,
+    },
+    {
+      start: descriptorRange.start,
+      end: descriptorRange.end,
+      text: canonicalDescriptor,
+    },
+  ]);
+  return {
+    layer: "titlebar",
+    version: candidate.version,
+    dialect: candidate.dialect,
+    functionName: shape.functionName,
+    menuArrayName: shape.menuArrayName,
+    canonicalSource,
+  };
+}
+
+function validateUpdaterTitlebarSource(code) {
+  return inspectUpdaterTitlebarSource(code);
+}
+
+function patchWebviewMenuBarCode(code) {
+  if (typeof code !== "string" || code.trim() === "") {
+    throw new Error("Windows webview updater titlebar source is empty");
+  }
+  if (hasTitlebarSignature(code)) {
+    const inspection = inspectUpdaterTitlebarSource(code, { allowLegacy: true });
+    if (inspection.dialect === "current") return code;
+    validateUpdaterTitlebarSource(inspection.canonicalSource);
+    return inspection.canonicalSource;
   }
   const shape = analyzeWebviewMenuBarCode(code);
-  return applyReplacements(code, [
+  const next = applyReplacements(code, [
     {
       start: shape.menuArray.end - 1,
       end: shape.menuArray.end - 1,
-      text: `,${WEBVIEW_MENU_BAR_ITEM}`,
+      text: `,${makeWebviewMenuDescriptorPatch()}`,
     },
     {
       start: shape.menuFunction.start,
@@ -1180,17 +1388,8 @@ function patchWebviewMenuBarCode(code) {
       text: bindWebviewMenuBarPatch(makeWebviewMenuBarFunctionPatch(), shape),
     },
   ]);
-}
-
-function unwrapPatchedBootstrap(code) {
-  const prefixAnchor = `${END_MARKER}\nif(!CodexRebuildWindowsBootstrap()){\n`;
-  const prefixEnd = code.indexOf(prefixAnchor);
-  const suffixAnchor = `\n}\n${FILE_END_MARKER}`;
-  const suffixStart = code.lastIndexOf(suffixAnchor);
-  if (!code.startsWith(START_MARKER) || prefixEnd === -1 || suffixStart === -1) {
-    return null;
-  }
-  return code.slice(prefixEnd + prefixAnchor.length, suffixStart);
+  validateUpdaterTitlebarSource(next);
+  return next;
 }
 
 function normalizeAsarPath(value) {
@@ -1202,6 +1401,83 @@ function normalizeAsarPath(value) {
     throw new Error(`Windows package entry escapes the ASAR root: ${value}`);
   }
   return normalized;
+}
+
+function parseJavaScript(code, label, sourceType = "script") {
+  try {
+    return acorn.parse(code, { ecmaVersion: "latest", sourceType });
+  } catch (error) {
+    throw new Error(`${label} parse failed: ${error.message}`);
+  }
+}
+
+function flattenTopLevelSequence(node, output = []) {
+  if (node?.type === "SequenceExpression") {
+    for (const expression of node.expressions) flattenTopLevelSequence(expression, output);
+  } else if (node) {
+    output.push(node);
+  }
+  return output;
+}
+
+function bootstrapRequireTarget(node) {
+  if (
+    node?.type !== "CallExpression" ||
+    node.callee.type !== "Identifier" ||
+    node.callee.name !== "require" ||
+    node.arguments.length !== 1
+  ) {
+    return null;
+  }
+  const target = literalValue(node.arguments[0]);
+  return typeof target === "string" && /^\.\/bootstrap(?:-[A-Za-z0-9_$-]+)?\.js$/.test(target)
+    ? target
+    : null;
+}
+
+function promisedBootstrapRequireTarget(node) {
+  if (
+    node?.type !== "CallExpression" ||
+    node.callee.type !== "MemberExpression" ||
+    node.callee.computed ||
+    node.callee.property.type !== "Identifier" ||
+    node.callee.property.name !== "then" ||
+    node.arguments.length !== 1 ||
+    node.arguments[0].type !== "ArrowFunctionExpression" ||
+    node.arguments[0].async ||
+    node.arguments[0].generator ||
+    node.arguments[0].params.length !== 0 ||
+    node.arguments[0].body.type === "BlockStatement"
+  ) {
+    return null;
+  }
+  const resolved = node.callee.object;
+  if (
+    resolved.type !== "CallExpression" ||
+    resolved.arguments.length !== 0 ||
+    resolved.callee.type !== "MemberExpression" ||
+    resolved.callee.computed ||
+    resolved.callee.object.type !== "Identifier" ||
+    resolved.callee.object.name !== "Promise" ||
+    resolved.callee.property.type !== "Identifier" ||
+    resolved.callee.property.name !== "resolve"
+  ) {
+    return null;
+  }
+  return bootstrapRequireTarget(node.arguments[0].body);
+}
+
+function liveRuntimeBootstrapTargets(entrySource) {
+  const ast = parseJavaScript(entrySource, "Windows early bootstrap", "script");
+  const targets = [];
+  for (const statement of ast.body) {
+    if (statement.type !== "ExpressionStatement") continue;
+    for (const expression of flattenTopLevelSequence(statement.expression)) {
+      const target = bootstrapRequireTarget(expression) || promisedBootstrapRequireTarget(expression);
+      if (target) targets.push(target);
+    }
+  }
+  return targets;
 }
 
 function resolveRuntimeBootstrap(packageSource, readSource) {
@@ -1221,12 +1497,7 @@ function resolveRuntimeBootstrap(packageSource, readSource) {
     if (typeof entrySource !== "string") {
       throw new Error(`Windows early bootstrap is missing: ${entryPath}`);
     }
-    const matches = [
-      ...entrySource.matchAll(
-        /require\(\s*(["'`])(\.\/bootstrap(?:-[A-Za-z0-9_$-]+)?\.js)\1\s*\)/g,
-      ),
-    ];
-    const targets = [...new Set(matches.map((match) => match[2]))];
+    const targets = liveRuntimeBootstrapTargets(entrySource);
     if (targets.length !== 1) {
       throw new Error(`runtime bootstrap expected exactly 1 target, found ${targets.length}`);
     }
@@ -1251,32 +1522,145 @@ function localLayerCount(status) {
   };
 }
 
+function markerRange(code, startMarker, endMarker, label) {
+  const startCount = countOccurrences(code, startMarker);
+  const endCount = countOccurrences(code, endMarker);
+  if (startCount !== 1) {
+    throw new Error(`${label} start marker expected exactly 1 target, found ${startCount}`);
+  }
+  if (endCount !== 1) {
+    throw new Error(`${label} end marker expected exactly 1 target, found ${endCount}`);
+  }
+  const start = code.indexOf(startMarker);
+  const endMarkerStart = code.indexOf(endMarker);
+  if (endMarkerStart < start) throw new Error(`${label} canonical marker order is invalid`);
+  const end = endMarkerStart + endMarker.length;
+  return { start, end, code: code.slice(start, end) };
+}
+
+function updaterVersionSignatures(code) {
+  return [
+    ...code.matchAll(/\/\*\s*CodexRebuildLocalUpdater:[^*\r\n]*v\d+[^*\r\n]*\*\//g),
+  ].map((match) => match[0]);
+}
+
+function hasBackendSignature(code) {
+  return [
+    START_MARKER,
+    END_MARKER,
+    FILE_END_MARKER,
+    "CodexRebuildWindowsBootstrap",
+    "CodexRebuildSetupLocalUpdater",
+    "codex_rebuild:update-command",
+    "CodexRebuildLocalUpdater:v",
+  ].some((signature) => code.includes(signature));
+}
+
+function assertBackendProgramAttachment(code) {
+  const ast = parseJavaScript(code, "Windows runtime bootstrap", "script");
+  const [bootstrap, setup, guardedRuntime, ...rest] = ast.body;
+  const attached =
+    rest.length === 0 &&
+    bootstrap?.type === "FunctionDeclaration" &&
+    bootstrap.id?.name === "CodexRebuildWindowsBootstrap" &&
+    setup?.type === "FunctionDeclaration" &&
+    setup.id?.name === "CodexRebuildSetupLocalUpdater" &&
+    guardedRuntime?.type === "IfStatement" &&
+    guardedRuntime.alternate == null &&
+    guardedRuntime.test.type === "UnaryExpression" &&
+    guardedRuntime.test.operator === "!" &&
+    guardedRuntime.test.argument.type === "CallExpression" &&
+    guardedRuntime.test.argument.callee.type === "Identifier" &&
+    guardedRuntime.test.argument.callee.name === "CodexRebuildWindowsBootstrap" &&
+    guardedRuntime.test.argument.arguments.length === 0 &&
+    guardedRuntime.consequent.type === "BlockStatement" &&
+    guardedRuntime.consequent.body.length > 0;
+  if (!attached) {
+    throw new Error(
+      "Windows runtime bootstrap canonical backend is not attached to the live Program guard",
+    );
+  }
+}
+
+function inspectUpdaterBackendSource(code, { allowLegacy = false } = {}) {
+  if (typeof code !== "string" || code.trim() === "") {
+    throw new Error("resolved Windows runtime bootstrap is empty");
+  }
+  markerRange(code, START_MARKER, END_MARKER, "Windows runtime bootstrap");
+  const fileEndCount = countOccurrences(code, FILE_END_MARKER);
+  if (fileEndCount !== 1) {
+    throw new Error(
+      `Windows runtime bootstrap file-end marker expected exactly 1 target, found ${fileEndCount}`,
+    );
+  }
+
+  const suffix = `\n}\n${FILE_END_MARKER}\n`;
+  const candidates = [
+    {
+      dialect: "current",
+      version: LOCAL_UPDATER_CONTRACT_VERSION,
+      prefix: makeBootstrapPrefix(),
+      versionMarker: layerVersionMarker("backend"),
+    },
+  ];
+  if (allowLegacy) {
+    candidates.push(
+      {
+        dialect: "v0",
+        version: 0,
+        prefix: makeBootstrapPrefix(0),
+        versionMarker: layerVersionMarker("backend", 0),
+      },
+      { dialect: "versionless", version: null, prefix: makeBootstrapPrefix(null) },
+    );
+  }
+
+  for (const candidate of candidates) {
+    if (!code.startsWith(candidate.prefix) || !code.endsWith(suffix)) continue;
+    const versions = updaterVersionSignatures(code);
+    const expectedVersions = candidate.versionMarker ? [candidate.versionMarker] : [];
+    if (
+      versions.length !== expectedVersions.length ||
+      versions.some((version, index) => version !== expectedVersions[index])
+    ) {
+      throw new Error("Windows runtime bootstrap canonical backend version is stale or mismatched");
+    }
+    assertBackendProgramAttachment(code);
+    const originalSource = code.slice(candidate.prefix.length, -suffix.length);
+    return {
+      layer: "backend",
+      version: candidate.version,
+      dialect: candidate.dialect,
+      originalSource,
+      canonicalSource: `${makeBootstrapPrefix()}${originalSource}${suffix}`,
+    };
+  }
+  throw new Error("Windows runtime bootstrap canonical backend postcondition failed");
+}
+
+function validateUpdaterBackendSource(code) {
+  return inspectUpdaterBackendSource(code);
+}
+
 function patchBootstrapCode(code) {
   if (typeof code !== "string" || code.trim() === "") {
     throw new Error("resolved Windows runtime bootstrap is empty");
   }
-  const markerCounts = [START_MARKER, END_MARKER, FILE_END_MARKER].map((marker) =>
-    countOccurrences(code, marker),
-  );
-  if (markerCounts.some((count) => count > 0)) {
-    for (const [index, label] of ["start", "end", "file-end"].entries()) {
-      if (markerCounts[index] !== 1) {
-        throw new Error(
-          `Windows runtime bootstrap ${label} marker expected exactly 1 target, ` +
-            `found ${markerCounts[index]}`,
-        );
-      }
+  if (hasBackendSignature(code)) {
+    const inspection = inspectUpdaterBackendSource(code, { allowLegacy: true });
+    if (inspection.dialect === "current") {
+      return { code, status: "already", counts: localLayerCount("already") };
     }
-    if (!code.includes("codex_rebuild:update-command")) {
-      throw new Error("Windows runtime bootstrap updater command is incomplete");
-    }
-    return { code, status: "already", counts: localLayerCount("already") };
+    validateUpdaterBackendSource(inspection.canonicalSource);
+    return {
+      code: inspection.canonicalSource,
+      status: "patched",
+      counts: localLayerCount("patched"),
+    };
   }
-  return {
-    code: `${makeBootstrapPrefix()}${code}\n}\n${FILE_END_MARKER}\n`,
-    status: "patched",
-    counts: localLayerCount("patched"),
-  };
+  const next = `${makeBootstrapPrefix()}${code}\n}\n${FILE_END_MARKER}\n`;
+  validateUpdaterBackendSource(next);
+  return { code: next, status: "patched", counts: localLayerCount("patched") };
 }
 
 function findElectronBinding(code) {
@@ -1310,31 +1694,148 @@ function findElectronBinding(code) {
   return bindings[0];
 }
 
+function hasPreloadSignature(code) {
+  return [
+    PRELOAD_START_MARKER,
+    PRELOAD_END_MARKER,
+    layerVersionMarker("preload"),
+    "codexRebuildUpdater",
+    "codex_rebuild:update-state",
+    "codex_rebuild:update-command",
+  ].some((signature) => code.includes(signature));
+}
+
+function makePatchedPreloadSource(baseSource, electronAlias, version) {
+  const patch = makePreloadPatch(electronAlias, version);
+  const sourceMap = "\n//# sourceMappingURL=preload.js.map";
+  return baseSource.includes(sourceMap)
+    ? baseSource.replace(sourceMap, `\n${patch}${sourceMap}`)
+    : `${baseSource}\n${patch}\n`;
+}
+
+function preloadBaseSource(code, range) {
+  if (range.start === 0 || code[range.start - 1] !== "\n") {
+    throw new Error("Windows preload canonical block is not attached at Program scope");
+  }
+  const suffix = code.slice(range.end);
+  if (suffix.startsWith("\n//# sourceMappingURL=preload.js.map")) {
+    return code.slice(0, range.start - 1) + suffix;
+  }
+  if (suffix === "\n") return code.slice(0, range.start - 1);
+  throw new Error("Windows preload canonical block placement postcondition failed");
+}
+
+function assertPreloadProgramAttachment(code, range, electronAlias) {
+  const ast = parseJavaScript(code, "Windows preload", "script");
+  const enclosed = ast.body.filter(
+    (statement) => statement.start >= range.start && statement.end <= range.end,
+  );
+  const statements = enclosed.filter((statement) => statement.type !== "EmptyStatement");
+  if (
+    enclosed.some(
+      (statement) =>
+        statement.type !== "EmptyStatement" && statement.type !== "ExpressionStatement",
+    ) ||
+    statements.length !== 1 ||
+    statements[0].type !== "ExpressionStatement" ||
+    !code
+      .slice(statements[0].start, statements[0].end)
+      .includes(`${electronAlias}.contextBridge.exposeInMainWorld('codexRebuildUpdater'`)
+  ) {
+    throw new Error(
+      "Windows preload canonical bridge has no executable Program-scope exposure",
+    );
+  }
+}
+
+function inspectUpdaterPreloadSource(code, { allowLegacy = false } = {}) {
+  if (typeof code !== "string" || code.trim() === "") {
+    throw new Error("Windows preload source is empty");
+  }
+  const range = markerRange(
+    code,
+    PRELOAD_START_MARKER,
+    PRELOAD_END_MARKER,
+    "Windows preload updater",
+  );
+  const baseSource = preloadBaseSource(code, range);
+  const electronAlias = findElectronBinding(baseSource);
+  const candidates = [
+    {
+      dialect: "current",
+      version: LOCAL_UPDATER_CONTRACT_VERSION,
+      block: makePreloadPatch(electronAlias),
+      versionMarker: layerVersionMarker("preload"),
+    },
+  ];
+  if (allowLegacy) {
+    candidates.push(
+      {
+        dialect: "v0",
+        version: 0,
+        block: makePreloadPatch(electronAlias, 0),
+        versionMarker: layerVersionMarker("preload", 0),
+      },
+      {
+        dialect: "versionless",
+        version: null,
+        block: makePreloadPatch(electronAlias, null),
+      },
+    );
+  }
+  const candidate = candidates.find((item) => item.block === range.code);
+  if (!candidate) {
+    throw new Error("Windows preload canonical bridge bytes or version do not match");
+  }
+  const versions = updaterVersionSignatures(code);
+  const expectedVersions = candidate.versionMarker ? [candidate.versionMarker] : [];
+  if (
+    versions.length !== expectedVersions.length ||
+    versions.some((version, index) => version !== expectedVersions[index])
+  ) {
+    throw new Error("Windows preload canonical bridge version is stale or mismatched");
+  }
+  if (code !== makePatchedPreloadSource(baseSource, electronAlias, candidate.version)) {
+    throw new Error("Windows preload canonical bridge placement postcondition failed");
+  }
+  assertPreloadProgramAttachment(code, range, electronAlias);
+  return {
+    layer: "preload",
+    version: candidate.version,
+    dialect: candidate.dialect,
+    electronAlias,
+    baseSource,
+    canonicalSource: makePatchedPreloadSource(
+      baseSource,
+      electronAlias,
+      LOCAL_UPDATER_CONTRACT_VERSION,
+    ),
+  };
+}
+
+function validateUpdaterPreloadSource(code) {
+  return inspectUpdaterPreloadSource(code);
+}
+
 function patchPreloadCode(code) {
-  const startCount = countOccurrences(code, PRELOAD_START_MARKER);
-  const endCount = countOccurrences(code, PRELOAD_END_MARKER);
-  if (startCount > 0 || endCount > 0) {
-    if (startCount !== 1) {
-      throw new Error(
-        `Windows preload updater start marker expected exactly 1 target, found ${startCount}`,
-      );
+  if (typeof code !== "string" || code.trim() === "") {
+    throw new Error("Windows preload source is empty");
+  }
+  if (hasPreloadSignature(code)) {
+    const inspection = inspectUpdaterPreloadSource(code, { allowLegacy: true });
+    if (inspection.dialect === "current") {
+      return { code, status: "already", counts: localLayerCount("already") };
     }
-    if (endCount !== 1) {
-      throw new Error(
-        `Windows preload updater end marker expected exactly 1 target, found ${endCount}`,
-      );
-    }
-    if (!/exposeInMainWorld\(\s*["'`]codexRebuildUpdater["'`]/.test(code)) {
-      throw new Error("Windows preload updater bridge is incomplete");
-    }
-    return { code, status: "already", counts: localLayerCount("already") };
+    validateUpdaterPreloadSource(inspection.canonicalSource);
+    return {
+      code: inspection.canonicalSource,
+      status: "patched",
+      counts: localLayerCount("patched"),
+    };
   }
   const electronAlias = findElectronBinding(code);
-  const patch = makePreloadPatch(electronAlias);
-  const sourceMap = "\n//# sourceMappingURL=preload.js.map";
-  const next = code.includes(sourceMap)
-    ? code.replace(sourceMap, `\n${patch}${sourceMap}`)
-    : `${code}\n${patch}\n`;
+  const next = makePatchedPreloadSource(code, electronAlias, LOCAL_UPDATER_CONTRACT_VERSION);
+  validateUpdaterPreloadSource(next);
   return { code: next, status: "patched", counts: localLayerCount("patched") };
 }
 
@@ -1358,35 +1859,203 @@ function patchPackageMetadataSource(packageSource, updateUrl = DEFAULT_WINDOWS_U
   };
 }
 
+function inspectUpdaterMetadataSource(packageSource, expectedUpdateUrl) {
+  let metadata;
+  try {
+    metadata = JSON.parse(packageSource);
+  } catch (error) {
+    throw new Error(`Windows package metadata parse failed: ${error.message}`);
+  }
+  const updateUrl = String(metadata?.codexRebuildWindowsUpdateUrl || "").trim();
+  if (!updateUrl) throw new Error("Windows package metadata updater URL is missing");
+  if (
+    expectedUpdateUrl !== undefined &&
+    updateUrl !== String(expectedUpdateUrl || "").trim()
+  ) {
+    throw new Error("Windows package metadata updater URL does not match the planned URL");
+  }
+  return { layer: "metadata", version: LOCAL_UPDATER_CONTRACT_VERSION, updateUrl };
+}
+
+function normalizeUpdaterFiles(files) {
+  if (!files || typeof files !== "object") throw new Error("Windows ASAR sources are required");
+  const normalizedFiles = {};
+  for (const [fileName, source] of Object.entries(files)) {
+    const normalized = normalizeAsarPath(fileName);
+    if (Object.hasOwn(normalizedFiles, normalized)) {
+      throw new Error(`Windows ASAR source path is duplicated after normalization: ${normalized}`);
+    }
+    normalizedFiles[normalized] = source;
+  }
+  return normalizedFiles;
+}
+
+function exactlyOneEvidence(evidence, label) {
+  if (evidence.length !== 1) {
+    throw new Error(`${label} expected exactly 1 canonical target, found ${evidence.length}`);
+  }
+  return evidence[0];
+}
+
+function makeUpdaterEvidence(pathName, inspection) {
+  const {
+    canonicalSource: _canonicalSource,
+    originalSource: _originalSource,
+    baseSource: _baseSource,
+    ...evidence
+  } = inspection;
+  return { ...evidence, path: pathName };
+}
+
+function validateLocalUpdaterSources({ packageSource, files, expectedUpdateUrl } = {}) {
+  if (typeof packageSource !== "string") throw new Error("Windows package metadata is required");
+  const normalizedFiles = normalizeUpdaterFiles(files);
+  const metadata = inspectUpdaterMetadataSource(packageSource, expectedUpdateUrl);
+  const resolved = resolveRuntimeBootstrap(packageSource, (fileName) => normalizedFiles[fileName]);
+
+  const backendEvidence = [];
+  for (const [fileName, source] of Object.entries(normalizedFiles)) {
+    if (!/^\.vite\/build\/bootstrap(?:-[A-Za-z0-9_$-]+)?\.js$/.test(fileName)) continue;
+    if (fileName !== resolved.runtimePath && !hasBackendSignature(String(source || ""))) continue;
+    let inspection;
+    try {
+      inspection = validateUpdaterBackendSource(source);
+    } catch (error) {
+      throw new Error(`Windows updater backend ${fileName}: ${error.message}`);
+    }
+    backendEvidence.push(makeUpdaterEvidence(fileName, inspection));
+  }
+  const backend = exactlyOneEvidence(backendEvidence, "Windows updater backend");
+  if (backend.path !== resolved.runtimePath) {
+    throw new Error("Windows updater backend canonical target is not the live runtime bootstrap");
+  }
+
+  const preloadPath = ".vite/build/preload.js";
+  if (typeof normalizedFiles[preloadPath] !== "string") {
+    throw new Error("Windows preload expected exactly 1 target, found 0");
+  }
+  let preloadInspection;
+  try {
+    preloadInspection = validateUpdaterPreloadSource(normalizedFiles[preloadPath]);
+  } catch (error) {
+    throw new Error(`Windows updater preload ${preloadPath}: ${error.message}`);
+  }
+  const preload = makeUpdaterEvidence(preloadPath, preloadInspection);
+
+  const mainMenuEvidence = [];
+  for (const [fileName, source] of Object.entries(normalizedFiles)) {
+    if (!/^\.vite\/build\/main-.*\.js$/.test(fileName)) continue;
+    if (!hasMainMenuSignature(String(source || ""))) continue;
+    let inspection;
+    try {
+      inspection = validateUpdaterMainMenuSource(source);
+    } catch (error) {
+      throw new Error(`Windows updater main menu ${fileName}: ${error.message}`);
+    }
+    mainMenuEvidence.push(makeUpdaterEvidence(fileName, inspection));
+  }
+  const mainMenu = exactlyOneEvidence(mainMenuEvidence, "Windows updater main menu");
+
+  const titlebarEvidence = [];
+  for (const [fileName, source] of Object.entries(normalizedFiles)) {
+    if (!/^webview\/assets\/app-shell-.*\.js$/.test(fileName)) continue;
+    if (!hasTitlebarSignature(String(source || ""))) continue;
+    let inspection;
+    try {
+      inspection = validateUpdaterTitlebarSource(source);
+    } catch (error) {
+      throw new Error(`Windows updater titlebar ${fileName}: ${error.message}`);
+    }
+    titlebarEvidence.push(makeUpdaterEvidence(fileName, inspection));
+  }
+  const titlebar = exactlyOneEvidence(titlebarEvidence, "Windows updater titlebar");
+
+  const evidence = [
+    { ...metadata, path: "package.json" },
+    backend,
+    preload,
+    mainMenu,
+    titlebar,
+  ];
+  const uniquePaths = new Set(evidence.map((item) => item.path));
+  if (evidence.length !== 5 || uniquePaths.size !== 5) {
+    throw new Error(
+      `Windows local updater evidence expected exactly 5 unique paths, found ${uniquePaths.size}`,
+    );
+  }
+  return {
+    version: LOCAL_UPDATER_CONTRACT_VERSION,
+    paths: {
+      metadata: "package.json",
+      entry: resolved.entryPath,
+      backend: backend.path,
+      preload: preload.path,
+      mainMenu: mainMenu.path,
+      titlebar: titlebar.path,
+    },
+    evidence,
+  };
+}
+
+function selectMainMenuTarget(normalizedFiles) {
+  const candidates = [];
+  for (const [fileName, source] of Object.entries(normalizedFiles)) {
+    if (!/^\.vite\/build\/main-.*\.js$/.test(fileName)) continue;
+    if (hasMainMenuSignature(String(source || ""))) {
+      try {
+        candidates.push({ path: fileName, code: patchMainMenuCode(source) });
+      } catch (error) {
+        throw new Error(`Windows main menu ${fileName}: ${error.message}`);
+      }
+      continue;
+    }
+    try {
+      analyzeMainMenuCode(source);
+      candidates.push({ path: fileName, code: patchMainMenuCode(source) });
+    } catch {
+      // Non-menu main chunks are not updater targets.
+    }
+  }
+  if (candidates.length !== 1) {
+    throw new Error(`Windows main menu expected exactly 1 target, found ${candidates.length}`);
+  }
+  return candidates[0];
+}
+
+function selectTitlebarTarget(normalizedFiles) {
+  const candidates = [];
+  for (const [fileName, source] of Object.entries(normalizedFiles)) {
+    if (!/^webview\/assets\/app-shell-.*\.js$/.test(fileName)) continue;
+    if (hasTitlebarSignature(String(source || ""))) {
+      try {
+        candidates.push({ path: fileName, code: patchWebviewMenuBarCode(source) });
+      } catch (error) {
+        throw new Error(`Windows webview titlebar ${fileName}: ${error.message}`);
+      }
+      continue;
+    }
+    if (!source.includes("windowsMenuBar.help") || !source.includes("showApplicationMenu")) continue;
+    try {
+      analyzeWebviewMenuBarCode(source);
+      candidates.push({ path: fileName, code: patchWebviewMenuBarCode(source) });
+    } catch {
+      // Other app-shell chunks may mention menu messages without rendering the titlebar.
+    }
+  }
+  if (candidates.length !== 1) {
+    throw new Error(`Windows webview titlebar expected exactly 1 target, found ${candidates.length}`);
+  }
+  return candidates[0];
+}
+
 function makePlannedLayer(pathName, result) {
   return { path: pathName, status: result.status, counts: result.counts };
 }
 
 function planLocalUpdaterSources({ packageSource, files, updateUrl = DEFAULT_WINDOWS_UPDATE_URL }) {
   if (typeof packageSource !== "string") throw new Error("Windows package metadata is required");
-  if (!files || typeof files !== "object") throw new Error("Windows ASAR sources are required");
-  const normalizedFiles = {};
-  for (const [fileName, source] of Object.entries(files)) {
-    normalizedFiles[normalizeAsarPath(fileName)] = source;
-  }
+  const normalizedFiles = normalizeUpdaterFiles(files);
   const resolved = resolveRuntimeBootstrap(packageSource, (fileName) => normalizedFiles[fileName]);
-  const mainNames = Object.keys(normalizedFiles).filter((fileName) =>
-    /^\.vite\/build\/main-.*\.js$/.test(fileName),
-  );
-  const webviewNames = Object.keys(normalizedFiles).filter((fileName) => {
-    if (!/^webview\/assets\/app-shell-.*\.js$/.test(fileName)) return false;
-    const source = normalizedFiles[fileName];
-    return (
-      source.includes("function codexRebuildUpdaterEnsureTitlebarStyle") ||
-      (source.includes("windowsMenuBar.help") && source.includes("showApplicationMenu"))
-    );
-  });
-  if (mainNames.length !== 1) {
-    throw new Error(`Windows main menu expected exactly 1 target, found ${mainNames.length}`);
-  }
-  if (webviewNames.length !== 1) {
-    throw new Error(`Windows webview titlebar expected exactly 1 target, found ${webviewNames.length}`);
-  }
   const preloadPath = ".vite/build/preload.js";
   if (typeof normalizedFiles[preloadPath] !== "string") {
     throw new Error("Windows preload expected exactly 1 target, found 0");
@@ -1395,16 +2064,18 @@ function planLocalUpdaterSources({ packageSource, files, updateUrl = DEFAULT_WIN
   const metadata = patchPackageMetadataSource(packageSource, updateUrl);
   const backend = patchBootstrapCode(normalizedFiles[resolved.runtimePath]);
   const preload = patchPreloadCode(normalizedFiles[preloadPath]);
-  const mainCode = patchMainMenuCode(normalizedFiles[mainNames[0]]);
-  const webviewCode = patchWebviewMenuBarCode(normalizedFiles[webviewNames[0]]);
+  const selectedMainMenu = selectMainMenuTarget(normalizedFiles);
+  const selectedTitlebar = selectTitlebarTarget(normalizedFiles);
+  const mainCode = selectedMainMenu.code;
+  const webviewCode = selectedTitlebar.code;
   const mainMenu = {
     code: mainCode,
-    status: mainCode === normalizedFiles[mainNames[0]] ? "already" : "patched",
+    status: mainCode === normalizedFiles[selectedMainMenu.path] ? "already" : "patched",
   };
   mainMenu.counts = localLayerCount(mainMenu.status);
   const webview = {
     code: webviewCode,
-    status: webviewCode === normalizedFiles[webviewNames[0]] ? "already" : "patched",
+    status: webviewCode === normalizedFiles[selectedTitlebar.path] ? "already" : "patched",
   };
   webview.counts = localLayerCount(webview.status);
 
@@ -1412,9 +2083,40 @@ function planLocalUpdaterSources({ packageSource, files, updateUrl = DEFAULT_WIN
     { path: "package.json", source: packageSource, result: metadata },
     { path: resolved.runtimePath, source: normalizedFiles[resolved.runtimePath], result: backend },
     { path: preloadPath, source: normalizedFiles[preloadPath], result: preload },
-    { path: mainNames[0], source: normalizedFiles[mainNames[0]], result: mainMenu },
-    { path: webviewNames[0], source: normalizedFiles[webviewNames[0]], result: webview },
+    {
+      path: selectedMainMenu.path,
+      source: normalizedFiles[selectedMainMenu.path],
+      result: mainMenu,
+    },
+    {
+      path: selectedTitlebar.path,
+      source: normalizedFiles[selectedTitlebar.path],
+      result: webview,
+    },
   ];
+  const outputPaths = new Set(outputs.map((output) => output.path));
+  if (outputs.length !== 5 || outputPaths.size !== 5) {
+    throw new Error(
+      `Windows local updater plan expected exactly 5 unique paths, found ${outputPaths.size}`,
+    );
+  }
+  const plannedFiles = { ...normalizedFiles };
+  for (const output of outputs) {
+    if (output.path !== "package.json") plannedFiles[output.path] = output.result.code;
+  }
+  const validation = validateLocalUpdaterSources({
+    packageSource: metadata.code,
+    files: plannedFiles,
+    expectedUpdateUrl: updateUrl,
+  });
+  if (
+    validation.paths.backend !== resolved.runtimePath ||
+    validation.paths.preload !== preloadPath ||
+    validation.paths.mainMenu !== selectedMainMenu.path ||
+    validation.paths.titlebar !== selectedTitlebar.path
+  ) {
+    throw new Error("Windows local updater planned-output canonical postcondition failed");
+  }
   const changes = outputs
     .filter((output) => output.result.code !== output.source)
     .map((output) => ({ path: output.path, original: output.source, code: output.result.code }));
@@ -1430,9 +2132,10 @@ function planLocalUpdaterSources({ packageSource, files, updateUrl = DEFAULT_WIN
       },
       backend: makePlannedLayer(resolved.runtimePath, backend),
       preload: makePlannedLayer(preloadPath, preload),
-      mainMenu: makePlannedLayer(mainNames[0], mainMenu),
-      webview: makePlannedLayer(webviewNames[0], webview),
+      mainMenu: makePlannedLayer(selectedMainMenu.path, mainMenu),
+      webview: makePlannedLayer(selectedTitlebar.path, webview),
     },
+    validation,
   };
 }
 
@@ -1501,137 +2204,6 @@ function executeLocalUpdater({
   return plan;
 }
 
-function patchBootstrap() {
-  const bootstrapPath = path.join(SRC_DIR, "win", "_asar", ".vite", "build", "bootstrap.js");
-  if (!fs.existsSync(bootstrapPath)) {
-    console.log("  [ok] Windows bootstrap not found");
-    return;
-  }
-
-  const code = fs.readFileSync(bootstrapPath, "utf-8");
-  if (code.includes(START_MARKER)) {
-    const original = unwrapPatchedBootstrap(code);
-    if (original == null) {
-      console.log(`  [ok] ${relPath(bootstrapPath)}: local updater already patched`);
-      return;
-    }
-    const patched = `${makeBootstrapPrefix()}${original}
-}
-${FILE_END_MARKER}
-`;
-    if (patched === code) {
-      console.log(`  [ok] ${relPath(bootstrapPath)}: local updater already patched`);
-      return;
-    }
-    fs.writeFileSync(bootstrapPath, patched, "utf-8");
-    console.log(`  [ok] ${relPath(bootstrapPath)}: refreshed local Windows updater`);
-    return;
-  }
-
-  const patched = `${makeBootstrapPrefix()}${code}
-}
-${FILE_END_MARKER}
-`;
-  fs.writeFileSync(bootstrapPath, patched, "utf-8");
-  console.log(`  [ok] ${relPath(bootstrapPath)}: added local Windows updater`);
-}
-
-function patchPreload() {
-  const preloadPath = path.join(SRC_DIR, "win", "_asar", ".vite", "build", "preload.js");
-  if (!fs.existsSync(preloadPath)) {
-    console.log("  [ok] Windows preload not found");
-    return;
-  }
-
-  const patch = makePreloadPatch();
-  const code = fs.readFileSync(preloadPath, "utf-8");
-  if (code.includes(PRELOAD_START_MARKER)) {
-    const start = code.indexOf(PRELOAD_START_MARKER);
-    const end = code.indexOf(PRELOAD_END_MARKER, start);
-    if (end === -1) {
-      console.log(`  [ok] ${relPath(preloadPath)}: updater UI already patched`);
-      return;
-    }
-    const next = code.slice(0, start) + patch + code.slice(end + PRELOAD_END_MARKER.length);
-    if (next === code) {
-      console.log(`  [ok] ${relPath(preloadPath)}: updater UI already patched`);
-      return;
-    }
-    fs.writeFileSync(preloadPath, next, "utf-8");
-    console.log(`  [ok] ${relPath(preloadPath)}: refreshed updater UI bridge`);
-    return;
-  }
-
-  const sourceMap = "\n//# sourceMappingURL=preload.js.map";
-  const next = code.includes(sourceMap)
-    ? code.replace(sourceMap, `\n${patch}${sourceMap}`)
-    : `${code}\n${patch}\n`;
-  fs.writeFileSync(preloadPath, next, "utf-8");
-  console.log(`  [ok] ${relPath(preloadPath)}: added updater UI bridge`);
-}
-
-function patchMainMenu() {
-  const buildDir = path.join(SRC_DIR, "win", "_asar", ".vite", "build");
-  if (!fs.existsSync(buildDir)) {
-    console.log("  [ok] Windows main bundle directory not found");
-    return;
-  }
-
-  const candidates = fs
-    .readdirSync(buildDir)
-    .filter((name) => /^main-.*\.js$/.test(name))
-    .map((name) => path.join(buildDir, name));
-  const mainPath = candidates.find((candidate) => {
-    const code = fs.readFileSync(candidate, "utf-8");
-    return code.includes(MAIN_MENU_START_MARKER) || code.includes("let _t=[]");
-  });
-  if (!mainPath) {
-    console.log("  [ok] Windows main menu extension point not found");
-    return;
-  }
-
-  const code = fs.readFileSync(mainPath, "utf-8");
-  const next = patchMainMenuCode(code);
-  if (next === code) {
-    console.log(`  [ok] ${relPath(mainPath)}: updater menu already patched`);
-    return;
-  }
-
-  fs.writeFileSync(mainPath, next, "utf-8");
-  console.log(`  [ok] ${relPath(mainPath)}: added updater menu entries`);
-}
-
-function patchWebviewMenuBar() {
-  const assetsDir = path.join(SRC_DIR, "win", "_asar", "webview", "assets");
-  if (!fs.existsSync(assetsDir)) {
-    console.log("  [ok] Windows webview assets directory not found");
-    return;
-  }
-
-  const candidates = fs
-    .readdirSync(assetsDir)
-    .filter((name) => /^app-shell-.*\.js$/.test(name))
-    .map((name) => path.join(assetsDir, name));
-  const menuBarPath = candidates.find((candidate) => {
-    const code = fs.readFileSync(candidate, "utf-8");
-    return code.includes("windowsMenuBar.help") && code.includes("$r=[{id:_.file");
-  });
-  if (!menuBarPath) {
-    console.log("  [ok] Windows webview menu bar extension point not found");
-    return;
-  }
-
-  const code = fs.readFileSync(menuBarPath, "utf-8");
-  const next = patchWebviewMenuBarCode(code);
-  if (next === code) {
-    console.log(`  [ok] ${relPath(menuBarPath)}: updater titlebar menu already patched`);
-    return;
-  }
-
-  fs.writeFileSync(menuBarPath, next, "utf-8");
-  console.log(`  [ok] ${relPath(menuBarPath)}: added updater titlebar menu`);
-}
-
 function main() {
   const args = process.argv.slice(2);
   const isCheck = args.includes("--check");
@@ -1654,12 +2226,22 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
+  LOCAL_UPDATER_CONTRACT_VERSION,
   makeBootstrapPrefix,
   makePreloadPatch,
   makeMainMenuPatch,
   patchMainMenuCode,
   patchWebviewMenuBarCode,
   resolveRuntimeBootstrap,
+  inspectUpdaterBackendSource,
+  inspectUpdaterPreloadSource,
+  inspectUpdaterMainMenuSource,
+  inspectUpdaterTitlebarSource,
+  validateUpdaterBackendSource,
+  validateUpdaterPreloadSource,
+  validateUpdaterMainMenuSource,
+  validateUpdaterTitlebarSource,
+  validateLocalUpdaterSources,
   patchBootstrapCode,
   patchPreloadCode,
   patchPackageMetadataSource,
