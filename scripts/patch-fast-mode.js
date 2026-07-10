@@ -26,6 +26,15 @@ const { relPath, SRC_DIR } = require("./patch-util");
 const CHATGPT_AUTH = "chatgpt";
 const APIKEY_AUTH = "apikey";
 const ALWAYS_FALSE = "!1";
+const REQUEST_AUTH_MARKER = "/* CodexRebuildFastModeRequestAuth */";
+const FAST_MODE_CONTRACT_IDS = [
+  "fast_mode_settings_auth_gate",
+  "fast_mode_request_auth_gate",
+];
+const FAST_MODE_FILE_PATTERNS = new Map([
+  ["fast_mode_settings_auth_gate", /^use-service-tier-settings-.*\.js$/],
+  ["fast_mode_request_auth_gate", /^read-service-tier-for-request-.*\.js$/],
+]);
 
 function walk(node, visitor, parent = null) {
   if (!node || typeof node !== "object") return;
@@ -72,6 +81,39 @@ function expressionSourceForChatGptSide(binary, source) {
   if (isStringLiteral(binary.left, CHATGPT_AUTH))
     return sourceFor(source, binary.right);
   return null;
+}
+
+function hasApiKeyRejection(node, source, operand) {
+  if (node?.type !== "LogicalExpression" || node.operator !== "&&") return false;
+  let found = false;
+  walk(node, (child) => {
+    if (found || child.type !== "BinaryExpression" || child.operator !== "!==") {
+      return;
+    }
+    const left = sourceFor(source, child.left);
+    const right = sourceFor(source, child.right);
+    found =
+      (left === operand && isStringLiteral(child.right, APIKEY_AUTH)) ||
+      (right === operand && isStringLiteral(child.left, APIKEY_AUTH));
+  });
+  return found;
+}
+
+function isPatchedRequestAuthGate(node, source) {
+  if (node?.type !== "LogicalExpression" || node.operator !== "&&") return false;
+  let chatGptOperand = null;
+  walk(node, (child) => {
+    if (
+      chatGptOperand == null &&
+      child.type === "BinaryExpression" &&
+      child.operator === "!=="
+    ) {
+      chatGptOperand = expressionSourceForChatGptSide(child, source);
+    }
+  });
+  return (
+    chatGptOperand != null && hasApiKeyRejection(node, source, chatGptOperand)
+  );
 }
 
 function hasApiKeyAlternative(node, source, operand) {
@@ -121,15 +163,16 @@ function collectPatches(ast, source) {
 
       // Old shape: X.authMethod !== "chatgpt" gates the selector.
       if (child.operator === "!==") {
-        if (!childSrc.includes("authMethod") || !childSrc.includes(CHATGPT_AUTH))
-          return;
-        if (childSrc === ALWAYS_FALSE) return;
+        if (isPatchedRequestAuthGate(parent, source)) return;
+        const operand = expressionSourceForChatGptSide(child, source);
+        if (operand == null) return;
 
         addPatch(patches, {
-          id: "fast_mode_legacy_auth_gate",
+          id: "fast_mode_request_auth_gate",
           start: child.start,
           end: child.end,
-          replacement: ALWAYS_FALSE,
+          replacement:
+            `(${childSrc}&&${operand}!==\`${APIKEY_AUTH}\`)${REQUEST_AUTH_MARKER}`,
           original: childSrc,
         });
         return;
@@ -143,7 +186,7 @@ function collectPatches(ast, source) {
         if (isAlreadyExpandedToApiKey(parent, source, operand)) return;
 
         addPatch(patches, {
-          id: "fast_mode_api_key_auth_gate",
+          id: "fast_mode_settings_auth_gate",
           start: child.start,
           end: child.end,
           replacement: `(${childSrc}||${operand}===\`${APIKEY_AUTH}\`)`,
@@ -154,6 +197,105 @@ function collectPatches(ast, source) {
   });
 
   return patches;
+}
+
+function collectAlreadyPatchedGates(ast, source) {
+  const already = [];
+  walk(ast, (node) => {
+    if (!isFunctionNode(node)) return;
+    const fnSrc = sourceFor(source, node);
+    if (!fnSrc.includes("fast_mode")) return;
+    walk(node, (child, parent) => {
+      if (child.type === "BinaryExpression" && child.operator === "===") {
+        const operand = expressionSourceForChatGptSide(child, source);
+        if (operand == null || !isAlreadyExpandedToApiKey(parent, source, operand)) return;
+        addPatch(already, {
+          id: "fast_mode_settings_auth_gate",
+          start: child.start,
+        });
+        return;
+      }
+      if (
+        child.type === "IfStatement" &&
+        isPatchedRequestAuthGate(child.test, source) &&
+        source.slice(child.test.end, child.consequent.start).includes(REQUEST_AUTH_MARKER)
+      ) {
+        addPatch(already, {
+          id: "fast_mode_request_auth_gate",
+          start: child.test.start,
+        });
+      }
+    });
+  });
+  return already;
+}
+
+function analyzeFastModeSource(source) {
+  let ast;
+  try {
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  } catch (error) {
+    throw new Error(`fast_mode parse failed: ${error.message}`);
+  }
+  const patches = collectPatches(ast, source);
+  const already = collectAlreadyPatchedGates(ast, source);
+  const total = patches.length + already.length;
+
+  let code = source;
+  for (const patch of [...patches].sort((left, right) => right.start - left.start)) {
+    code = code.slice(0, patch.start) + patch.replacement + code.slice(patch.end);
+  }
+  return {
+    code,
+    status: patches.length === 1 ? "patched" : "already",
+    counts: { patchable: patches.length, already: already.length, total },
+    patches,
+    targetIds: [...new Set([...patches, ...already].map((target) => target.id))],
+  };
+}
+
+function patchFastModeSource(source) {
+  const result = analyzeFastModeSource(source);
+  if (result.counts.total !== 1) {
+    throw new Error(
+      `fast_mode auth gate expected exactly 1 target, found ${result.counts.total}`,
+    );
+  }
+  return result;
+}
+
+function planFastModeTargets(candidates, platform = "platform") {
+  const matches = new Map(FAST_MODE_CONTRACT_IDS.map((id) => [id, []]));
+  for (const candidate of candidates) {
+    const result = analyzeFastModeSource(candidate.source);
+    if (result.counts.total > 1) {
+      throw new Error(
+        `fast_mode candidate ${candidate.fileName ?? candidate.path ?? "<unknown>"} ` +
+          `expected at most 1 auth gate, found ${result.counts.total}`,
+      );
+    }
+    if (result.counts.total === 0) continue;
+    const [targetId] = result.targetIds;
+    if (!matches.has(targetId)) {
+      throw new Error(
+        `fast_mode candidate ${candidate.fileName ?? candidate.path ?? "<unknown>"} ` +
+          `matched unexpected contract ${targetId}`,
+      );
+    }
+    const fileName = candidate.fileName ?? path.basename(candidate.path ?? "");
+    if (!FAST_MODE_FILE_PATTERNS.get(targetId).test(fileName)) continue;
+    matches.get(targetId).push({ ...candidate, result });
+  }
+  for (const targetId of FAST_MODE_CONTRACT_IDS) {
+    const contractMatches = matches.get(targetId);
+    if (contractMatches.length !== 1) {
+      throw new Error(
+        `fast_mode ${targetId} expected exactly 1 target bundle for ${platform}, ` +
+          `found ${contractMatches.length}`,
+      );
+    }
+  }
+  return FAST_MODE_CONTRACT_IDS.map((targetId) => matches.get(targetId)[0]);
 }
 
 function main() {
@@ -169,78 +311,55 @@ function main() {
         fs.existsSync(path.join(SRC_DIR, p, "_asar", "webview", "assets")),
       );
 
-  const targets = [];
+  const candidates = [];
   for (const plat of platforms) {
     const assetsDir = path.join(SRC_DIR, plat, "_asar", "webview", "assets");
     if (!fs.existsSync(assetsDir)) continue;
     for (const f of fs.readdirSync(assetsDir)) {
-      if (!f.endsWith(".js")) continue;
+      if (![...FAST_MODE_FILE_PATTERNS.values()].some((pattern) => pattern.test(f))) {
+        continue;
+      }
       const fp = path.join(assetsDir, f);
       const src = fs.readFileSync(fp, "utf-8");
-      if (src.includes("chatgpt") && src.includes("fast_mode")) {
-        targets.push({ platform: plat, path: fp });
+      if (src.includes("fast_mode")) {
+        candidates.push({ platform: plat, path: fp, fileName: f, source: src });
       }
     }
   }
 
-  if (targets.length === 0) {
-    console.log("  [skip] No chunk contains fast_mode gate logic");
-    return;
-  }
-
-  let totalPatched = 0;
-  let totalFound = 0;
-
-  for (const bundle of targets) {
-    const source = fs.readFileSync(bundle.path, "utf-8");
-
-    const t0 = Date.now();
-    let ast;
-    try {
-      ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
-    } catch {
-      continue;
-    }
-
-    const patches = collectPatches(ast, source);
-
-    if (patches.length === 0) continue;
-    totalFound += patches.length;
-
-    console.log(
-      `  [${bundle.platform}] ${relPath(bundle.path)} (parse ${Date.now() - t0}ms)`,
+  const plans = platforms.flatMap((platformName) => {
+    const platformCandidates = candidates.filter(
+      (candidate) => candidate.platform === platformName,
     );
-
-    if (isCheck) {
-      for (const p of patches) {
-        console.log(`    [?] offset ${p.start}: ${p.original} -> ${p.replacement}`);
+    const t0 = Date.now();
+    const platformPlans = planFastModeTargets(platformCandidates, platformName);
+    for (const plan of platformPlans) {
+      console.log(
+        `  [${platformName}] ${relPath(plan.path)} (parse ${Date.now() - t0}ms)`,
+      );
+      console.log(
+        `    [${isCheck ? "check" : plan.result.status}] patchable=${plan.result.counts.patchable} already=${plan.result.counts.already} expected=1`,
+      );
+      for (const patch of plan.result.patches) {
+        console.log(`    ${isCheck ? "?" : "*"} ${patch.original} -> ${patch.replacement}`);
       }
-      continue;
     }
-
-    patches.sort((a, b) => b.start - a.start);
-
-    let code = source;
-    for (const p of patches) {
-      console.log(`    * ${p.original} -> ${p.replacement}`);
-      code = code.slice(0, p.start) + p.replacement + code.slice(p.end);
+    return platformPlans;
+  });
+  if (!isCheck) {
+    for (const plan of plans) {
+      if (plan.result.code !== plan.source) {
+        fs.writeFileSync(plan.path, plan.result.code, "utf-8");
+      }
     }
-
-    fs.writeFileSync(bundle.path, code, "utf-8");
-    totalPatched += patches.length;
   }
-
-  if (totalPatched > 0) {
-    console.log(`  [ok] ${totalPatched} auth gate(s) patched`);
-  } else if (isCheck && totalFound > 0) {
-    console.log(`  [check] ${totalFound} auth gate(s) would be patched`);
-  } else {
-    console.log("  [ok] fast_mode auth gates already patched or absent");
-  }
+  const patched = plans.reduce((sum, plan) => sum + plan.result.counts.patchable, 0);
+  const already = plans.reduce((sum, plan) => sum + plan.result.counts.already, 0);
+  console.log(`  [ok] fast_mode patchable=${patched} already=${already} expected=${plans.length}`);
 }
 
 if (require.main === module) {
   main();
 }
 
-module.exports = { collectPatches };
+module.exports = { collectPatches, patchFastModeSource, planFastModeTargets };

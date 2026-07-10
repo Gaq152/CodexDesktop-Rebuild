@@ -9,6 +9,15 @@ const test = require("node:test");
 const { verifyPatchedApp } = require("./verify-patched-app");
 
 const EXPECTED_VERSION = "26.707.31428";
+const UPDATER_BACKEND_FIXTURE = [
+  "/* CodexRebuildLocalUpdater:start */",
+  "const updateChannel=`codex_rebuild:update-command`;",
+  "/* CodexRebuildLocalUpdater:end */",
+  "if(!CodexRebuildWindowsBootstrap()){",
+  "  const backend=true;",
+  "}",
+  "/* CodexRebuildLocalUpdater:file-end */",
+].join("\n");
 const CONTRACT_IDS = [
   "fast",
   "plugin",
@@ -29,6 +38,12 @@ const MARKERS = [
     contract: "fast",
     file: "webview/assets/fast-mode.js",
     text: "const fastAllowed = authMethod === `chatgpt` || authMethod === `apikey`;",
+  },
+  {
+    id: "fast-request-api-key-authorization",
+    contract: "fast",
+    file: "webview/assets/read-service-tier-for-request-fixture.js",
+    text: "async function readFast(authMethod, requirements) { if(authMethod !== `chatgpt` && authMethod !== `apikey`/* CodexRebuildFastModeRequestAuth */) return !1; return requirements.featureRequirements.fast_mode !== !1; }",
   },
   {
     id: "browser-availability",
@@ -59,16 +74,38 @@ const MARKERS = [
     ].join("\n"),
   },
   {
+    id: "plugin-webview-auth",
+    contract: "plugin",
+    file: "webview/assets/use-is-plugins-enabled-fixture.js",
+    text: "function pluginAuth(auth){return auth.authMethod===`chatgpt`||auth.authMethod===`apikey`}",
+  },
+  {
+    id: "plugin-webview-availability",
+    contract: "plugin",
+    file: "webview/assets/use-is-plugins-enabled-fixture.js",
+    text: "function pluginAvailability(){const featureName=`browser_use_external`;return{allowed:!0,available:!0,isLoading:!1}}",
+  },
+  {
+    id: "plugin-webview-statsig",
+    contract: "plugin",
+    file: "webview/assets/use-is-plugins-enabled-fixture.js",
+    text: [
+      "function computerGate(){const featureName=`computer_use`;return !0/* CodexRebuildPluginStatsig */}",
+      "function externalBrowserGate(){const featureName=`browser_use_external`;return !0/* CodexRebuildPluginStatsig */}",
+      "function browserGate(){const featureName=`browser_use`;return !0/* CodexRebuildPluginStatsig */}",
+    ].join("\n"),
+  },
+  {
     id: "delete-route",
     contract: "archive-delete",
-    file: "webview/assets/app-main.js",
-    text: "routes[`delete-conversation`] = deleteConversation;",
+    file: "webview/assets/app-main-fixture.js",
+    text: "let routes={\"delete-archived-conversation\":q7((manager,{conversationId:id})=>manager.deleteArchivedConversation(id))};",
   },
   {
     id: "delete-protocol",
     contract: "archive-delete",
-    file: "webview/assets/app-main.js",
-    text: "manager.sendRequest(`thread/delete`, { threadId });",
+    file: "webview/assets/data-controls-fixture.js",
+    text: "const labels={delete:{id:`settings.dataControls.archivedChats.delete`}};function remove(send,conversationId){return send(`delete-archived-conversation`,{conversationId})}",
   },
   {
     id: "sidebar-delete",
@@ -86,19 +123,25 @@ const MARKERS = [
     id: "updater-bootstrap",
     contract: "updater",
     file: ".vite/build/bootstrap.js",
-    text: "/* CodexRebuildLocalUpdater:start */",
+    text: UPDATER_BACKEND_FIXTURE,
   },
   {
     id: "updater-preload-bridge",
     contract: "updater",
     file: ".vite/build/preload.js",
-    text: "contextBridge.exposeInMainWorld(`codexRebuildUpdater`, updaterApi);",
+    text: "/* CodexRebuildUpdaterPreload:start */ contextBridge.exposeInMainWorld(`codexRebuildUpdater`, updaterApi); /* CodexRebuildUpdaterPreload:end */",
+  },
+  {
+    id: "updater-main-menu",
+    contract: "updater",
+    file: ".vite/build/main-updater.js",
+    text: "/* CodexRebuildUpdaterMainMenu:start */ const updaterMenu={id:`codex-rebuild-updater-top`}; /* CodexRebuildUpdaterMainMenu:end */",
   },
   {
     id: "updater-titlebar",
     contract: "updater",
-    file: "webview/assets/windows-titlebar.js",
-    text: "const updaterMenu = { id:`codex-rebuild-updater-top` };",
+    file: "webview/assets/app-shell-fixture.js",
+    text: "function codexRebuildUpdaterEnsureTitlebarStyle(){};const updaterItems=[{id:'codex-rebuild-updater-top',message:{id:`windowsMenuBar.checkUpdates`}}];",
   },
 ];
 
@@ -122,6 +165,8 @@ function createFixture(t, options = {}) {
     const packageJson = options.packageText ?? JSON.stringify({
       name: "openai-codex-electron",
       version: options.version ?? EXPECTED_VERSION,
+      main: ".vite/build/bootstrap.js",
+      codexRebuildWindowsUpdateUrl: "https://example.invalid/windows-update-feed",
     });
     writeText(path.join(asarRoot, "package.json"), packageJson);
   }
@@ -192,7 +237,6 @@ for (const marker of MARKERS) {
 
 for (const [contract, markerIds] of [
   ["fast", ["fast-mode", "fast-api-key-authorization"]],
-  ["archive-delete", ["delete-route", "delete-protocol"]],
   ["sidebar-delete", ["sidebar-delete", "sidebar-inline-confirmation"]],
 ]) {
   test(`${contract} requires its markers in the same bundle`, (t) => {
@@ -233,6 +277,49 @@ test("fast rejects unrelated same-bundle authorization evidence", (t) => {
   );
 });
 
+test("fast rejects a detached request authorization marker", (t) => {
+  const fixture = createFixture(t, {
+    omitMarkers: ["fast-request-api-key-authorization"],
+  });
+  writeText(
+    path.join(
+      fixture.asarRoot,
+      "webview",
+      "assets",
+      "read-service-tier-for-request-decoy.js",
+    ),
+    [
+      "const marker = !1/* CodexRebuildFastModeRequestAuth */;",
+      "function readFast(requirements) { return requirements.fast_mode; }",
+    ].join("\n"),
+  );
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("fast"),
+  );
+});
+
+test("fast rejects an always-false request authorization gate", (t) => {
+  const fixture = createFixture(t, {
+    omitMarkers: ["fast-request-api-key-authorization"],
+  });
+  writeText(
+    path.join(
+      fixture.asarRoot,
+      "webview",
+      "assets",
+      "read-service-tier-for-request-decoy.js",
+    ),
+    "function readFast(requirements) { if(!1/* CodexRebuildFastModeRequestAuth */) return !1; return requirements.fast_mode; }",
+  );
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("fast"),
+  );
+});
+
 test("plugin rejects unrelated availability decoys", (t) => {
   const fixture = createFixture(t, {
     omitMarkers: ["browser-availability", "computer-availability"],
@@ -245,6 +332,27 @@ test("plugin rejects unrelated availability decoys", (t) => {
       "const browser = { featureName:`browser_use`, available:!0, isLoading:!1 };",
       "const computer = { featureName:`computer_use`, available:!0, isLoading:!1 };",
     ].join("\n"),
+    true,
+  );
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("plugin"),
+  );
+});
+
+test("plugin rejects a detached Statsig marker", (t) => {
+  const fixture = createFixture(t, {
+    omitMarkers: ["plugin-webview-statsig"],
+  });
+  writeText(
+    path.join(
+      fixture.asarRoot,
+      "webview",
+      "assets",
+      "use-is-plugins-enabled-fixture.js",
+    ),
+    "const detached=!0/* CodexRebuildPluginStatsig */;",
     true,
   );
 
@@ -377,6 +485,130 @@ test("updater requires the titlebar marker in webview assets", (t) => {
   );
 });
 
+test("updater rejects a stale non-app-shell titlebar asset", (t) => {
+  const fixture = createFixture(t, { omitMarkers: ["updater-titlebar"] });
+  writeText(
+    path.join(
+      fixture.asarRoot,
+      "webview",
+      "assets",
+      "windows-titlebar-stale.js",
+    ),
+    "function codexRebuildUpdaterEnsureTitlebarStyle(){};const updaterMenu={id:`codex-rebuild-updater-top`};",
+  );
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("updater"),
+  );
+});
+
+test("updater rejects an inert resolved backend marker", (t) => {
+  const fixture = createFixture(t, { omitMarkers: ["updater-bootstrap"] });
+  writeText(
+    path.join(fixture.asarRoot, ".vite", "build", "bootstrap.js"),
+    "/* CodexRebuildLocalUpdater:start */",
+  );
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("updater"),
+  );
+});
+
+test("plugin rejects main-only success without the latest webview postconditions", (t) => {
+  const fixture = createFixture(t, {
+    omitMarkers: [
+      "plugin-webview-auth",
+      "plugin-webview-availability",
+      "plugin-webview-statsig",
+    ],
+  });
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("plugin"),
+  );
+});
+
+test("archive-delete accepts the unambiguous legacy custom route", (t) => {
+  const fixture = createFixture(t, { omitMarkers: ["delete-route", "delete-protocol"] });
+  writeText(
+    path.join(fixture.asarRoot, "webview", "assets", "legacy-archive.js"),
+    "let routes={\"delete-conversation\":K7(async(manager,{conversationId:id})=>{await manager.sendRequest(`thread/delete`,{threadId:id})})};",
+  );
+  const result = verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION);
+  assert.ok(result.contracts["archive-delete"].some((file) => file.endsWith("legacy-archive.js")));
+});
+
+test("archive-delete rejects a data-controls-only route and error-code decoy", (t) => {
+  const fixture = createFixture(t, {
+    omitMarkers: ["delete-route", "delete-protocol"],
+  });
+  writeText(
+    path.join(fixture.asarRoot, "webview", "assets", "data-controls-decoy.js"),
+    [
+      "send(`delete-archived-conversation`, { conversationId });",
+      "const unsupported = error.code === `thread/delete`;",
+    ].join("\n"),
+  );
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("archive-delete"),
+  );
+});
+
+test("updater resolves the hashed runtime bootstrap and rejects early-bootstrap-only evidence", (t) => {
+  const fixture = createFixture(t, { omitMarkers: ["updater-bootstrap"] });
+  writeText(
+    path.join(fixture.asarRoot, "package.json"),
+    JSON.stringify({
+      name: "openai-codex-electron",
+      version: EXPECTED_VERSION,
+      main: ".vite/build/early-bootstrap.js",
+      codexRebuildWindowsUpdateUrl: "https://example.invalid/windows-update-feed",
+    }),
+  );
+  writeText(
+    path.join(fixture.asarRoot, ".vite", "build", "early-bootstrap.js"),
+    "Promise.resolve().then(()=>require(`./bootstrap-BXjiq4qE.js`));",
+  );
+  writeText(
+    path.join(fixture.asarRoot, ".vite", "build", "bootstrap-BXjiq4qE.js"),
+    UPDATER_BACKEND_FIXTURE,
+  );
+  const result = verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION);
+  assert.ok(
+    result.contracts.updater.includes(
+      "src/win/_asar/.vite/build/bootstrap-BXjiq4qE.js",
+    ),
+  );
+
+  writeText(
+    path.join(fixture.asarRoot, ".vite", "build", "early-bootstrap.js"),
+    "/* CodexRebuildLocalUpdater:start */ Promise.resolve().then(()=>require(`./bootstrap-BXjiq4qE.js`));",
+  );
+  writeText(
+    path.join(fixture.asarRoot, ".vite", "build", "bootstrap-BXjiq4qE.js"),
+    "const backend=false;",
+  );
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("updater"),
+  );
+});
+
+test("updater requires package metadata and Electron main-menu evidence", (t) => {
+  const fixture = createFixture(t);
+  const packageJson = JSON.parse(fs.readFileSync(path.join(fixture.asarRoot, "package.json"), "utf8"));
+  delete packageJson.codexRebuildWindowsUpdateUrl;
+  writeText(path.join(fixture.asarRoot, "package.json"), JSON.stringify(packageJson));
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("updater"),
+  );
+});
+
 test("reports recursive evidence files for every satisfied contract", (t) => {
   const fixture = createFixture(t);
 
@@ -390,8 +622,10 @@ test("reports recursive evidence files for every satisfied contract", (t) => {
   }
   assert.deepEqual(result.contracts.updater, [
     "src/win/_asar/.vite/build/bootstrap.js",
+    "src/win/_asar/.vite/build/main-updater.js",
     "src/win/_asar/.vite/build/preload.js",
-    "src/win/_asar/webview/assets/windows-titlebar.js",
+    "src/win/_asar/package.json",
+    "src/win/_asar/webview/assets/app-shell-fixture.js",
   ]);
 });
 
@@ -461,7 +695,7 @@ test("supports the Windows verification CLI and prints evidence files", (t) => {
 
   assert.equal(result.status, 0, result.stderr);
   for (const contract of CONTRACT_IDS) assert.match(result.stdout, new RegExp(contract));
-  assert.match(result.stdout, /windows-titlebar\.js/);
+  assert.match(result.stdout, /app-shell-fixture\.js/);
 });
 
 test("patch-all passes the extracted Windows version to the verifier", (t) => {

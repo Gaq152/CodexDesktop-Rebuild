@@ -68,6 +68,82 @@ function collectPatches(ast, source) {
   return patches;
 }
 
+function patchUpdaterSource(source) {
+  let ast;
+  try {
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  } catch (error) {
+    throw new Error(`updater parse failed: ${error.message}`);
+  }
+  const targets = new Map([...UPDATER_METHODS].map((method) => [method, []]));
+  walk(ast, (node) => {
+    if (node.type !== "Property") return;
+    const method = node.key?.name ?? node.key?.value;
+    if (!targets.has(method)) return;
+    const body = node.value?.type === "FunctionExpression" ? node.value.body : null;
+    if (body?.type !== "BlockStatement" || body.body.length !== 1) return;
+    const returned = body.body[0];
+    if (returned.type !== "ReturnStatement" || !returned.argument) return;
+    targets.get(method).push(returned.argument);
+  });
+
+  const patches = [];
+  const methods = {};
+  let already = 0;
+  for (const method of UPDATER_METHODS) {
+    const matches = targets.get(method);
+    if (matches.length !== 1) {
+      throw new Error(`${method} expected exactly 1 target, found ${matches.length}`);
+    }
+    const argument = matches[0];
+    const original = source.slice(argument.start, argument.end);
+    const isAlready = original === "!1";
+    if (isAlready) already += 1;
+    else {
+      patches.push({
+        id: method,
+        start: argument.start,
+        end: argument.end,
+        original,
+        replacement: "!1",
+      });
+    }
+    methods[method] = { patchable: isAlready ? 0 : 1, already: isAlready ? 1 : 0, total: 1 };
+  }
+  let code = source;
+  for (const patch of [...patches].sort((left, right) => right.start - left.start)) {
+    code = code.slice(0, patch.start) + patch.replacement + code.slice(patch.end);
+  }
+  return {
+    code,
+    status: patches.length > 0 ? "patched" : "already",
+    patches,
+    counts: {
+      patchable: patches.length,
+      already,
+      total: patches.length + already,
+      methods,
+    },
+  };
+}
+
+function patchUpdaterContracts({ loggerSource, workerSource }) {
+  if (typeof loggerSource !== "string") throw new Error("updater logger source is required");
+  if (typeof workerSource !== "string") throw new Error("updater worker source is required");
+  const logger = patchUpdaterSource(loggerSource);
+  const worker = patchUpdaterSource(workerSource);
+  return {
+    status: logger.status === "already" && worker.status === "already" ? "already" : "patched",
+    logger,
+    worker,
+    counts: {
+      patchable: logger.counts.patchable + worker.counts.patchable,
+      already: logger.counts.already + worker.counts.already,
+      total: logger.counts.total + worker.counts.total,
+    },
+  };
+}
+
 function locateTargets(platform) {
   const platforms = platform
     ? [platform]
@@ -96,35 +172,54 @@ function locateTargets(platform) {
 
 function main() {
   const args = process.argv.slice(2);
+  const isCheck = args.includes("--check");
   const platform = args.find((a) => ["mac-arm64", "mac-x64", "win"].includes(a));
-
-  const targets = locateTargets(platform);
-  if (targets.length === 0) {
-    console.log("  [ok] No updater targets found");
-    return;
-  }
-
-  for (const bundle of targets) {
-    console.log(`  [${bundle.platform}] ${relPath(bundle.path)}`);
-    const source = fs.readFileSync(bundle.path, "utf-8");
-    const ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
-    const patches = collectPatches(ast, source);
-
-    if (patches.length === 0) {
-      console.log("    [ok] Already patched or no match");
-      continue;
+  const platforms = platform
+    ? [platform]
+    : ["mac-arm64", "mac-x64", "win"].filter((name) =>
+        fs.existsSync(path.join(SRC_DIR, name, "_asar", ".vite", "build")),
+      );
+  if (platforms.length === 0) throw new Error("updater expected at least one platform");
+  const plans = platforms.map((platformName) => {
+    const buildDir = path.join(SRC_DIR, platformName, "_asar", ".vite", "build");
+    const files = fs.readdirSync(buildDir);
+    const loggerNames = files.filter((name) => /^file-based-logger-.*\.js$/.test(name));
+    const workerNames = files.filter((name) => name === "worker.js");
+    if (loggerNames.length !== 1) {
+      throw new Error(`updater logger expected exactly 1 target for ${platformName}, found ${loggerNames.length}`);
     }
-
-    patches.sort((a, b) => b.start - a.start);
-    let code = source;
-    for (const p of patches) {
-      console.log(`    * [${p.id}] ${p.original} -> !1`);
-      code = code.slice(0, p.start) + p.replacement + code.slice(p.end);
+    if (workerNames.length !== 1) {
+      throw new Error(`updater worker expected exactly 1 target for ${platformName}, found ${workerNames.length}`);
     }
-
-    fs.writeFileSync(bundle.path, code, "utf-8");
-    console.log(`    [ok] ${patches.length} updater methods disabled`);
+    const loggerPath = path.join(buildDir, loggerNames[0]);
+    const workerPath = path.join(buildDir, workerNames[0]);
+    const loggerSource = fs.readFileSync(loggerPath, "utf-8");
+    const workerSource = fs.readFileSync(workerPath, "utf-8");
+    return {
+      platform: platformName,
+      loggerPath,
+      workerPath,
+      loggerSource,
+      workerSource,
+      result: patchUpdaterContracts({ loggerSource, workerSource }),
+    };
+  });
+  for (const plan of plans) {
+    console.log(`  [${plan.platform}] ${isCheck ? "check" : plan.result.status}: patchable=${plan.result.counts.patchable} already=${plan.result.counts.already} expected=8`);
   }
+  if (!isCheck) {
+    for (const plan of plans) {
+      if (plan.result.logger.code !== plan.loggerSource) {
+        fs.writeFileSync(plan.loggerPath, plan.result.logger.code, "utf-8");
+      }
+      if (plan.result.worker.code !== plan.workerSource) {
+        fs.writeFileSync(plan.workerPath, plan.result.worker.code, "utf-8");
+      }
+    }
+  }
+  console.log(`  [ok] updater contracts satisfied for ${plans.length} platform(s)`);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { collectPatches, patchUpdaterSource, patchUpdaterContracts };

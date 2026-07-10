@@ -13,8 +13,9 @@
  * Requires the bundled official Codex CLI to support thread/delete.
  */
 const fs = require("fs");
+const path = require("path");
 const acorn = require("acorn");
-const { locateBundles, relPath } = require("./patch-util");
+const { locateBundles, relPath, SRC_DIR } = require("./patch-util");
 
 // ─── Layer 1: app-main route injection ──────────────────────────
 
@@ -295,31 +296,200 @@ function patchDataControls(bundles) {
   return patched;
 }
 
+function archiveCount(patchable, already, native, label) {
+  const total = patchable + already + native;
+  if (total !== 1) {
+    throw new Error(`${label} expected exactly 1 target, found ${total}`);
+  }
+  return { patchable, already, native, total };
+}
+
+function patchAppMainSource(source) {
+  const nativeRouteRe = /(["'`])delete-archived-conversation\1\s*:\s*(\w+)\(\s*(?:async\s*)?\(\s*(\w+)\s*,\s*\{\s*conversationId\s*:\s*(\w+)\s*\}\s*\)\s*=>\s*\3\.deleteArchivedConversation\(\s*\4\s*\)\s*\)/g;
+  const nativeMatches = [...source.matchAll(nativeRouteRe)];
+  const nativeTokens = [...source.matchAll(/(["'`])delete-archived-conversation\1/g)];
+  if (nativeTokens.length > 0) {
+    if (nativeMatches.length !== 1) {
+      throw new Error(
+        `native archive route expected exactly 1 target, found ${nativeMatches.length}`,
+      );
+    }
+    return {
+      code: source,
+      status: "native",
+      mode: "native",
+      counts: archiveCount(0, 0, 1, "archive route"),
+    };
+  }
+
+  const legacyRouteRe = /(["'`])delete-conversation\1\s*:\s*(\w+)\(\s*(?:async\s*)?\(\s*(\w+)\s*,\s*\{\s*conversationId\s*:\s*(\w+)\s*\}\s*\)\s*=>\s*\{\s*await\s+\3\.sendRequest\(\s*(["'`])thread\/delete\5\s*,\s*\{\s*threadId\s*:\s*\4\s*\}\s*\)\s*\}\s*\)/g;
+  const legacyMatches = [...source.matchAll(legacyRouteRe)];
+  const legacyTokens = [...source.matchAll(/(["'`])delete-conversation\1/g)];
+  if (legacyTokens.length > 0) {
+    if (legacyMatches.length !== 1) {
+      throw new Error(
+        `legacy archive route expected exactly 1 target, found ${legacyMatches.length}`,
+      );
+    }
+    return {
+      code: source,
+      status: "already",
+      mode: "legacy",
+      counts: archiveCount(0, 1, 0, "archive route"),
+    };
+  }
+
+  const routeRe = /(["`])archive-conversation\1:(\w+)\(async\((\w+),\{conversationId:(\w+),cleanupWorktree:(\w+),source:(\w+)\}\)=>\{\s*await \3\.archiveConversation\(\4,\{cleanupWorktree:\5,source:\6\}\)\s*\}\)/g;
+  const matches = [...source.matchAll(routeRe)];
+  if (matches.length !== 1) {
+    throw new Error(`archive route expected exactly 1 target, found ${matches.length}`);
+  }
+  const match = matches[0];
+  const quote = match[1];
+  const wrapper = match[2];
+  const manager = match[3];
+  const conversationId = match[4];
+  const end = match.index + match[0].length;
+  const injection = `,${quote}delete-conversation${quote}:${wrapper}(async(${manager},{conversationId:${conversationId}})=>{await ${manager}.sendRequest(${quote}thread/delete${quote},{threadId:${conversationId}})})`;
+  return {
+    code: source.slice(0, end) + injection + source.slice(end),
+    status: "patched",
+    mode: "legacy",
+    counts: archiveCount(1, 0, 0, "archive route"),
+  };
+}
+
+function patchDataControlsSource(source) {
+  const nativeRouteCount = [...source.matchAll(/(["'`])delete-archived-conversation\1/g)].length;
+  const nativeLabelCount = [
+    ...source.matchAll(/(["'`])settings\.dataControls\.archivedChats\.delete\1/g),
+  ].length;
+  const threadDeleteCount = [...source.matchAll(/(["'`])thread\/delete\1/g)].length;
+  if (nativeRouteCount > 0 || nativeLabelCount > 0) {
+    if (nativeRouteCount !== 2) {
+      throw new Error(
+        `native archive-delete UI route expected exactly 2 targets, found ${nativeRouteCount}`,
+      );
+    }
+    if (nativeLabelCount !== 1) {
+      throw new Error(
+        `native archive-delete UI label expected exactly 1 target, found ${nativeLabelCount}`,
+      );
+    }
+    if (threadDeleteCount !== 1) {
+      throw new Error(
+        `native archive-delete UI thread/delete expected exactly 1 target, found ${threadDeleteCount}`,
+      );
+    }
+    return {
+      code: source,
+      status: "native",
+      mode: "native",
+      counts: archiveCount(0, 0, 1, "archive button"),
+    };
+  }
+  const legacyRouteCount = [...source.matchAll(/(["'`])delete-conversation\1/g)].length;
+  if (legacyRouteCount > 0) {
+    if (legacyRouteCount !== 1) {
+      throw new Error(
+        `legacy archive-delete button expected exactly 1 target, found ${legacyRouteCount}`,
+      );
+    }
+    if (!source.includes("codexConfirmDelete")) {
+      throw new Error("legacy archive-delete button is missing inline confirmation");
+    }
+    return {
+      code: source,
+      status: "already",
+      mode: "legacy",
+      counts: archiveCount(0, 1, 0, "archive button"),
+    };
+  }
+  throw new Error("archive button expected exactly 1 target, found 0");
+}
+
+function patchArchiveContracts({ appMainSource, dataControlsSource }) {
+  if (typeof appMainSource !== "string") throw new Error("archive app-main source is required");
+  if (typeof dataControlsSource !== "string") throw new Error("archive data-controls source is required");
+  const appMain = patchAppMainSource(appMainSource);
+  const dataControls = patchDataControlsSource(dataControlsSource);
+  if (appMain.mode !== dataControls.mode) {
+    throw new Error(
+      `archive route/UI mode mismatch: app-main=${appMain.mode}, data-controls=${dataControls.mode}`,
+    );
+  }
+  const status =
+    appMain.status === "native" && dataControls.status === "native"
+      ? "native"
+      : appMain.status === "already" && dataControls.status === "already"
+        ? "already"
+        : "patched";
+  return {
+    status,
+    appMain,
+    dataControls,
+    counts: { route: appMain.counts, button: dataControls.counts },
+  };
+}
+
+function findExactAsset(platform, pattern, label) {
+  const directory = path.join(SRC_DIR, platform, "_asar", "webview", "assets");
+  if (!fs.existsSync(directory)) throw new Error(`${label} asset directory is missing for ${platform}`);
+  const matches = fs.readdirSync(directory).filter((fileName) => pattern.test(fileName));
+  if (matches.length !== 1) {
+    throw new Error(`${label} expected exactly 1 bundle for ${platform}, found ${matches.length}`);
+  }
+  return path.join(directory, matches[0]);
+}
+
 // ─── Main ───────────────────────────────────────────────────────
 
 function main() {
   const args = process.argv.slice(2);
+  const isCheck = args.includes("--check");
   const platform = args.find((a) =>
     ["mac-arm64", "mac-x64", "win"].includes(a),
   );
-
-  console.log("  [layer 1] app-main: delete-conversation route");
-  const appMainBundles = locateBundles({
-    dir: "assets",
-    pattern: /^app-main-.*\.js$/,
-    ...(platform ? { platform } : {}),
+  const platforms = platform
+    ? [platform]
+    : ["mac-arm64", "mac-x64", "win"].filter((name) =>
+        fs.existsSync(path.join(SRC_DIR, name, "_asar")),
+      );
+  if (platforms.length === 0) throw new Error("archive-delete expected at least one platform");
+  const plans = platforms.map((platformName) => {
+    const appMainPath = findExactAsset(platformName, /^app-main-.*\.js$/, "archive app-main");
+    const dataControlsPath = findExactAsset(
+      platformName,
+      /^data-controls-.*\.js$/,
+      "archive data-controls",
+    );
+    const appMainSource = fs.readFileSync(appMainPath, "utf-8");
+    const dataControlsSource = fs.readFileSync(dataControlsPath, "utf-8");
+    return {
+      platform: platformName,
+      appMainPath,
+      dataControlsPath,
+      appMainSource,
+      dataControlsSource,
+      result: patchArchiveContracts({ appMainSource, dataControlsSource }),
+    };
   });
-  const routePatched = patchAppMain(appMainBundles);
-
-  console.log("  [layer 2] data-controls: delete button");
-  const dataControlsBundles = locateBundles({
-    dir: "assets",
-    pattern: /^data-controls-.*\.js$/,
-    ...(platform ? { platform } : {}),
-  });
-  const btnPatched = patchDataControls(dataControlsBundles);
-
-  console.log(`  [done] routes: ${routePatched}, buttons: ${btnPatched}`);
+  for (const plan of plans) {
+    console.log(`  [${plan.platform}] ${isCheck ? "check" : plan.result.status}: ${JSON.stringify(plan.result.counts)}`);
+  }
+  if (!isCheck) {
+    for (const plan of plans) {
+      if (plan.result.appMain.code !== plan.appMainSource) {
+        fs.writeFileSync(plan.appMainPath, plan.result.appMain.code, "utf-8");
+      }
+      if (plan.result.dataControls.code !== plan.dataControlsSource) {
+        fs.writeFileSync(plan.dataControlsPath, plan.result.dataControls.code, "utf-8");
+      }
+    }
+  }
+  console.log(`  [done] archive-delete contracts satisfied for ${plans.length} platform(s)`);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { patchAppMainSource, patchDataControlsSource, patchArchiveContracts };

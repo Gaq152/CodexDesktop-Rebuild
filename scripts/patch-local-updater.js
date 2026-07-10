@@ -9,6 +9,7 @@
  */
 const fs = require("fs");
 const path = require("path");
+const acorn = require("acorn");
 const { relPath, SRC_DIR } = require("./patch-util");
 
 const DEFAULT_WINDOWS_UPDATE_URL =
@@ -396,13 +397,13 @@ if(!CodexRebuildWindowsBootstrap()){
 `;
 }
 
-function makePreloadPatch() {
+function makePreloadPatch(electronAlias = "e") {
   return `${PRELOAD_START_MARKER}
 ;(()=>{try{
   const channelState='codex_rebuild:update-state';
   const channelCommand='codex_rebuild:update-command';
   const listeners=new Set;
-  const invoke=command=>e.ipcRenderer.invoke(channelCommand,{command});
+  const invoke=command=>${electronAlias}.ipcRenderer.invoke(channelCommand,{command});
   const updaterApi={
     getState:()=>invoke('get-state'),
     checkForUpdates:()=>invoke('check'),
@@ -411,8 +412,8 @@ function makePreloadPatch() {
     clearUpdateState:()=>invoke('clear'),
     onState:t=>{if(typeof t!=='function')return()=>{};listeners.add(t);return()=>listeners.delete(t)}
   };
-  e.ipcRenderer.on(channelState,(_event,state)=>{for(const listener of listeners){try{listener(state)}catch{}}});
-  try{e.contextBridge.exposeInMainWorld('codexRebuildUpdater',updaterApi)}catch{}
+  ${electronAlias}.ipcRenderer.on(channelState,(_event,state)=>{for(const listener of listeners){try{listener(state)}catch{}}});
+  try{${electronAlias}.contextBridge.exposeInMainWorld('codexRebuildUpdater',updaterApi)}catch{}
 }catch{}})();
 ${PRELOAD_END_MARKER}`;
   return `${PRELOAD_START_MARKER}
@@ -681,8 +682,8 @@ ${PRELOAD_END_MARKER}`;
 ${PRELOAD_END_MARKER}`;
 }
 
-function makeMainMenuPatch() {
-  return `${MAIN_MENU_START_MARKER}
+function makeMainMenuPatch(electronAlias = "a") {
+  const patch = `${MAIN_MENU_START_MARKER}
 (()=>{
   let codexRebuildUpdaterIds={
     top:'codex-rebuild-updater-top',
@@ -827,36 +828,144 @@ function makeMainMenuPatch() {
   }
 })()
 ${MAIN_MENU_END_MARKER}`;
+  return patch.replace(/\ba\.(Menu|BrowserWindow)\b/g, `${electronAlias}.$1`);
+}
+
+function walkAst(node, visit) {
+  if (!node || typeof node.type !== "string") return;
+  visit(node);
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "start" || key === "end" || key === "type") continue;
+    if (Array.isArray(value)) {
+      for (const child of value) walkAst(child, visit);
+    } else {
+      walkAst(value, visit);
+    }
+  }
+}
+
+function propertyName(node) {
+  if (!node || node.type !== "Property") return null;
+  if (!node.computed && node.key.type === "Identifier") return node.key.name;
+  if (node.key.type === "Literal") return String(node.key.value);
+  return null;
+}
+
+function literalValue(node) {
+  if (!node) return null;
+  if (node.type === "Literal") return node.value;
+  if (node.type === "TemplateLiteral" && node.expressions.length === 0) {
+    return node.quasis[0].value.cooked;
+  }
+  return null;
+}
+
+function analyzeMainMenuCode(code) {
+  const ast = acorn.parse(code, { ecmaVersion: "latest", sourceType: "script" });
+  const declarations = new Map();
+  const buildCalls = [];
+  walkAst(ast, (node) => {
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier") {
+      declarations.set(node.id.name, node);
+    }
+    if (
+      node.type === "CallExpression" &&
+      node.callee.type === "MemberExpression" &&
+      !node.callee.computed &&
+      node.callee.property.type === "Identifier" &&
+      node.callee.property.name === "buildFromTemplate" &&
+      node.callee.object.type === "MemberExpression" &&
+      !node.callee.object.computed &&
+      node.callee.object.property.type === "Identifier" &&
+      node.callee.object.property.name === "Menu" &&
+      node.callee.object.object.type === "Identifier" &&
+      node.arguments.length === 1 &&
+      node.arguments[0].type === "Identifier"
+    ) {
+      buildCalls.push(node);
+    }
+  });
+
+  const shapes = [];
+  for (const buildCall of buildCalls) {
+    const template = declarations.get(buildCall.arguments[0].name);
+    if (!template || template.init?.type !== "ArrayExpression") continue;
+    const helpObjects = template.init.elements.filter((element) => {
+      if (element?.type !== "ObjectExpression") return false;
+      return element.properties.some(
+        (property) => propertyName(property) === "role" && literalValue(property.value) === "help",
+      );
+    });
+    for (const helpObject of helpObjects) {
+      const submenu = helpObject.properties.find(
+        (property) => propertyName(property) === "submenu" && property.value.type === "ArrayExpression",
+      )?.value;
+      if (!submenu) continue;
+      const extensionSpreads = submenu.elements.filter((element) => {
+        if (element?.type !== "SpreadElement" || element.argument.type !== "Identifier") return false;
+        const declaration = declarations.get(element.argument.name);
+        return declaration?.init?.type === "ArrayExpression" && declaration.init.elements.length === 0;
+      });
+      if (extensionSpreads.length !== 1) continue;
+      const extensionSpread = extensionSpreads[0];
+      shapes.push({
+        electronAlias: buildCall.callee.object.object.name,
+        extensionName: extensionSpread.argument.name,
+        extensionInit: declarations.get(extensionSpread.argument.name).init,
+        extensionSpread,
+        templateArray: template.init,
+      });
+    }
+  }
+  if (shapes.length !== 1) {
+    throw new Error(`expected one Windows main menu shape, found ${shapes.length}`);
+  }
+  return shapes[0];
+}
+
+function applyReplacements(code, replacements) {
+  let next = code;
+  for (const replacement of [...replacements].sort((left, right) => right.start - left.start)) {
+    next = next.slice(0, replacement.start) + replacement.text + next.slice(replacement.end);
+  }
+  return next;
+}
+
+function countOccurrences(source, token) {
+  return source.split(token).length - 1;
 }
 
 function patchMainMenuCode(code) {
-  const patch = makeMainMenuPatch();
-  let next = code;
-  if (code.includes(MAIN_MENU_START_MARKER)) {
-    const start = code.indexOf(MAIN_MENU_START_MARKER);
-    const end = code.indexOf(MAIN_MENU_END_MARKER, start);
-    if (end === -1) return code;
-    next = code.slice(0, start) + patch + code.slice(end + MAIN_MENU_END_MARKER.length);
-  } else {
-    const target = "let _t=[]";
-    const index = code.indexOf(target);
-    if (index === -1) return code;
-    next = code.slice(0, index) + `let _t=${patch}` + code.slice(index + target.length);
-  }
-
-  next = next.replace("..._t,{type:`separator`}", "..._t.helpItems,{type:`separator`}");
-  if (!next.includes("..._t.topItems],yt=a.Menu.buildFromTemplate(vt)")) {
-    const helpIndex = next.indexOf("{role:`help`,id:t.fo.help");
-    const anchor = "]}],yt=a.Menu.buildFromTemplate(vt)";
-    const anchorIndex = helpIndex === -1 ? -1 : next.indexOf(anchor, helpIndex);
-    if (anchorIndex !== -1) {
-      next =
-        next.slice(0, anchorIndex) +
-        "]},..._t.topItems],yt=a.Menu.buildFromTemplate(vt)" +
-        next.slice(anchorIndex + anchor.length);
+  const startCount = countOccurrences(code, MAIN_MENU_START_MARKER);
+  const endCount = countOccurrences(code, MAIN_MENU_END_MARKER);
+  if (startCount > 0 || endCount > 0) {
+    if (startCount !== 1) {
+      throw new Error(
+        `Windows main menu start marker expected exactly 1 target, found ${startCount}`,
+      );
     }
+    if (endCount !== 1) {
+      throw new Error(
+        `Windows main menu end marker expected exactly 1 target, found ${endCount}`,
+      );
+    }
+    return code;
   }
-  return next;
+  const shape = analyzeMainMenuCode(code);
+  const patch = makeMainMenuPatch(shape.electronAlias);
+  return applyReplacements(code, [
+    { start: shape.extensionInit.start, end: shape.extensionInit.end, text: patch },
+    {
+      start: shape.extensionSpread.start,
+      end: shape.extensionSpread.end,
+      text: `...${shape.extensionName}.helpItems`,
+    },
+    {
+      start: shape.templateArray.end - 1,
+      end: shape.templateArray.end - 1,
+      text: `,...${shape.extensionName}.topItems`,
+    },
+  ]);
 }
 
 function makeWebviewMenuBarFunctionPatch() {
@@ -910,32 +1019,167 @@ function codexRebuildUpdaterBuildPanel(e,t){let n=e||{status:'idle'},r=n.status|
 function Yr(){let e=D(),[t,n]=(0,Xr.useState)(null),[r,i]=(0,Xr.useState)({status:'idle'}),[a,o]=(0,Xr.useState)(false),s=(0,Xr.useRef)(0),c=(0,Xr.useRef)(null);(0,Xr.useEffect)(()=>{codexRebuildUpdaterEnsureTitlebarStyle();let e=window.codexRebuildUpdater;if(!e)return;let t=e=>{i(e||{status:'idle'})};e.getState?.().then(t).catch(()=>{});let n=e.onState?.(t);return typeof n==='function'?n:void 0},[]),(0,Xr.useEffect)(()=>{if(!a)return;let e=e=>{c.current?.contains?.(e.target)||o(!1)},t=e=>{e.key==='Escape'&&o(!1)};return document.addEventListener('pointerdown',e,!0),document.addEventListener('keydown',t,!0),()=>{document.removeEventListener('pointerdown',e,!0),document.removeEventListener('keydown',t,!0)}},[a]);if(!qr())return null;let l=async(e,t)=>{let r=window.electronBridge?.showApplicationMenu;if(!r)return;let i=s.current+1;s.current=i,n(e);let a=t.currentTarget.getBoundingClientRect();try{await r(e,Math.round(a.left),Math.round(a.bottom))}finally{s.current===i&&n(null)}},u=(e,t={})=>i(n=>({...n,...t,status:e})),d=e=>{let t=window.codexRebuildUpdater;if(e==='close'){o(!1);return}if(e==='clear'){o(!1),t?.clearUpdateState?.().then(i).catch(()=>{});return}if(e==='check'||e==='retry'){o(!0),u('checking',{error:null}),t?.checkForUpdates?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='download'){o(!0),u('downloading',{error:null,downloadedBytes:0,elapsedMs:0}),t?.downloadUpdate?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='install'){t?.installUpdate?.().catch(e=>u('error',{error:e&&e.message?e.message:String(e)}))}},f=e=>{let t=r?.status||'idle';if(t==='idle'){d('check');return}o(e=>!e)},p=codexRebuildUpdaterMenuBarLabel(r),m=codexRebuildUpdaterMenuBarProgress(r),h=m==null?0:Math.floor(m);return(0,Zr.jsx)('div',{className:'flex items-center gap-0.5 pr-2 pl-1',children:$r.map(({id:s,message:u})=>{if(s==='${WEBVIEW_UPDATER_MENU_ID}')return(0,Zr.jsxs)('div',{ref:c,className:'cru-anchor',children:[(0,Zr.jsxs)('button',{type:'button','aria-expanded':a,'aria-haspopup':'dialog','aria-label':p,className:'cru-trigger '+(r?.status||'idle')+(a?' open':''),style:{'--cru-progress':h+'%'},onClick:f,children:[(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'}),(0,Zr.jsx)('span',{className:'cru-label',children:p})]}),a&&codexRebuildUpdaterBuildPanel(r,d)]},s);return(0,Zr.jsx)('button',{type:'button','aria-expanded':t===s,'aria-haspopup':'menu','aria-label':e.formatMessage(u),className:M('no-drag rounded-md border border-transparent px-2.5 py-1 text-base font-normal leading-none outline-none transition-colors',t===s?'bg-[var(--color-token-menubar-selection-background)] text-[var(--color-token-menubar-selection-foreground)]':'text-token-text-tertiary hover:bg-token-foreground/5 hover:text-token-description-foreground focus-visible:bg-token-foreground/5 focus-visible:text-token-description-foreground'),onClick:e=>{l(s,e)},children:(0,Zr.jsx)(w,{...u})},s)})})}`;
 }
 
-function patchWebviewMenuBarCode(code) {
-  let next = code;
-  const menuAnchor =
-    "$r=[{id:_.file,message:Qr.file},{id:_.edit,message:Qr.edit},{id:_.view,message:Qr.view},{id:_.help,message:Qr.help}]";
-  const menuReplacement =
-    "$r=[{id:_.file,message:Qr.file},{id:_.edit,message:Qr.edit},{id:_.view,message:Qr.view},{id:_.help,message:Qr.help}," +
-    WEBVIEW_MENU_BAR_ITEM +
-    "]";
+function sequenceMember(node, property) {
+  if (node?.type !== "CallExpression" || node.callee.type !== "SequenceExpression") return null;
+  const member = node.callee.expressions.at(-1);
+  if (
+    member?.type !== "MemberExpression" ||
+    member.computed ||
+    member.object.type !== "Identifier" ||
+    member.property.type !== "Identifier" ||
+    member.property.name !== property
+  ) {
+    return null;
+  }
+  return member.object.name;
+}
 
-  if (!next.includes("{id:'codex-rebuild-updater-top',message:")) {
-    next = next.replace(menuAnchor, menuReplacement);
+function onlyValue(values, label) {
+  const unique = [...new Set(values)];
+  if (unique.length !== 1) throw new Error(`expected one ${label}, found ${unique.length}`);
+  return unique[0];
+}
+
+function analyzeWebviewMenuBarCode(code) {
+  const ast = acorn.parse(code, { ecmaVersion: "latest", sourceType: "module" });
+  const initializers = new Map();
+  const candidates = [];
+  walkAst(ast, (node) => {
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && node.init) {
+      initializers.set(node.id.name, node.init);
+    }
+    if (
+      node.type === "AssignmentExpression" &&
+      node.operator === "=" &&
+      node.left.type === "Identifier"
+    ) {
+      initializers.set(node.left.name, node.right);
+    }
+    if (node.type === "FunctionDeclaration") {
+      const source = code.slice(node.start, node.end);
+      if (
+        source.includes("showApplicationMenu") &&
+        source.includes("formatMessage") &&
+        source.includes("no-drag")
+      ) {
+        candidates.push(node);
+      }
+    }
+  });
+  if (candidates.length !== 1) {
+    throw new Error(`expected one Windows webview menu-bar function, found ${candidates.length}`);
   }
 
-  const functionEndAnchor = "}var Xr,Zr,Qr,$r,ei=";
-  let functionStart = next.indexOf("function codexRebuildUpdaterEnsureTitlebarStyle");
-  if (functionStart === -1) functionStart = next.indexOf("function codexRebuildUpdaterMenuBarProgress");
-  if (functionStart === -1) functionStart = next.indexOf("function Yr(){");
-  const functionEnd = functionStart === -1 ? -1 : next.indexOf(functionEndAnchor, functionStart);
-  if (functionStart !== -1 && functionEnd !== -1) {
-    next =
-      next.slice(0, functionStart) +
-      makeWebviewMenuBarFunctionPatch() +
-      next.slice(functionEnd + 1);
+  const menuFunction = candidates[0];
+  const source = code.slice(menuFunction.start, menuFunction.end);
+  const header = source.match(
+    /^function\s+([A-Za-z_$][\w$]*)\(\)\{let\s+[A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)\(\),/,
+  );
+  const availability = source.match(/if\(!([A-Za-z_$][\w$]*)\(\)\)return null/);
+  const classNames = source.match(/className:([A-Za-z_$][\w$]*)\(\s*[`'"]no-drag/);
+  if (!header || !availability || !classNames) {
+    throw new Error("Windows webview menu-bar structure is incomplete");
   }
 
+  const reactAliases = [];
+  const jsxAliases = [];
+  const menuArrays = [];
+  const iconAliases = [];
+  walkAst(menuFunction, (node) => {
+    const reactAlias = sequenceMember(node, "useState");
+    if (reactAlias) reactAliases.push(reactAlias);
+    const jsxAlias = sequenceMember(node, "jsx");
+    if (jsxAlias) {
+      jsxAliases.push(jsxAlias);
+      if (
+        node.arguments[0]?.type === "Identifier" &&
+        node.arguments[1]?.type === "ObjectExpression" &&
+        node.arguments[1].properties.some((property) => property.type === "SpreadElement")
+      ) {
+        iconAliases.push(node.arguments[0].name);
+      }
+    }
+    if (
+      node.type === "CallExpression" &&
+      node.callee.type === "MemberExpression" &&
+      !node.callee.computed &&
+      node.callee.object.type === "Identifier" &&
+      node.callee.property.type === "Identifier" &&
+      node.callee.property.name === "map"
+    ) {
+      menuArrays.push(node.callee.object.name);
+    }
+  });
+
+  const menuArrayName = onlyValue(menuArrays, "webview menu descriptor array");
+  const menuArray = initializers.get(menuArrayName);
+  if (menuArray?.type !== "ArrayExpression" || menuArray.elements.length < 4) {
+    throw new Error("Windows webview menu descriptor array is missing");
+  }
+  return {
+    functionName: header[1],
+    intlHook: header[2],
+    reactAlias: onlyValue(reactAliases, "React binding"),
+    jsxAlias: onlyValue(jsxAliases, "JSX binding"),
+    availabilityFunction: availability[1],
+    classNamesFunction: classNames[1],
+    iconAlias: onlyValue(iconAliases, "webview menu icon binding"),
+    menuArrayName,
+    menuArray,
+    menuFunction,
+  };
+}
+
+function bindWebviewMenuBarPatch(patch, shape) {
+  let next = patch
+    .replace("function Yr(){let e=D()", `function ${shape.functionName}(){let e=${shape.intlHook}()`)
+    .replaceAll("Xr.", `${shape.reactAlias}.`)
+    .replaceAll("Zr.", `${shape.jsxAlias}.`)
+    .replace("if(!qr())", `if(!${shape.availabilityFunction}())`)
+    .replace("children:$r.map", `children:${shape.menuArrayName}.map`)
+    .replaceAll("className:M(", `className:${shape.classNamesFunction}(`);
+  next = next.replace(
+    `(0,${shape.jsxAlias}.jsx)(w,{...u})`,
+    `(0,${shape.jsxAlias}.jsx)(${shape.iconAlias},{...u})`,
+  );
   return next;
+}
+
+function patchWebviewMenuBarCode(code) {
+  const functionCount = countOccurrences(
+    code,
+    "function codexRebuildUpdaterEnsureTitlebarStyle",
+  );
+  const itemCount = countOccurrences(
+    code,
+    "{id:'codex-rebuild-updater-top',message:",
+  );
+  if (functionCount > 0 || itemCount > 0) {
+    if (functionCount !== 1) {
+      throw new Error(
+        `Windows webview updater function expected exactly 1 target, found ${functionCount}`,
+      );
+    }
+    if (itemCount !== 1) {
+      throw new Error(
+        `Windows webview updater item expected exactly 1 target, found ${itemCount}`,
+      );
+    }
+    return code;
+  }
+  const shape = analyzeWebviewMenuBarCode(code);
+  return applyReplacements(code, [
+    {
+      start: shape.menuArray.end - 1,
+      end: shape.menuArray.end - 1,
+      text: `,${WEBVIEW_MENU_BAR_ITEM}`,
+    },
+    {
+      start: shape.menuFunction.start,
+      end: shape.menuFunction.end,
+      text: bindWebviewMenuBarPatch(makeWebviewMenuBarFunctionPatch(), shape),
+    },
+  ]);
 }
 
 function unwrapPatchedBootstrap(code) {
@@ -947,6 +1191,314 @@ function unwrapPatchedBootstrap(code) {
     return null;
   }
   return code.slice(prefixEnd + prefixAnchor.length, suffixStart);
+}
+
+function normalizeAsarPath(value) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error("Windows package main entry is missing");
+  }
+  const normalized = path.posix.normalize(value.replaceAll("\\", "/").replace(/^\.\//, ""));
+  if (normalized === ".." || normalized.startsWith("../") || path.posix.isAbsolute(normalized)) {
+    throw new Error(`Windows package entry escapes the ASAR root: ${value}`);
+  }
+  return normalized;
+}
+
+function resolveRuntimeBootstrap(packageSource, readSource) {
+  let metadata;
+  try {
+    metadata = typeof packageSource === "string" ? JSON.parse(packageSource) : packageSource;
+  } catch (error) {
+    throw new Error(`Windows package metadata parse failed: ${error.message}`);
+  }
+  const entryPath = normalizeAsarPath(metadata?.main);
+  const entryName = path.posix.basename(entryPath);
+  let runtimePath = entryPath;
+  let viaEarlyBootstrap = false;
+  if (entryName === "early-bootstrap.js") {
+    viaEarlyBootstrap = true;
+    const entrySource = readSource(entryPath);
+    if (typeof entrySource !== "string") {
+      throw new Error(`Windows early bootstrap is missing: ${entryPath}`);
+    }
+    const matches = [
+      ...entrySource.matchAll(
+        /require\(\s*(["'`])(\.\/bootstrap(?:-[A-Za-z0-9_$-]+)?\.js)\1\s*\)/g,
+      ),
+    ];
+    const targets = [...new Set(matches.map((match) => match[2]))];
+    if (targets.length !== 1) {
+      throw new Error(`runtime bootstrap expected exactly 1 target, found ${targets.length}`);
+    }
+    runtimePath = normalizeAsarPath(path.posix.join(path.posix.dirname(entryPath), targets[0]));
+  } else if (!/^bootstrap(?:-[A-Za-z0-9_$-]+)?\.js$/.test(entryName)) {
+    throw new Error(`unsupported Windows runtime bootstrap entry: ${entryPath}`);
+  }
+  if (runtimePath === entryPath && entryName === "early-bootstrap.js") {
+    throw new Error("early-bootstrap.js cannot satisfy the runtime backend contract");
+  }
+  if (typeof readSource(runtimePath) !== "string") {
+    throw new Error(`resolved Windows runtime bootstrap is missing: ${runtimePath}`);
+  }
+  return { entryPath, runtimePath, viaEarlyBootstrap };
+}
+
+function localLayerCount(status) {
+  return {
+    patchable: status === "patched" ? 1 : 0,
+    already: status === "already" ? 1 : 0,
+    total: 1,
+  };
+}
+
+function patchBootstrapCode(code) {
+  if (typeof code !== "string" || code.trim() === "") {
+    throw new Error("resolved Windows runtime bootstrap is empty");
+  }
+  const markerCounts = [START_MARKER, END_MARKER, FILE_END_MARKER].map((marker) =>
+    countOccurrences(code, marker),
+  );
+  if (markerCounts.some((count) => count > 0)) {
+    for (const [index, label] of ["start", "end", "file-end"].entries()) {
+      if (markerCounts[index] !== 1) {
+        throw new Error(
+          `Windows runtime bootstrap ${label} marker expected exactly 1 target, ` +
+            `found ${markerCounts[index]}`,
+        );
+      }
+    }
+    if (!code.includes("codex_rebuild:update-command")) {
+      throw new Error("Windows runtime bootstrap updater command is incomplete");
+    }
+    return { code, status: "already", counts: localLayerCount("already") };
+  }
+  return {
+    code: `${makeBootstrapPrefix()}${code}\n}\n${FILE_END_MARKER}\n`,
+    status: "patched",
+    counts: localLayerCount("patched"),
+  };
+}
+
+function findElectronBinding(code) {
+  let ast;
+  try {
+    ast = acorn.parse(code, { ecmaVersion: "latest", sourceType: "script" });
+  } catch (error) {
+    throw new Error(`Windows preload parse failed: ${error.message}`);
+  }
+  const bindings = [];
+  for (const statement of ast.body) {
+    if (statement.type !== "VariableDeclaration") continue;
+    for (const declaration of statement.declarations) {
+      if (
+        declaration.id.type === "Identifier" &&
+        declaration.init?.type === "CallExpression" &&
+        declaration.init.callee.type === "Identifier" &&
+        declaration.init.callee.name === "require" &&
+        declaration.init.arguments.length === 1 &&
+        literalValue(declaration.init.arguments[0]) === "electron"
+      ) {
+        bindings.push(declaration.id.name);
+      }
+    }
+  }
+  if (bindings.length !== 1) {
+    throw new Error(
+      `program-scope preload electron binding expected exactly 1 target, found ${bindings.length}`,
+    );
+  }
+  return bindings[0];
+}
+
+function patchPreloadCode(code) {
+  const startCount = countOccurrences(code, PRELOAD_START_MARKER);
+  const endCount = countOccurrences(code, PRELOAD_END_MARKER);
+  if (startCount > 0 || endCount > 0) {
+    if (startCount !== 1) {
+      throw new Error(
+        `Windows preload updater start marker expected exactly 1 target, found ${startCount}`,
+      );
+    }
+    if (endCount !== 1) {
+      throw new Error(
+        `Windows preload updater end marker expected exactly 1 target, found ${endCount}`,
+      );
+    }
+    if (!/exposeInMainWorld\(\s*["'`]codexRebuildUpdater["'`]/.test(code)) {
+      throw new Error("Windows preload updater bridge is incomplete");
+    }
+    return { code, status: "already", counts: localLayerCount("already") };
+  }
+  const electronAlias = findElectronBinding(code);
+  const patch = makePreloadPatch(electronAlias);
+  const sourceMap = "\n//# sourceMappingURL=preload.js.map";
+  const next = code.includes(sourceMap)
+    ? code.replace(sourceMap, `\n${patch}${sourceMap}`)
+    : `${code}\n${patch}\n`;
+  return { code: next, status: "patched", counts: localLayerCount("patched") };
+}
+
+function patchPackageMetadataSource(packageSource, updateUrl = DEFAULT_WINDOWS_UPDATE_URL) {
+  let metadata;
+  try {
+    metadata = JSON.parse(packageSource);
+  } catch (error) {
+    throw new Error(`Windows package metadata parse failed: ${error.message}`);
+  }
+  const normalizedUrl = String(updateUrl || "").trim();
+  if (!normalizedUrl) throw new Error("Windows update URL is empty");
+  if (metadata.codexRebuildWindowsUpdateUrl === normalizedUrl) {
+    return { code: packageSource, status: "already", counts: localLayerCount("already") };
+  }
+  metadata.codexRebuildWindowsUpdateUrl = normalizedUrl;
+  return {
+    code: JSON.stringify(metadata, null, 2) + "\n",
+    status: "patched",
+    counts: localLayerCount("patched"),
+  };
+}
+
+function makePlannedLayer(pathName, result) {
+  return { path: pathName, status: result.status, counts: result.counts };
+}
+
+function planLocalUpdaterSources({ packageSource, files, updateUrl = DEFAULT_WINDOWS_UPDATE_URL }) {
+  if (typeof packageSource !== "string") throw new Error("Windows package metadata is required");
+  if (!files || typeof files !== "object") throw new Error("Windows ASAR sources are required");
+  const normalizedFiles = {};
+  for (const [fileName, source] of Object.entries(files)) {
+    normalizedFiles[normalizeAsarPath(fileName)] = source;
+  }
+  const resolved = resolveRuntimeBootstrap(packageSource, (fileName) => normalizedFiles[fileName]);
+  const mainNames = Object.keys(normalizedFiles).filter((fileName) =>
+    /^\.vite\/build\/main-.*\.js$/.test(fileName),
+  );
+  const webviewNames = Object.keys(normalizedFiles).filter((fileName) => {
+    if (!/^webview\/assets\/app-shell-.*\.js$/.test(fileName)) return false;
+    const source = normalizedFiles[fileName];
+    return (
+      source.includes("function codexRebuildUpdaterEnsureTitlebarStyle") ||
+      (source.includes("windowsMenuBar.help") && source.includes("showApplicationMenu"))
+    );
+  });
+  if (mainNames.length !== 1) {
+    throw new Error(`Windows main menu expected exactly 1 target, found ${mainNames.length}`);
+  }
+  if (webviewNames.length !== 1) {
+    throw new Error(`Windows webview titlebar expected exactly 1 target, found ${webviewNames.length}`);
+  }
+  const preloadPath = ".vite/build/preload.js";
+  if (typeof normalizedFiles[preloadPath] !== "string") {
+    throw new Error("Windows preload expected exactly 1 target, found 0");
+  }
+
+  const metadata = patchPackageMetadataSource(packageSource, updateUrl);
+  const backend = patchBootstrapCode(normalizedFiles[resolved.runtimePath]);
+  const preload = patchPreloadCode(normalizedFiles[preloadPath]);
+  const mainCode = patchMainMenuCode(normalizedFiles[mainNames[0]]);
+  const webviewCode = patchWebviewMenuBarCode(normalizedFiles[webviewNames[0]]);
+  const mainMenu = {
+    code: mainCode,
+    status: mainCode === normalizedFiles[mainNames[0]] ? "already" : "patched",
+  };
+  mainMenu.counts = localLayerCount(mainMenu.status);
+  const webview = {
+    code: webviewCode,
+    status: webviewCode === normalizedFiles[webviewNames[0]] ? "already" : "patched",
+  };
+  webview.counts = localLayerCount(webview.status);
+
+  const outputs = [
+    { path: "package.json", source: packageSource, result: metadata },
+    { path: resolved.runtimePath, source: normalizedFiles[resolved.runtimePath], result: backend },
+    { path: preloadPath, source: normalizedFiles[preloadPath], result: preload },
+    { path: mainNames[0], source: normalizedFiles[mainNames[0]], result: mainMenu },
+    { path: webviewNames[0], source: normalizedFiles[webviewNames[0]], result: webview },
+  ];
+  const changes = outputs
+    .filter((output) => output.result.code !== output.source)
+    .map((output) => ({ path: output.path, original: output.source, code: output.result.code }));
+  return {
+    status: changes.length === 0 ? "already" : "patched",
+    changes,
+    layers: {
+      metadata: makePlannedLayer("package.json", metadata),
+      entry: {
+        path: resolved.entryPath,
+        status: resolved.viaEarlyBootstrap ? "native" : "direct",
+        counts: { native: 1, total: 1 },
+      },
+      backend: makePlannedLayer(resolved.runtimePath, backend),
+      preload: makePlannedLayer(preloadPath, preload),
+      mainMenu: makePlannedLayer(mainNames[0], mainMenu),
+      webview: makePlannedLayer(webviewNames[0], webview),
+    },
+  };
+}
+
+function collectLocalUpdaterSources(asarRoot) {
+  const packagePath = path.join(asarRoot, "package.json");
+  if (!fs.existsSync(packagePath)) throw new Error("Windows package metadata is missing");
+  const packageSource = fs.readFileSync(packagePath, "utf-8");
+  const buildDir = path.join(asarRoot, ".vite", "build");
+  const assetsDir = path.join(asarRoot, "webview", "assets");
+  if (!fs.existsSync(buildDir)) throw new Error("Windows build directory is missing");
+  if (!fs.existsSync(assetsDir)) throw new Error("Windows webview assets directory is missing");
+  const files = {};
+  for (const fileName of fs.readdirSync(buildDir)) {
+    if (
+      fileName === "early-bootstrap.js" ||
+      fileName === "preload.js" ||
+      /^bootstrap(?:-[A-Za-z0-9_$-]+)?\.js$/.test(fileName) ||
+      /^main-.*\.js$/.test(fileName)
+    ) {
+      files[`.vite/build/${fileName}`] = fs.readFileSync(path.join(buildDir, fileName), "utf-8");
+    }
+  }
+  for (const fileName of fs.readdirSync(assetsDir)) {
+    if (/^app-shell-.*\.js$/.test(fileName)) {
+      files[`webview/assets/${fileName}`] = fs.readFileSync(path.join(assetsDir, fileName), "utf-8");
+    }
+  }
+  return { packageSource, files };
+}
+
+function executeLocalUpdater({
+  asarRoot = path.join(SRC_DIR, "win", "_asar"),
+  check = false,
+  updateUrl = (process.env.CODEX_REBUILD_UPDATE_URL || DEFAULT_WINDOWS_UPDATE_URL).trim(),
+  writeFileSync = fs.writeFileSync,
+} = {}) {
+  const sources = collectLocalUpdaterSources(asarRoot);
+  const plan = planLocalUpdaterSources({ ...sources, updateUrl });
+  if (check) return plan;
+  const applied = [];
+  try {
+    for (const change of plan.changes) {
+      const filePath = path.join(asarRoot, ...change.path.split("/"));
+      applied.push({ filePath, original: change.original });
+      writeFileSync(filePath, change.code, "utf-8");
+    }
+  } catch (error) {
+    const rollbackFailures = [];
+    for (const item of applied.reverse()) {
+      try {
+        writeFileSync(item.filePath, item.original, "utf-8");
+      } catch (rollbackError) {
+        rollbackFailures.push(
+          `${path.relative(asarRoot, item.filePath)}: ${rollbackError.message}`,
+        );
+      }
+    }
+    if (rollbackFailures.length > 0) {
+      throw new Error(
+        `local updater write failed; rollback incomplete (${rollbackFailures.join("; ")}): ` +
+          error.message,
+      );
+    }
+    throw new Error(`local updater write failed and was rolled back: ${error.message}`);
+  }
+  return plan;
 }
 
 function patchBootstrap() {
@@ -1082,17 +1634,35 @@ function patchWebviewMenuBar() {
 
 function main() {
   const args = process.argv.slice(2);
+  const isCheck = args.includes("--check");
   const platform = args.find((a) => ["mac-arm64", "mac-x64", "win", "unix"].includes(a));
   if (platform && platform !== "win") {
     console.log("  [ok] Local updater patch only applies to Windows");
     return;
   }
 
-  updatePackageMetadata();
-  patchBootstrap();
-  patchPreload();
-  patchMainMenu();
-  patchWebviewMenuBar();
+  const result = executeLocalUpdater({ check: isCheck });
+  for (const [name, layer] of Object.entries(result.layers)) {
+    const counts = layer.counts ? ` ${JSON.stringify(layer.counts)}` : "";
+    console.log(`  [${isCheck ? "check" : layer.status}] ${name}: ${layer.path}${counts}`);
+  }
+  console.log(
+    `  [ok] local updater status=${result.status} writes=${isCheck ? 0 : result.changes.length} planned=${result.changes.length}`,
+  );
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = {
+  makeBootstrapPrefix,
+  makePreloadPatch,
+  makeMainMenuPatch,
+  patchMainMenuCode,
+  patchWebviewMenuBarCode,
+  resolveRuntimeBootstrap,
+  patchBootstrapCode,
+  patchPreloadCode,
+  patchPackageMetadataSource,
+  planLocalUpdaterSources,
+  executeLocalUpdater,
+};

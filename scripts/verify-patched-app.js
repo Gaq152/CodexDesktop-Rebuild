@@ -61,8 +61,8 @@ function stringValue(node) {
   return null;
 }
 
-function comparisonOperand(node, expectedValue, source) {
-  if (node?.type !== "BinaryExpression" || node.operator !== "===") return null;
+function comparisonOperand(node, expectedValue, source, operator = "===") {
+  if (node?.type !== "BinaryExpression" || node.operator !== operator) return null;
   if (stringValue(node.right) === expectedValue) {
     return source.slice(node.left.start, node.left.end);
   }
@@ -76,6 +76,16 @@ function flattenLogicalOr(node, terms = []) {
   if (node?.type === "LogicalExpression" && node.operator === "||") {
     flattenLogicalOr(node.left, terms);
     flattenLogicalOr(node.right, terms);
+  } else {
+    terms.push(node);
+  }
+  return terms;
+}
+
+function flattenLogicalAnd(node, terms = []) {
+  if (node?.type === "LogicalExpression" && node.operator === "&&") {
+    flattenLogicalAnd(node.left, terms);
+    flattenLogicalAnd(node.right, terms);
   } else {
     terms.push(node);
   }
@@ -140,6 +150,65 @@ function hasPatchedFastModeAuthorization(source) {
       isFunctionNode(node) &&
       functionHasFastMode(node) &&
       functionHasPatchedFastAuth(node, source)
+    ) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+function functionHasPatchedFastRequestAuthorization(functionNode, source) {
+  let found = false;
+  walk(
+    functionNode,
+    (node) => {
+      if (
+        found ||
+        node.type !== "IfStatement" ||
+        node.test?.type !== "LogicalExpression" ||
+        node.test.operator !== "&&" ||
+        !source
+          .slice(node.test.end, node.consequent.start)
+          .includes("CodexRebuildFastModeRequestAuth")
+      ) {
+        return;
+      }
+      const terms = flattenLogicalAnd(node.test);
+      const chatGptOperands = new Set(
+        terms
+          .map((term) => comparisonOperand(term, "chatgpt", source, "!=="))
+          .filter(Boolean),
+      );
+      const apiKeyOperands = terms
+        .map((term) => comparisonOperand(term, "apikey", source, "!=="))
+        .filter(Boolean);
+      found = apiKeyOperands.some((operand) => chatGptOperands.has(operand));
+    },
+    functionNode,
+  );
+  return found;
+}
+
+function hasPatchedFastModeRequestAuthorization(source) {
+  if (
+    !source.includes("fast_mode") ||
+    !source.includes("CodexRebuildFastModeRequestAuth")
+  ) {
+    return false;
+  }
+  let ast;
+  try {
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  } catch {
+    return false;
+  }
+  let found = false;
+  walk(ast, (node) => {
+    if (
+      !found &&
+      isFunctionNode(node) &&
+      functionHasFastMode(node) &&
+      functionHasPatchedFastRequestAuthorization(node, source)
     ) {
       found = true;
     }
@@ -462,48 +531,413 @@ function isWebviewAsset(file) {
   return file.startsWith("src/win/_asar/webview/assets/");
 }
 
+function isPluginWebviewAsset(file) {
+  return /^src\/win\/_asar\/webview\/assets\/use-is-plugins-enabled-.*\.js$/.test(file);
+}
+
+function parseBundle(source) {
+  try {
+    return parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  } catch {
+    return null;
+  }
+}
+
+function hasNativeArchiveRoute(source, file) {
+  if (!/^src\/win\/_asar\/webview\/assets\/app-main-.*\.js$/.test(file)) {
+    return false;
+  }
+  const ast = parseBundle(source);
+  if (!ast) return false;
+  let matches = 0;
+  walk(ast, (node) => {
+    if (node.type !== "Property" || propertyName(node) !== "delete-archived-conversation") {
+      return;
+    }
+    let routeMatches = 0;
+    walk(node.value, (inner) => {
+      if (
+        inner.type !== "ArrowFunctionExpression" ||
+        inner.params.length !== 2 ||
+        inner.params[0].type !== "Identifier" ||
+        inner.params[1].type !== "ObjectPattern"
+      ) {
+        return;
+      }
+      const conversationId = inner.params[1].properties.find(
+        (property) => propertyName(property) === "conversationId",
+      )?.value;
+      const body = inner.body;
+      if (
+        conversationId?.type === "Identifier" &&
+        body?.type === "CallExpression" &&
+        body.callee?.type === "MemberExpression" &&
+        !body.callee.computed &&
+        body.callee.object?.type === "Identifier" &&
+        body.callee.object.name === inner.params[0].name &&
+        body.callee.property?.name === "deleteArchivedConversation" &&
+        body.arguments.length === 1 &&
+        body.arguments[0]?.type === "Identifier" &&
+        body.arguments[0].name === conversationId.name
+      ) {
+        routeMatches += 1;
+      }
+    });
+    if (routeMatches === 1) matches += 1;
+  });
+  return matches === 1;
+}
+
+function hasNativeArchiveUi(source, file) {
+  if (!/^src\/win\/_asar\/webview\/assets\/data-controls-.*\.js$/.test(file)) {
+    return false;
+  }
+  if (!source.includes("settings.dataControls.archivedChats.delete")) return false;
+  const ast = parseBundle(source);
+  if (!ast) return false;
+  let found = false;
+  walk(ast, (node) => {
+    if (
+      found ||
+      node.type !== "CallExpression" ||
+      stringValue(node.arguments[0]) !== "delete-archived-conversation" ||
+      node.arguments[1]?.type !== "ObjectExpression"
+    ) {
+      return;
+    }
+    found = node.arguments[1].properties.some(
+      (property) => propertyName(property) === "conversationId",
+    );
+  });
+  return found;
+}
+
+function hasLegacyArchiveDelete(source, file) {
+  if (!isWebviewAsset(file)) return false;
+  const ast = parseBundle(source);
+  if (!ast) return false;
+  let matches = 0;
+  walk(ast, (node) => {
+    if (node.type !== "Property" || propertyName(node) !== "delete-conversation") {
+      return;
+    }
+    let protocolCalls = 0;
+    walk(node.value, (inner) => {
+      if (
+        inner.type !== "CallExpression" ||
+        inner.callee?.type !== "MemberExpression" ||
+        inner.callee.property?.name !== "sendRequest" ||
+        stringValue(inner.arguments[0]) !== "thread/delete" ||
+        inner.arguments[1]?.type !== "ObjectExpression"
+      ) {
+        return;
+      }
+      if (
+        inner.arguments[1].properties.some(
+          (property) => propertyName(property) === "threadId",
+        )
+      ) {
+        protocolCalls += 1;
+      }
+    });
+    if (protocolCalls === 1) matches += 1;
+  });
+  return matches === 1;
+}
+
+function inspectArchiveDelete(sources) {
+  const nativeRoutes = sources.filter(({ source, file }) =>
+    hasNativeArchiveRoute(source, file),
+  );
+  const nativeUis = sources.filter(({ source, file }) =>
+    hasNativeArchiveUi(source, file),
+  );
+  if (nativeRoutes.length === 1 && nativeUis.length === 1) {
+    return {
+      files: [...new Set([nativeRoutes[0].file, nativeUis[0].file])].sort(),
+    };
+  }
+  const legacyRoutes = sources.filter(({ source, file }) =>
+    hasLegacyArchiveDelete(source, file),
+  );
+  if (legacyRoutes.length === 1) return { files: [legacyRoutes[0].file] };
+  return {
+    detail:
+      `native route/UI expected exactly 1/1, found ${nativeRoutes.length}/${nativeUis.length}; ` +
+      `legacy route expected exactly 1, found ${legacyRoutes.length}`,
+  };
+}
+
+function hasPatchedPluginWebviewAuth(source) {
+  if (!source.includes("authMethod") || !source.includes("chatgpt") || !source.includes("apikey")) {
+    return false;
+  }
+  let ast;
+  try {
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  } catch {
+    return false;
+  }
+  let found = false;
+  walk(ast, (node) => {
+    if (found || node.type !== "LogicalExpression" || node.operator !== "||") return;
+    const terms = flattenLogicalOr(node);
+    const chatGptOperands = new Set(
+      terms
+        .map((term) => comparisonOperand(term, "chatgpt", source))
+        .filter((operand) => operand?.includes("authMethod")),
+    );
+    found = terms
+      .map((term) => comparisonOperand(term, "apikey", source))
+      .some((operand) => chatGptOperands.has(operand));
+  });
+  return found;
+}
+
+function hasPatchedPluginStatsig(source) {
+  const marker = "/* CodexRebuildPluginStatsig */";
+  if (!source.includes(marker)) return false;
+  const ast = parseBundle(source);
+  if (!ast) return false;
+  const contexts = ["browser_use", "browser_use_external", "computer_use"];
+  const attached = new Set();
+  walk(ast, (node) => {
+    if (!isFunctionNode(node)) return;
+    const functionSource = source.slice(node.start, node.end);
+    if (!contexts.some((context) => functionSource.includes(context))) return;
+    walk(
+      node,
+      (inner) => {
+        if (
+          isAlwaysTrue(inner) &&
+          source.slice(inner.end, inner.end + marker.length) === marker
+        ) {
+          attached.add(inner.start);
+        }
+      },
+      node,
+    );
+  });
+  return attached.size === 3;
+}
+
+function hasPatchedPluginWebviewAvailability(source) {
+  if (!source.includes("browser_use_external") || !source.includes("isLoading")) return false;
+  let ast;
+  try {
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  } catch {
+    return false;
+  }
+  let found = false;
+  walk(ast, (node) => {
+    if (found || !isFunctionNode(node)) return;
+    const functionSource = source.slice(node.start, node.end);
+    if (!functionSource.includes("browser_use_external")) return;
+    walk(
+      node,
+      (inner) => {
+        if (found || inner.type !== "ObjectExpression") return;
+        const properties = new Map(inner.properties.map((property) => [propertyName(property), property]));
+        found =
+          isAlwaysTrue(properties.get("allowed")?.value) &&
+          isAlwaysTrue(properties.get("available")?.value) &&
+          properties.has("isLoading");
+      },
+      node,
+    );
+  });
+  return found;
+}
+
+function normalizeAsarEntry(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  const normalized = path.posix.normalize(value.replaceAll("\\", "/").replace(/^\.\//, ""));
+  if (normalized === ".." || normalized.startsWith("../") || path.posix.isAbsolute(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function resolveUpdaterBackendFile(packageJson, sources) {
+  const entryPath = normalizeAsarEntry(packageJson?.main);
+  if (!entryPath) return null;
+  const entryName = path.posix.basename(entryPath);
+  let runtimePath = entryPath;
+  if (entryName === "early-bootstrap.js") {
+    const entryFile = `src/win/_asar/${entryPath}`;
+    const entrySource = sources.find(({ file }) => file === entryFile)?.source;
+    if (typeof entrySource !== "string") return null;
+    const targets = [
+      ...new Set(
+        [...entrySource.matchAll(/require\(\s*(["'`])(\.\/bootstrap(?:-[A-Za-z0-9_$-]+)?\.js)\1\s*\)/g)].map(
+          (match) => match[2],
+        ),
+      ),
+    ];
+    if (targets.length !== 1) return null;
+    runtimePath = normalizeAsarEntry(path.posix.join(path.posix.dirname(entryPath), targets[0]));
+  } else if (!/^bootstrap(?:-[A-Za-z0-9_$-]+)?\.js$/.test(entryName)) {
+    return null;
+  }
+  if (!runtimePath || path.posix.basename(runtimePath) === "early-bootstrap.js") return null;
+  return `src/win/_asar/${runtimePath}`;
+}
+
+function hasUpdaterMetadata(source, file) {
+  if (file !== "src/win/_asar/package.json") return false;
+  try {
+    const metadata = JSON.parse(source);
+    return (
+      typeof metadata.codexRebuildWindowsUpdateUrl === "string" &&
+      metadata.codexRebuildWindowsUpdateUrl.trim().length > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+function occurrenceCount(source, token) {
+  return source.split(token).length - 1;
+}
+
+function hasUpdaterBackend(source, file, context) {
+  if (file !== context.updaterBackendFile) return false;
+  const start = "/* CodexRebuildLocalUpdater:start */";
+  const end = "/* CodexRebuildLocalUpdater:end */";
+  const fileEnd = "/* CodexRebuildLocalUpdater:file-end */";
+  if (
+    occurrenceCount(source, start) !== 1 ||
+    occurrenceCount(source, end) !== 1 ||
+    occurrenceCount(source, fileEnd) !== 1 ||
+    !source.startsWith(start)
+  ) {
+    return false;
+  }
+  const endIndex = source.indexOf(end);
+  const commandIndex = source.indexOf("codex_rebuild:update-command");
+  const wrapperIndex = source.indexOf("if(!CodexRebuildWindowsBootstrap())", endIndex);
+  const fileEndIndex = source.indexOf(fileEnd);
+  return (
+    commandIndex > 0 &&
+    commandIndex < endIndex &&
+    wrapperIndex > endIndex &&
+    fileEndIndex > wrapperIndex
+  );
+}
+
+function hasUpdaterPreloadBridge(source, file) {
+  if (!isBuildFile(file, "preload.js")) return false;
+  const start = "/* CodexRebuildUpdaterPreload:start */";
+  const end = "/* CodexRebuildUpdaterPreload:end */";
+  if (occurrenceCount(source, start) !== 1 || occurrenceCount(source, end) !== 1) {
+    return false;
+  }
+  const startIndex = source.indexOf(start);
+  const endIndex = source.indexOf(end);
+  const bridgeIndex = source.search(
+    /exposeInMainWorld\(\s*["'`]codexRebuildUpdater["'`]/,
+  );
+  return startIndex < bridgeIndex && bridgeIndex < endIndex;
+}
+
+function hasUpdaterMainMenu(source, file) {
+  if (!/^src\/win\/_asar\/\.vite\/build\/main-.*\.js$/.test(file)) return false;
+  const start = "/* CodexRebuildUpdaterMainMenu:start */";
+  const end = "/* CodexRebuildUpdaterMainMenu:end */";
+  if (occurrenceCount(source, start) !== 1 || occurrenceCount(source, end) !== 1) {
+    return false;
+  }
+  const startIndex = source.indexOf(start);
+  const endIndex = source.indexOf(end);
+  const itemIndex = source.indexOf("codex-rebuild-updater-top", startIndex);
+  return startIndex < itemIndex && itemIndex < endIndex;
+}
+
+function hasUpdaterTitlebar(source, file) {
+  if (!/^src\/win\/_asar\/webview\/assets\/app-shell-.*\.js$/.test(file)) {
+    return false;
+  }
+  return (
+    occurrenceCount(source, "function codexRebuildUpdaterEnsureTitlebarStyle") === 1 &&
+    occurrenceCount(source, "{id:'codex-rebuild-updater-top',message:") === 1
+  );
+}
+
 const CONTRACT_DEFINITIONS = [
   {
     id: "fast",
-    sameBundle: true,
-    markers: [
+    groups: [
       {
-        label: "fast_mode",
-        matches: (source) => source.includes("fast_mode"),
+        label: "service-tier settings",
+        markers: [
+          {
+            label: "fast_mode",
+            matches: (source) => source.includes("fast_mode"),
+          },
+          {
+            label: "API-key authorization postcondition",
+            matches: hasPatchedFastModeAuthorization,
+          },
+        ],
       },
       {
-        label: "API-key authorization postcondition",
-        matches: hasPatchedFastModeAuthorization,
+        label: "request service tier",
+        markers: [
+          {
+            label: "request bundle",
+            matches: (_source, file) =>
+              /\/read-service-tier-for-request-[^/]+\.js$/.test(file),
+          },
+          {
+            label: "request API-key authorization postcondition",
+            matches: hasPatchedFastModeRequestAuthorization,
+          },
+        ],
       },
     ],
   },
   {
     id: "plugin",
-    sameBundle: true,
-    markers: [
+    groups: [
       {
-        label: "browser/computer default-feature object postcondition",
-        matches: hasPatchedDesktopFeatureDefaults,
+        label: "main process",
+        markers: [
+          {
+            label: "browser/computer default-feature object postcondition",
+            matches: hasPatchedDesktopFeatureDefaults,
+          },
+          {
+            label: "bundled plugin availability postcondition",
+            matches: hasPatchedBundledPluginFilter,
+          },
+        ],
       },
       {
-        label: "bundled plugin availability postcondition",
-        matches: hasPatchedBundledPluginFilter,
+        label: "use-is-plugins-enabled webview",
+        markers: [
+          {
+            label: "plugin API-key authorization postcondition",
+            matches: (source, file) =>
+              isPluginWebviewAsset(file) && hasPatchedPluginWebviewAuth(source),
+          },
+          {
+            label: "plugin allowed/available postcondition",
+            matches: (source, file) =>
+              isPluginWebviewAsset(file) && hasPatchedPluginWebviewAvailability(source),
+          },
+          {
+            label: "plugin Statsig bypass postcondition",
+            matches: (source, file) =>
+              isPluginWebviewAsset(file) && hasPatchedPluginStatsig(source),
+          },
+        ],
       },
     ],
   },
   {
     id: "archive-delete",
-    sameBundle: true,
-    markers: [
-      {
-        label: "delete-conversation",
-        matches: (source) => source.includes("delete-conversation"),
-      },
-      {
-        label: "thread/delete",
-        matches: (source) => source.includes("thread/delete"),
-      },
-    ],
+    inspect: inspectArchiveDelete,
   },
   {
     id: "sidebar-delete",
@@ -525,21 +959,24 @@ const CONTRACT_DEFINITIONS = [
     id: "updater",
     markers: [
       {
-        label: "CodexRebuildLocalUpdater",
-        matches: (source, file) =>
-          isBuildFile(file, "bootstrap.js") &&
-          source.includes("CodexRebuildLocalUpdater"),
+        label: "codexRebuildWindowsUpdateUrl metadata",
+        matches: hasUpdaterMetadata,
+      },
+      {
+        label: "resolved CodexRebuildLocalUpdater backend",
+        matches: hasUpdaterBackend,
+      },
+      {
+        label: "CodexRebuildUpdaterMainMenu",
+        matches: hasUpdaterMainMenu,
       },
       {
         label: "codexRebuildUpdater preload bridge",
-        matches: (source, file) =>
-          isBuildFile(file, "preload.js") &&
-          /exposeInMainWorld\(\s*["'`]codexRebuildUpdater["'`]/.test(source),
+        matches: hasUpdaterPreloadBridge,
       },
       {
         label: "codex-rebuild-updater-top",
-        matches: (source, file) =>
-          isWebviewAsset(file) && source.includes("codex-rebuild-updater-top"),
+        matches: hasUpdaterTitlebar,
       },
     ],
   },
@@ -658,12 +1095,58 @@ function verifyPatchedApp(root, platform, expectedVersion) {
     });
   }
 
+  const context = {
+    packageJson: packageInspection.packageJson,
+    updaterBackendFile: resolveUpdaterBackendFile(packageInspection.packageJson, sources),
+  };
   const contracts = {};
   for (const definition of CONTRACT_DEFINITIONS) {
+    if (definition.inspect) {
+      const inspection = definition.inspect(sources, context);
+      if (inspection.detail) {
+        failures.push({ id: definition.id, detail: inspection.detail });
+      } else {
+        contracts[definition.id] = inspection.files;
+      }
+      continue;
+    }
+    if (definition.groups) {
+      const evidenceFiles = new Set();
+      const missingGroups = [];
+      for (const group of definition.groups) {
+        const matchingFiles = sources
+          .filter(({ source, file }) =>
+            group.markers.every((marker) => marker.matches(source, file, context)),
+          )
+          .map(({ file }) => file)
+          .sort();
+        if (matchingFiles.length === 0) {
+          const missingMarkers = group.markers
+            .filter(
+              (marker) =>
+                !sources.some(({ source, file }) => marker.matches(source, file, context)),
+            )
+            .map((marker) => marker.label);
+          missingGroups.push(
+            missingMarkers.length > 0
+              ? `${group.label}: missing ${missingMarkers.join(", ")}`
+              : `${group.label}: markers are not co-located`,
+          );
+        } else {
+          for (const file of matchingFiles) evidenceFiles.add(file);
+        }
+      }
+      if (missingGroups.length > 0) {
+        failures.push({ id: definition.id, detail: missingGroups.join("; ") });
+      } else {
+        contracts[definition.id] = [...evidenceFiles].sort();
+      }
+      continue;
+    }
     if (definition.sameBundle) {
       const matchingFiles = sources
         .filter(({ source, file }) =>
-          definition.markers.every((marker) => marker.matches(source, file)),
+          definition.markers.every((marker) => marker.matches(source, file, context)),
         )
         .map(({ file }) => file)
         .sort();
@@ -675,7 +1158,7 @@ function verifyPatchedApp(root, platform, expectedVersion) {
       const missingMarkers = definition.markers
         .filter(
           (marker) =>
-            !sources.some(({ source, file }) => marker.matches(source, file)),
+            !sources.some(({ source, file }) => marker.matches(source, file, context)),
         )
         .map((marker) => marker.label);
       failures.push({
@@ -695,7 +1178,7 @@ function verifyPatchedApp(root, platform, expectedVersion) {
 
     for (const marker of definition.markers) {
       const matchingFiles = sources
-        .filter(({ source, file }) => marker.matches(source, file))
+        .filter(({ source, file }) => marker.matches(source, file, context))
         .map(({ file }) => file);
       if (matchingFiles.length === 0) missingMarkers.push(marker.label);
       for (const file of matchingFiles) evidenceFiles.add(file);

@@ -14,7 +14,7 @@
 const fs = require("fs");
 const path = require("path");
 const acorn = require("acorn");
-const { locateBundles, relPath } = require("./patch-util");
+const { locateBundles, relPath, SRC_DIR } = require("./patch-util");
 
 function walk(node, visitor) {
   if (!node || typeof node !== "object") return;
@@ -396,27 +396,520 @@ function patchSidebarFlat(bundles) {
   return patched;
 }
 
-function main() {
-  const args = process.argv.slice(2);
-  const platform = args.find((arg) => ["mac-arm64", "mac-x64", "win"].includes(arg));
-
-  console.log("  [layer 1] thread-actions: delete action");
-  const threadActions = locateBundles({
-    dir: "assets",
-    pattern: /^thread-actions-.*\.js$/,
-    ...(platform ? { platform } : {}),
-  });
-  const actionCount = patchThreadActions(threadActions);
-
-  console.log("  [layer 2] sidebar-flat-sections: delete UI");
-  const sidebarFlat = locateBundles({
-    dir: "assets",
-    pattern: /^sidebar-flat-sections-.*\.js$/,
-    ...(platform ? { platform } : {}),
-  });
-  const sidebarCount = patchSidebarFlat(sidebarFlat);
-
-  console.log(`  [done] thread actions: ${actionCount}, sidebar bundles: ${sidebarCount}`);
+function parseRequired(code, label) {
+  try {
+    return acorn.parse(code, { ecmaVersion: "latest", sourceType: "module" });
+  } catch (error) {
+    throw new Error(`${label} parse failed: ${error.message}`);
+  }
 }
 
-main();
+function propertyName(node) {
+  if (node?.type !== "Property") return null;
+  if (!node.computed && node.key.type === "Identifier") return node.key.name;
+  if (node.key.type === "Literal") return String(node.key.value);
+  return null;
+}
+
+function literalValue(node) {
+  if (node?.type === "Literal") return node.value;
+  if (node?.type === "TemplateLiteral" && node.expressions.length === 0) {
+    return node.quasis[0].value.cooked;
+  }
+  return null;
+}
+
+function sourceFor(code, node) {
+  return code.slice(node.start, node.end);
+}
+
+function applySourceReplacements(code, replacements) {
+  let next = code;
+  for (const replacement of [...replacements].sort((left, right) => right.start - left.start)) {
+    next = next.slice(0, replacement.start) + replacement.text + next.slice(replacement.end);
+  }
+  return next;
+}
+
+function sidebarCount(patchable, already, label) {
+  const total = patchable + already;
+  if (total !== 1) throw new Error(`${label} expected exactly 1 target, found ${total}`);
+  return { patchable, already, total };
+}
+
+function countOccurrences(source, token) {
+  return source.split(token).length - 1;
+}
+
+function sequenceMemberAlias(node, property) {
+  if (node?.type !== "CallExpression" || node.callee.type !== "SequenceExpression") return null;
+  const member = node.callee.expressions.at(-1);
+  if (
+    member?.type === "MemberExpression" &&
+    !member.computed &&
+    member.object.type === "Identifier" &&
+    member.property.type === "Identifier" &&
+    member.property.name === property
+  ) {
+    return member.object.name;
+  }
+  return null;
+}
+
+function patchThreadActionsSource(code) {
+  const messageMarker = "id:`sidebarElectron.deleteThread`";
+  const actionMarker = "/* CodexSidebarDeleteAction */";
+  const messageCount = countOccurrences(code, messageMarker);
+  const actionCount = countOccurrences(code, actionMarker);
+  const bindingCount = countOccurrences(code, "deleteThread:CodexSidebarDeleteAction");
+  if (messageCount > 0 || actionCount > 0 || bindingCount > 0) {
+    if (messageCount !== 1) {
+      throw new Error(
+        `sidebar messages expected exactly 1 target, found ${messageCount}`,
+      );
+    }
+    if (actionCount !== 1 || bindingCount !== 1) {
+      throw new Error(
+        `sidebar action expected exactly 1 target, found ${Math.max(actionCount, bindingCount)}`,
+      );
+    }
+    if (!code.includes("delete-archived-conversation")) {
+      throw new Error("sidebar thread-actions patch is only partially present");
+    }
+    return {
+      code,
+      status: "already",
+      counts: {
+        messages: sidebarCount(0, 1, "sidebar messages"),
+        action: sidebarCount(0, 1, "sidebar action"),
+      },
+    };
+  }
+
+  const ast = parseRequired(code, "sidebar thread-actions");
+  const archiveMessages = [];
+  const actionFunctions = [];
+  walk(ast, (node) => {
+    if (node.type === "Property" && propertyName(node) === "archiveThread") {
+      const idProperty = node.value?.type === "ObjectExpression"
+        ? node.value.properties.find((property) => propertyName(property) === "id")
+        : null;
+      if (literalValue(idProperty?.value) === "sidebarElectron.archiveThread") archiveMessages.push(node);
+    }
+    if (node.type === "FunctionDeclaration") {
+      const source = sourceFor(code, node);
+      if (source.includes("archive-conversation") && source.includes("copyConversationMarkdown")) {
+        actionFunctions.push(node);
+      }
+    }
+  });
+  if (archiveMessages.length !== 1) {
+    throw new Error(`sidebar messages expected exactly 1 target, found ${archiveMessages.length}`);
+  }
+  if (actionFunctions.length !== 1) {
+    throw new Error(`sidebar action expected exactly 1 target, found ${actionFunctions.length}`);
+  }
+
+  const actionFunction = actionFunctions[0];
+  const archiveCalls = [];
+  const resultObjects = [];
+  const returns = [];
+  walk(actionFunction, (node) => {
+    if (
+      node.type === "CallExpression" &&
+      node.callee.type === "Identifier" &&
+      literalValue(node.arguments[0]) === "archive-conversation"
+    ) archiveCalls.push(node);
+    if (node.type === "ObjectExpression") {
+      const names = node.properties.map(propertyName);
+      if (names.includes("archiveThread") && names.includes("copyConversationMarkdown")) {
+        resultObjects.push(node);
+      }
+    }
+    if (node.type === "ReturnStatement") returns.push(node);
+  });
+  if (archiveCalls.length !== 1 || resultObjects.length !== 1 || returns.length === 0) {
+    throw new Error("sidebar action structure is incomplete");
+  }
+  const sendFunction = archiveCalls[0].callee.name;
+  const finalReturn = returns.at(-1);
+  const messages =
+    ",deleteThread:{id:`sidebarElectron.deleteThread`,defaultMessage:`删除任务`,description:`Menu item to permanently delete a local task`}" +
+    ",deleteThreadConfirmAction:{id:`sidebarElectron.deleteThreadConfirmAction`,defaultMessage:`确认`,description:`Inline confirmation button label shown before permanently deleting a local task`}" +
+    ",deleteThreadError:{id:`sidebarElectron.deleteThreadError`,defaultMessage:`删除任务失败`,description:`Error message when permanently deleting a local task`}";
+  const action =
+    `${actionMarker}let CodexSidebarDeleteAction=e=>{let{conversationId:n,hostId:i,onDeleteStart:a,onDeleteSuccess:o,onDeleteError:s}=e;` +
+    `a?.(),${sendFunction}(\`delete-archived-conversation\`,{conversationId:n,hostId:i}).then(()=>o?.()).catch(()=>s?.())};`;
+  return {
+    code: applySourceReplacements(code, [
+      { start: archiveMessages[0].end, end: archiveMessages[0].end, text: messages },
+      { start: resultObjects[0].start + 1, end: resultObjects[0].start + 1, text: "deleteThread:CodexSidebarDeleteAction," },
+      { start: finalReturn.start, end: finalReturn.start, text: action },
+    ]),
+    status: "patched",
+    counts: {
+      messages: sidebarCount(1, 0, "sidebar messages"),
+      action: sidebarCount(1, 0, "sidebar action"),
+    },
+  };
+}
+
+function analyzeHoverFunction(code, node) {
+  const patterns = [];
+  const nullTests = [];
+  const formatCalls = [];
+  const actionRenders = [];
+  const returns = [];
+  walk(node, (inner) => {
+    if (inner.type === "ObjectPattern") {
+      const names = inner.properties.map(propertyName);
+      if (names.includes("archive") && names.includes("pinAction")) patterns.push(inner);
+    }
+    if (inner.type === "IfStatement" && sourceFor(code, inner.test).includes("==null")) {
+      nullTests.push(inner.test);
+    }
+    if (
+      inner.type === "CallExpression" &&
+      inner.callee.type === "MemberExpression" &&
+      inner.callee.property?.name === "formatMessage" &&
+      inner.arguments[0]?.type === "MemberExpression" &&
+      inner.arguments[0].property?.name === "archiveThread"
+    ) formatCalls.push(inner);
+    const jsxAlias = sequenceMemberAlias(inner, "jsx");
+    if (jsxAlias && inner.arguments[1]?.type === "ObjectExpression") {
+      const actions = inner.arguments[1].properties.find((property) => propertyName(property) === "actions");
+      const className = inner.arguments[1].properties.find((property) => propertyName(property) === "className");
+      if (actions?.value.type === "ArrayExpression" && className && inner.arguments[0]?.type === "Identifier") {
+        actionRenders.push({ call: inner, actions: actions.value, className: className.value, jsxAlias });
+      }
+    }
+    if (inner.type === "ReturnStatement") returns.push(inner);
+  });
+  if (
+    patterns.length !== 1 ||
+    nullTests.length !== 1 ||
+    formatCalls.length !== 1 ||
+    actionRenders.length !== 1 ||
+    returns.length === 0
+  ) throw new Error("sidebar hover action structure is incomplete");
+  const formatCall = formatCalls[0];
+  const render = actionRenders[0];
+  const spreadNames = render.actions.elements
+    .filter((element) => element?.type === "SpreadElement" && element.argument.type === "Identifier")
+    .map((element) => element.argument.name);
+  if (spreadNames.length !== 2) throw new Error("sidebar hover action lists are ambiguous");
+  const finalReturn = returns.at(-1);
+  const priorStatement = node.body.body[node.body.body.indexOf(finalReturn) - 1];
+  if (priorStatement?.type !== "VariableDeclaration") {
+    throw new Error("sidebar hover return cache structure is missing");
+  }
+  return {
+    pattern: patterns[0],
+    nullTest: nullTests[0],
+    intl: sourceFor(code, formatCall.callee.object),
+    messages: sourceFor(code, formatCall.arguments[0].object),
+    render,
+    spreadNames,
+    tailStart: priorStatement.start,
+    tailEnd: finalReturn.end,
+  };
+}
+
+function analyzeRowFunction(code, node, hoverFunctionName) {
+  const hookPatterns = [];
+  const stateDeclarations = [];
+  const archiveHandlers = [];
+  const archiveItems = [];
+  const hoverRenders = [];
+  const hoverCounts = [];
+  const useCallbacks = [];
+  walk(node, (inner) => {
+    if (inner.type === "VariableDeclarator" && inner.id.type === "ObjectPattern") {
+      const names = inner.id.properties.map(propertyName);
+      if (names.includes("archiveThread")) hookPatterns.push(inner.id);
+    }
+    if (
+      inner.type === "VariableDeclarator" &&
+      inner.id.type === "ArrayPattern" &&
+      sequenceMemberAlias(inner.init, "useState")
+    ) stateDeclarations.push(inner);
+    if (
+      inner.type === "VariableDeclarator" &&
+      (inner.init?.type === "ArrowFunctionExpression" || inner.init?.type === "FunctionExpression") &&
+      sourceFor(code, inner.init).includes("sidebar_context_menu")
+    ) archiveHandlers.push(inner);
+    if (inner.type === "ObjectExpression") {
+      const id = inner.properties.find((property) => propertyName(property) === "id");
+      if (literalValue(id?.value) === "archive-thread") archiveItems.push(inner);
+      const hoverCount = inner.properties.find(
+        (property) => propertyName(property) === "additionalHoverActionCount",
+      );
+      if (hoverCount) hoverCounts.push({ object: inner, property: hoverCount });
+    }
+    const jsxAlias = sequenceMemberAlias(inner, "jsx");
+    if (
+      jsxAlias &&
+      inner.arguments[0]?.type === "Identifier" &&
+      inner.arguments[0].name === hoverFunctionName &&
+      inner.arguments[1]?.type === "ObjectExpression"
+    ) hoverRenders.push(inner);
+    const reactAlias = sequenceMemberAlias(inner, "useCallback");
+    if (reactAlias && inner.arguments[1]?.type === "ArrayExpression") useCallbacks.push(inner);
+  });
+  if (
+    hookPatterns.length !== 1 ||
+    stateDeclarations.length < 1 ||
+    archiveHandlers.length !== 1 ||
+    archiveItems.length !== 1 ||
+    hoverRenders.length !== 1 ||
+    hoverCounts.length !== 1
+  ) throw new Error("sidebar row structure is incomplete");
+  const render = hoverRenders[0];
+  const callback = useCallbacks.find((call) =>
+    call.arguments[0] &&
+    render.start >= call.arguments[0].start &&
+    render.end <= call.arguments[0].end,
+  );
+  if (!callback) throw new Error("sidebar renderActions callback is missing");
+  const handler = archiveHandlers[0];
+  const archiveCall = [];
+  walk(handler.init, (inner) => {
+    if (inner.type !== "CallExpression") return;
+    const options = inner.arguments.find(
+      (argument) =>
+        argument?.type === "ObjectExpression" &&
+        argument.properties.some((property) => propertyName(property) === "conversationId"),
+    );
+    if (options) archiveCall.push({ call: inner, options });
+  });
+  if (archiveCall.length !== 1) throw new Error("sidebar archive handler call is ambiguous");
+  const archiveArgs = archiveCall[0].options;
+  const valueFor = (name) => {
+    const property = archiveArgs.properties.find((item) => propertyName(item) === name);
+    if (!property) throw new Error(`sidebar archive handler ${name} is missing`);
+    return sourceFor(code, property.value);
+  };
+  const archiveMessage = archiveItems[0].properties.find((property) => propertyName(property) === "message");
+  if (archiveMessage?.value.type !== "MemberExpression") {
+    throw new Error("sidebar archive message binding is missing");
+  }
+  return {
+    hookPattern: hookPatterns[0],
+    stateDeclaration: stateDeclarations[0],
+    handler,
+    archiveItem: archiveItems[0],
+    messageObject: sourceFor(code, archiveMessage.value.object),
+    hoverRender: render,
+    callbackDependencies: callback.arguments[1],
+    hoverCount: hoverCounts[0],
+    conversationId: valueFor("conversationId"),
+    hostId: valueFor("hostId"),
+    success: valueFor("onArchiveSuccess"),
+    error: valueFor("onArchiveError"),
+  };
+}
+
+function patchSidebarSource(code) {
+  const hoverMarker = "/* CodexSidebarDeleteHover */";
+  const rowMarker = "/* CodexSidebarDeleteRow */";
+  const hoverCount = countOccurrences(code, hoverMarker);
+  const rowCount = countOccurrences(code, rowMarker);
+  if (hoverCount > 0 || rowCount > 0) {
+    if (hoverCount !== 1) {
+      throw new Error(`sidebar hover expected exactly 1 target, found ${hoverCount}`);
+    }
+    if (rowCount !== 1) {
+      throw new Error(`sidebar row expected exactly 1 target, found ${rowCount}`);
+    }
+    if (
+      !code.includes("thread-delete-confirm-action") ||
+      !code.includes("id:`delete-thread`")
+    ) throw new Error("sidebar delete UI patch is only partially present");
+    return {
+      code,
+      status: "already",
+      counts: {
+        hover: sidebarCount(0, 1, "sidebar hover"),
+        row: sidebarCount(0, 1, "sidebar row"),
+      },
+    };
+  }
+
+  const ast = parseRequired(code, "sidebar UI");
+  const hoverFunctions = [];
+  const broadRowFunctions = [];
+  walk(ast, (node) => {
+    if (node.type !== "FunctionDeclaration") return;
+    const source = sourceFor(code, node);
+    if (source.includes("thread-primary-action") && source.includes(".archiveThread")) {
+      hoverFunctions.push(node);
+    }
+    if (source.includes("archive-thread") && source.includes("additionalHoverActionCount")) {
+      broadRowFunctions.push(node);
+    }
+  });
+  if (hoverFunctions.length !== 1) {
+    throw new Error(`sidebar hover expected exactly 1 target, found ${hoverFunctions.length}`);
+  }
+  const hoverFunction = hoverFunctions[0];
+  const rowFunctions = broadRowFunctions.filter((rowFunction) => {
+    let rendersHover = false;
+    let hasArchiveActionBinding = false;
+    walk(rowFunction, (node) => {
+      if (
+        sequenceMemberAlias(node, "jsx") &&
+        node.arguments[0]?.type === "Identifier" &&
+        node.arguments[0].name === hoverFunction.id.name
+      ) rendersHover = true;
+      if (node.type === "VariableDeclarator" && node.id.type === "ObjectPattern" && node.init) {
+        const names = node.id.properties.map(propertyName);
+        if (names.includes("archiveThread")) hasArchiveActionBinding = true;
+      }
+    });
+    return rendersHover && hasArchiveActionBinding;
+  });
+  if (rowFunctions.length !== 1) {
+    throw new Error(`sidebar row expected exactly 1 target, found ${rowFunctions.length}`);
+  }
+
+  const hover = analyzeHoverFunction(code, hoverFunction);
+  const rowFunction = rowFunctions[0];
+  const row = analyzeRowFunction(code, rowFunction, hoverFunction.id.name);
+  const renderComponent = sourceFor(code, hover.render.call.arguments[0]);
+  const className = sourceFor(code, hover.render.className);
+  const deleteActions =
+    `${hoverMarker}let CodexSidebarDeleteActions=CodexDeleteAction==null?[]:CodexDeleteAction.confirming?` +
+    `[{id:\`thread-delete-confirm-action\`,ariaLabel:${hover.intl}.formatMessage(${hover.messages}.deleteThreadConfirmAction),label:${hover.intl}.formatMessage(${hover.messages}.deleteThreadConfirmAction),buttonClassName:\`text-token-error-foreground hover:text-token-error-foreground\`,onClick:CodexDeleteAction.onConfirm}]:` +
+    `[{id:\`thread-delete-action\`,ariaLabel:${hover.intl}.formatMessage(${hover.messages}.deleteThread),label:${hover.intl}.formatMessage(${hover.messages}.deleteThread),buttonClassName:\`text-token-error-foreground hover:text-token-error-foreground\`,onClick:CodexDeleteAction.onRequest}];` +
+    `return(0,${hover.render.jsxAlias}.jsx)(${renderComponent},{actions:[...${hover.spreadNames[0]},...${hover.spreadNames[1]},...CodexSidebarDeleteActions],className:${className}})`;
+  const stateInit = sourceFor(code, row.stateDeclaration.init);
+  const handlers =
+    `,CodexRequestDelete=()=>{CodexSetDeleteConfirm(!0)},CodexConfirmDelete=()=>{CodexSetDeleteConfirm(!1),` +
+    `CodexDeleteThread({conversationId:${row.conversationId},hostId:${row.hostId},onDeleteSuccess:${row.success},onDeleteError:${row.error}})}`;
+  const renderObject = row.hoverRender.arguments[1];
+  const countValue = sourceFor(code, row.hoverCount.property.value);
+  const replacements = [
+    { start: hover.pattern.end - 1, end: hover.pattern.end - 1, text: ",deleteAction:CodexDeleteAction" },
+    {
+      start: hover.nullTest.start,
+      end: hover.nullTest.end,
+      text: `(${sourceFor(code, hover.nullTest)})&&CodexDeleteAction==null`,
+    },
+    { start: hover.tailStart, end: hover.tailEnd, text: deleteActions },
+    { start: rowFunction.body.start + 1, end: rowFunction.body.start + 1, text: rowMarker },
+    { start: row.hookPattern.end - 1, end: row.hookPattern.end - 1, text: ",deleteThread:CodexDeleteThread" },
+    {
+      start: row.stateDeclaration.end,
+      end: row.stateDeclaration.end,
+      text: `,[CodexDeleteConfirm,CodexSetDeleteConfirm]=${stateInit}`,
+    },
+    { start: row.handler.end, end: row.handler.end, text: handlers },
+    {
+      start: row.archiveItem.end,
+      end: row.archiveItem.end,
+      text: `,{id:\`delete-thread\`,message:${row.messageObject}.deleteThread,onSelect:CodexRequestDelete}`,
+    },
+    {
+      start: renderObject.end - 1,
+      end: renderObject.end - 1,
+      text: ",deleteAction:{confirming:CodexDeleteConfirm,onRequest:CodexRequestDelete,onConfirm:CodexConfirmDelete}",
+    },
+    {
+      start: row.callbackDependencies.end - 1,
+      end: row.callbackDependencies.end - 1,
+      text: ",CodexDeleteConfirm,CodexRequestDelete,CodexConfirmDelete",
+    },
+    {
+      start: row.hoverCount.property.value.start,
+      end: row.hoverCount.property.value.end,
+      text: `(${countValue})+1`,
+    },
+    {
+      start: row.hoverCount.object.end - 1,
+      end: row.hoverCount.object.end - 1,
+      text: ",onMouseLeave:()=>CodexSetDeleteConfirm(!1)",
+    },
+  ];
+  return {
+    code: applySourceReplacements(code, replacements),
+    status: "patched",
+    counts: {
+      hover: sidebarCount(1, 0, "sidebar hover"),
+      row: sidebarCount(1, 0, "sidebar row"),
+    },
+  };
+}
+
+function patchSidebarContracts({ threadActionsSource, sidebarSource }) {
+  if (typeof threadActionsSource !== "string") throw new Error("sidebar thread-actions source is required");
+  if (typeof sidebarSource !== "string") throw new Error("sidebar source is required");
+  const threadActions = patchThreadActionsSource(threadActionsSource);
+  const sidebar = patchSidebarSource(sidebarSource);
+  return {
+    status: threadActions.status === "already" && sidebar.status === "already" ? "already" : "patched",
+    threadActions,
+    sidebar,
+  };
+}
+
+function findExactSidebarAsset(platform, pattern, label) {
+  const directory = path.join(SRC_DIR, platform, "_asar", "webview", "assets");
+  if (!fs.existsSync(directory)) throw new Error(`${label} directory is missing for ${platform}`);
+  const matches = fs.readdirSync(directory).filter((fileName) => pattern.test(fileName));
+  if (matches.length !== 1) {
+    throw new Error(`${label} expected exactly 1 bundle for ${platform}, found ${matches.length}`);
+  }
+  return path.join(directory, matches[0]);
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  const isCheck = args.includes("--check");
+  const platform = args.find((arg) => ["mac-arm64", "mac-x64", "win"].includes(arg));
+  const platforms = platform
+    ? [platform]
+    : ["mac-arm64", "mac-x64", "win"].filter((name) =>
+        fs.existsSync(path.join(SRC_DIR, name, "_asar")),
+      );
+  if (platforms.length === 0) throw new Error("sidebar-delete expected at least one platform");
+  const plans = platforms.map((platformName) => {
+    const threadActionsPath = findExactSidebarAsset(
+      platformName,
+      /^thread-actions-.*\.js$/,
+      "sidebar thread-actions",
+    );
+    const sidebarPath = findExactSidebarAsset(
+      platformName,
+      /^sidebar-flat-sections-.*\.js$/,
+      "sidebar-flat-sections",
+    );
+    const threadActionsSource = fs.readFileSync(threadActionsPath, "utf-8");
+    const sidebarSource = fs.readFileSync(sidebarPath, "utf-8");
+    return {
+      platform: platformName,
+      threadActionsPath,
+      sidebarPath,
+      threadActionsSource,
+      sidebarSource,
+      result: patchSidebarContracts({ threadActionsSource, sidebarSource }),
+    };
+  });
+  for (const plan of plans) {
+    console.log(`  [${plan.platform}] ${isCheck ? "check" : plan.result.status}: thread=${JSON.stringify(plan.result.threadActions.counts)} sidebar=${JSON.stringify(plan.result.sidebar.counts)}`);
+  }
+  if (!isCheck) {
+    for (const plan of plans) {
+      if (plan.result.threadActions.code !== plan.threadActionsSource) {
+        fs.writeFileSync(plan.threadActionsPath, plan.result.threadActions.code, "utf-8");
+      }
+      if (plan.result.sidebar.code !== plan.sidebarSource) {
+        fs.writeFileSync(plan.sidebarPath, plan.result.sidebar.code, "utf-8");
+      }
+    }
+  }
+  console.log(`  [done] sidebar-delete contracts satisfied for ${plans.length} platform(s)`);
+}
+
+if (require.main === module) main();
+
+module.exports = { patchThreadActionsSource, patchSidebarSource, patchSidebarContracts };
