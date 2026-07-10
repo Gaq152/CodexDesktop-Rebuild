@@ -4,7 +4,17 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const PLATFORM = {
-  win: { suffix: "win32-x64", target: "x86_64-pc-windows-msvc" },
+  win: {
+    suffix: "win32-x64",
+    target: "x86_64-pc-windows-msvc",
+    requiredBasenames: [
+      "codex.exe",
+      "codex-code-mode-host.exe",
+      "rg.exe",
+      "codex-command-runner.exe",
+      "codex-windows-sandbox-setup.exe",
+    ],
+  },
   "mac-arm64": { suffix: "darwin-arm64", target: "aarch64-apple-darwin" },
   "mac-x64": { suffix: "darwin-x64", target: "x86_64-apple-darwin" },
   "linux-arm64": { suffix: "linux-arm64", target: "aarch64-unknown-linux-musl" },
@@ -139,6 +149,13 @@ function collectRegularFiles(directory, targetRoot, label, assets) {
   }
 }
 
+function missingRequiredAssetError(version, targetRoot, basename, cause) {
+  const detail = cause ? `: ${cause.message}` : "";
+  return new Error(
+    `Official Codex ${version} runtime at ${targetRoot} is missing required Windows runtime asset ${JSON.stringify(basename)}${detail}`,
+  );
+}
+
 function resolveCodexRuntime(projectRoot, platform) {
   const platformDefinition = PLATFORM[platform];
   if (!platformDefinition) {
@@ -216,7 +233,20 @@ function resolveCodexRuntime(projectRoot, platform) {
     );
   }
 
-  const entrypoint = resolveManifestPath(targetRoot, manifest.entrypoint, "entrypoint", "regular file");
+  let entrypoint;
+  try {
+    entrypoint = resolveManifestPath(targetRoot, manifest.entrypoint, "entrypoint", "regular file");
+  } catch (error) {
+    const entrypointBasename =
+      typeof manifest.entrypoint === "string" ? path.basename(manifest.entrypoint) : null;
+    if (
+      platformDefinition.requiredBasenames?.includes(entrypointBasename) &&
+      /entrypoint must (?:reference a regular file|not be a symlink)/.test(error.message)
+    ) {
+      throw missingRequiredAssetError(version, targetRoot, entrypointBasename, error);
+    }
+    throw error;
+  }
   const entrypointDir = requireDirectory(path.dirname(entrypoint), "entrypoint directory");
   const pathDir = resolveManifestPath(targetRoot, manifest.pathDir, "pathDir", "directory");
   const resourcesDir = resolveManifestPath(
@@ -236,6 +266,12 @@ function resolveCodexRuntime(projectRoot, platform) {
   }
   if (!assets.has(entrypoint)) {
     throw new Error(`entrypoint was not collected as a regular runtime asset: ${entrypoint}`);
+  }
+  const assetBasenames = new Set([...assets].map((asset) => path.basename(asset)));
+  for (const requiredBasename of platformDefinition.requiredBasenames || []) {
+    if (!assetBasenames.has(requiredBasename)) {
+      throw missingRequiredAssetError(version, targetRoot, requiredBasename);
+    }
   }
 
   return {

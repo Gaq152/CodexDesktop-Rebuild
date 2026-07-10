@@ -342,6 +342,31 @@ test("collects the official Windows asset set once in stable order", (t) => {
   );
 });
 
+for (const requiredBasename of [
+  "codex.exe",
+  "codex-code-mode-host.exe",
+  "rg.exe",
+  "codex-command-runner.exe",
+  "codex-windows-sandbox-setup.exe",
+]) {
+  test(`rejects a Windows runtime missing required asset ${requiredBasename}`, (t) => {
+    const project = createProject(t);
+    const fixture = createOfficialLayout(project);
+    const relativeFile = FIXTURES.win.files.find(
+      (file) => path.basename(file) === requiredBasename,
+    );
+    assert.ok(relativeFile, `fixture must contain ${requiredBasename}`);
+    fs.rmSync(path.join(fixture.targetRoot, relativeFile));
+
+    assert.throws(
+      () => resolveCodexRuntime(project.root, "win"),
+      (error) =>
+        /missing required Windows runtime asset/.test(error.message) &&
+        error.message.includes(requiredBasename),
+    );
+  });
+}
+
 test("copies assets flat and overwrites stale destination files", (t) => {
   const project = createProject(t);
   const fixture = createOfficialLayout(project);
