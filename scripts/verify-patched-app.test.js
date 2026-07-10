@@ -315,6 +315,55 @@ test("plugin filter context does not cross a shadowed selector binding", (t) => 
   );
 });
 
+test("plugin default Object.keys resolves the same block binding", (t) => {
+  const fixture = createFixture(t);
+  const pluginMarker = MARKERS.find(
+    (marker) => marker.id === "plugin-availability",
+  );
+  writeText(
+    path.join(fixture.asarRoot, ".vite", "build", "main-features.js"),
+    [
+      "const desktopFeatures = { browserPane:!0, inAppBrowserUse:!0, inAppBrowserUseAllowed:!0, externalBrowserUse:!0, externalBrowserUseAllowed:!0, computerUse:!0, computerUseNodeRepl:!0, control:!0, multiWindow:!0 };",
+      "{",
+      "  const desktopFeatures = { browserPane:!1, inAppBrowserUse:!1, inAppBrowserUseAllowed:!1, externalBrowserUse:!1, externalBrowserUseAllowed:!1, computerUse:!1, computerUseNodeRepl:!1, control:!1, multiWindow:!1 };",
+      "  const desktopFeatureKeys = Object.keys(desktopFeatures);",
+      "}",
+      pluginMarker.text,
+    ].join("\n"),
+  );
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("plugin"),
+  );
+});
+
+test("plugin filter checks every intermediate selector scope", (t) => {
+  const fixture = createFixture(t, { omitMarkers: ["plugin-availability"] });
+  writeText(
+    path.join(fixture.asarRoot, ".vite", "build", "main-features.js"),
+    [
+      "function decoySetup(features) {",
+      "  const selectBundledPlugins = current => bundledPlugins.filter(()=>!0);",
+      "  function intermediate(selectBundledPlugins) {",
+      "    return function grandchild() {",
+      "      const descriptors = selectBundledPlugins(features);",
+      "      logger.info(`bundled_plugins_reconcile_started`);",
+      "      return install({ marketplacePluginDescriptors:descriptors });",
+      "    };",
+      "  }",
+      "  return intermediate;",
+      "}",
+    ].join("\n"),
+    true,
+  );
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("plugin"),
+  );
+});
+
 test("updater requires the titlebar marker in webview assets", (t) => {
   const fixture = createFixture(t, { omitMarkers: ["updater-titlebar"] });
   writeText(

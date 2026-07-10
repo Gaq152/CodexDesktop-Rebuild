@@ -165,16 +165,139 @@ function isAlwaysTrue(node) {
   );
 }
 
-function collectScopes(ast) {
-  const scopes = [ast];
-  walk(ast, (node) => {
-    if (isFunctionNode(node)) scopes.push(node);
-  });
-  return scopes;
+function bindingIdentifiers(pattern, identifiers = []) {
+  if (!pattern) return identifiers;
+  if (pattern.type === "Identifier") identifiers.push(pattern);
+  else if (pattern.type === "AssignmentPattern") {
+    bindingIdentifiers(pattern.left, identifiers);
+  } else if (pattern.type === "RestElement") {
+    bindingIdentifiers(pattern.argument, identifiers);
+  } else if (pattern.type === "ArrayPattern") {
+    for (const element of pattern.elements) bindingIdentifiers(element, identifiers);
+  } else if (pattern.type === "ObjectPattern") {
+    for (const property of pattern.properties) {
+      bindingIdentifiers(
+        property.type === "RestElement" ? property.argument : property.value,
+        identifiers,
+      );
+    }
+  }
+  return identifiers;
 }
 
-function isObjectKeysCallFor(node, bindingName) {
-  return (
+function buildLexicalModel(ast) {
+  const scopeByNode = new WeakMap();
+  const bindingByDeclaration = new WeakMap();
+
+  function makeScope(kind, node, parent) {
+    return { kind, node, parent, bindings: new Map() };
+  }
+
+  const programScope = makeScope("program", ast, null);
+
+  function declarePattern(pattern, scope) {
+    for (const identifier of bindingIdentifiers(pattern)) {
+      let binding = scope.bindings.get(identifier.name);
+      if (!binding) {
+        binding = { name: identifier.name, scope };
+        scope.bindings.set(identifier.name, binding);
+      }
+      bindingByDeclaration.set(identifier, binding);
+      scopeByNode.set(identifier, scope);
+    }
+  }
+
+  function nearestVarScope(scope) {
+    let current = scope;
+    while (current.kind === "block") current = current.parent;
+    return current;
+  }
+
+  function visitChildren(node, scope) {
+    for (const [key, child] of Object.entries(node)) {
+      if (key === "type" || key === "start" || key === "end") continue;
+      if (Array.isArray(child)) {
+        for (const item of child) visit(item, scope);
+      } else {
+        visit(child, scope);
+      }
+    }
+  }
+
+  function visitFunction(node, parentScope) {
+    if (node.type === "FunctionDeclaration" && node.id) {
+      declarePattern(node.id, parentScope);
+    }
+    const functionScope = makeScope("function", node, parentScope);
+    scopeByNode.set(node, functionScope);
+    if (node.type === "FunctionExpression" && node.id) {
+      declarePattern(node.id, functionScope);
+    }
+    for (const parameter of node.params) declarePattern(parameter, functionScope);
+    if (node.body?.type === "BlockStatement") {
+      scopeByNode.set(node.body, functionScope);
+      for (const statement of node.body.body) visit(statement, functionScope);
+    } else {
+      visit(node.body, functionScope);
+    }
+  }
+
+  function visit(node, scope) {
+    if (!node || typeof node !== "object") return;
+    scopeByNode.set(node, scope);
+    if (isFunctionNode(node)) {
+      visitFunction(node, scope);
+      return;
+    }
+    if (node.type === "BlockStatement") {
+      const blockScope = makeScope("block", node, scope);
+      scopeByNode.set(node, blockScope);
+      for (const statement of node.body) visit(statement, blockScope);
+      return;
+    }
+    if (node.type === "VariableDeclaration") {
+      const declarationScope =
+        node.kind === "var" ? nearestVarScope(scope) : scope;
+      for (const declaration of node.declarations) {
+        scopeByNode.set(declaration, scope);
+        declarePattern(declaration.id, declarationScope);
+        visit(declaration.init, scope);
+      }
+      return;
+    }
+    visitChildren(node, scope);
+  }
+
+  scopeByNode.set(ast, programScope);
+  for (const statement of ast.body) visit(statement, programScope);
+
+  function resolve(identifier) {
+    if (identifier?.type !== "Identifier") return null;
+    let scope = scopeByNode.get(identifier);
+    while (scope) {
+      const binding = scope.bindings.get(identifier.name);
+      if (binding) return binding;
+      scope = scope.parent;
+    }
+    return null;
+  }
+
+  function nearestFunctionScope(node) {
+    let scope = scopeByNode.get(node);
+    while (scope?.kind === "block") scope = scope.parent;
+    return scope ?? null;
+  }
+
+  return {
+    bindingForDeclaration: (identifier) =>
+      bindingByDeclaration.get(identifier) ?? null,
+    nearestFunctionScope,
+    resolve,
+  };
+}
+
+function objectKeysArgument(node) {
+  if (
     node?.type === "CallExpression" &&
     node.callee?.type === "MemberExpression" &&
     !node.callee.computed &&
@@ -183,28 +306,18 @@ function isObjectKeysCallFor(node, bindingName) {
     node.callee.property?.type === "Identifier" &&
     node.callee.property.name === "keys" &&
     node.arguments.length === 1 &&
-    node.arguments[0]?.type === "Identifier" &&
-    node.arguments[0].name === bindingName
-  );
-}
-
-function scopeUsesDefaultFeatureKeys(scope, bindingName) {
-  let found = false;
-  walk(
-    scope,
-    (node) => {
-      if (isObjectKeysCallFor(node, bindingName)) found = true;
-    },
-    scope,
-  );
-  return found;
+    node.arguments[0]?.type === "Identifier"
+  ) {
+    return node.arguments[0];
+  }
+  return null;
 }
 
 function hasPatchedDesktopFeatureDefaults(source) {
   if (
     !source.includes("browserPane") ||
     !source.includes("computerUse") ||
-    !source.includes("!0")
+    !source.includes("Object.keys")
   ) {
     return false;
   }
@@ -216,37 +329,33 @@ function hasPatchedDesktopFeatureDefaults(source) {
     return false;
   }
 
-  return collectScopes(ast).some((scope) => {
-    let found = false;
-    walk(
-      scope,
-      (node) => {
-        if (
-          found ||
-          node.type !== "VariableDeclarator" ||
-          node.id?.type !== "Identifier" ||
-          node.init?.type !== "ObjectExpression"
-        ) {
-          return;
-        }
-        const properties = new Map();
-        for (const property of node.init.properties) {
-          const name = propertyName(property);
-          if (name) properties.set(name, property.value);
-        }
-        if (
-          [...FEATURE_DEFAULT_KEYS].every((name) =>
-            isAlwaysTrue(properties.get(name)),
-          ) &&
-          scopeUsesDefaultFeatureKeys(scope, node.id.name)
-        ) {
-          found = true;
-        }
-      },
-      scope,
-    );
-    return found;
+  const model = buildLexicalModel(ast);
+  const candidates = new Set();
+  const keyUses = [];
+  walk(ast, (node) => {
+    if (
+      node.type === "VariableDeclarator" &&
+      node.id?.type === "Identifier" &&
+      node.init?.type === "ObjectExpression"
+    ) {
+      const properties = new Map();
+      for (const property of node.init.properties) {
+        const name = propertyName(property);
+        if (name) properties.set(name, property.value);
+      }
+      if (
+        [...FEATURE_DEFAULT_KEYS].every((name) =>
+          isAlwaysTrue(properties.get(name)),
+        )
+      ) {
+        candidates.add(model.bindingForDeclaration(node.id));
+      }
+    }
+    const argument = objectKeysArgument(node);
+    if (argument) keyUses.push(argument);
   });
+  candidates.delete(null);
+  return keyUses.some((identifier) => candidates.has(model.resolve(identifier)));
 }
 
 function memberPropertyName(member) {
@@ -273,126 +382,12 @@ function isAlwaysTrueFilterCall(node) {
   );
 }
 
-function containsBundledReconcileStartCall(node) {
-  let found = false;
-  walk(node, (child) => {
-    if (
-      child.type === "CallExpression" &&
-      memberPropertyName(child.callee) === "info" &&
-      stringValue(child.arguments[0]) === "bundled_plugins_reconcile_started"
-    ) {
-      found = true;
-    }
-  });
-  return found;
-}
-
-function directSelectorBindings(functionNode) {
-  const bindings = [];
-  walk(
-    functionNode,
-    (node) => {
-      if (
-        node.type === "VariableDeclarator" &&
-        node.id?.type === "Identifier" &&
-        node.init?.type === "ArrowFunctionExpression" &&
-        isAlwaysTrueFilterCall(node.init.body)
-      ) {
-        bindings.push(node.id.name);
-      }
-    },
-    functionNode,
+function isBundledReconcileStartCall(node) {
+  return (
+    node?.type === "CallExpression" &&
+    memberPropertyName(node.callee) === "info" &&
+    stringValue(node.arguments[0]) === "bundled_plugins_reconcile_started"
   );
-  return bindings;
-}
-
-function descendantFunctionScopes(functionNode) {
-  const scopes = [functionNode];
-  walk(functionNode, (node) => {
-    if (node !== functionNode && isFunctionNode(node)) scopes.push(node);
-  });
-  return scopes;
-}
-
-function patternBindsName(pattern, bindingName) {
-  if (!pattern) return false;
-  if (pattern.type === "Identifier") return pattern.name === bindingName;
-  if (pattern.type === "AssignmentPattern") {
-    return patternBindsName(pattern.left, bindingName);
-  }
-  if (pattern.type === "RestElement") {
-    return patternBindsName(pattern.argument, bindingName);
-  }
-  if (pattern.type === "ArrayPattern") {
-    return pattern.elements.some((element) =>
-      patternBindsName(element, bindingName),
-    );
-  }
-  if (pattern.type === "ObjectPattern") {
-    return pattern.properties.some((property) =>
-      property.type === "RestElement"
-        ? patternBindsName(property.argument, bindingName)
-        : patternBindsName(property.value, bindingName),
-    );
-  }
-  return false;
-}
-
-function scopeShadowsBinding(scope, bindingName) {
-  if (
-    (scope.id?.type === "Identifier" && scope.id.name === bindingName) ||
-    scope.params?.some((param) => patternBindsName(param, bindingName))
-  ) {
-    return true;
-  }
-
-  let found = false;
-  walk(
-    scope,
-    (node) => {
-      if (
-        node.type === "VariableDeclarator" &&
-        patternBindsName(node.id, bindingName)
-      ) {
-        found = true;
-      }
-    },
-    scope,
-  );
-  return found;
-}
-
-function bindingFeedsMarketplaceDescriptors(scope, selectorName) {
-  const resultBindings = new Set();
-  walk(
-    scope,
-    (node) => {
-      if (
-        node.type === "VariableDeclarator" &&
-        node.id?.type === "Identifier" &&
-        node.init?.type === "CallExpression" &&
-        node.init.callee?.type === "Identifier" &&
-        node.init.callee.name === selectorName
-      ) {
-        resultBindings.add(node.id.name);
-      }
-    },
-    scope,
-  );
-  if (resultBindings.size === 0) return false;
-
-  let found = false;
-  walk(scope, (node) => {
-    if (
-      node.type === "Property" &&
-      propertyName(node) === "marketplacePluginDescriptors" &&
-      node.value?.type === "Identifier" &&
-      resultBindings.has(node.value.name)
-    ) {
-      found = true;
-    }
-  });
-  return found && containsBundledReconcileStartCall(scope);
 }
 
 function hasPatchedBundledPluginFilter(source) {
@@ -411,22 +406,50 @@ function hasPatchedBundledPluginFilter(source) {
     return false;
   }
 
+  const model = buildLexicalModel(ast);
+  const selectorBindings = new Set();
+  const resultBindings = new Set();
+  const reconcileScopes = new Set();
+
+  walk(ast, (node) => {
+    if (
+      node.type === "VariableDeclarator" &&
+      node.id?.type === "Identifier" &&
+      node.init?.type === "ArrowFunctionExpression" &&
+      isAlwaysTrueFilterCall(node.init.body)
+    ) {
+      selectorBindings.add(model.bindingForDeclaration(node.id));
+    }
+    if (isBundledReconcileStartCall(node)) {
+      reconcileScopes.add(model.nearestFunctionScope(node));
+    }
+  });
+  selectorBindings.delete(null);
+
+  walk(ast, (node) => {
+    if (
+      node.type === "VariableDeclarator" &&
+      node.id?.type === "Identifier" &&
+      node.init?.type === "CallExpression" &&
+      node.init.callee?.type === "Identifier" &&
+      selectorBindings.has(model.resolve(node.init.callee))
+    ) {
+      resultBindings.add(model.bindingForDeclaration(node.id));
+    }
+  });
+  resultBindings.delete(null);
+
   let found = false;
   walk(ast, (node) => {
     if (
-      found ||
-      !isFunctionNode(node) ||
-      !containsBundledReconcileStartCall(node)
+      node.type === "Property" &&
+      propertyName(node) === "marketplacePluginDescriptors" &&
+      node.value?.type === "Identifier" &&
+      resultBindings.has(model.resolve(node.value)) &&
+      reconcileScopes.has(model.nearestFunctionScope(node))
     ) {
-      return;
+      found = true;
     }
-    const scopes = descendantFunctionScopes(node);
-    found = directSelectorBindings(node).some((selectorName) =>
-      scopes.some((scope) =>
-        (scope === node || !scopeShadowsBinding(scope, selectorName)) &&
-        bindingFeedsMarketplaceDescriptors(scope, selectorName),
-      ),
-    );
   });
   return found;
 }
