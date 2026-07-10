@@ -317,6 +317,44 @@ function walkArchive(node, visitor) {
   }
 }
 
+function isArchiveFunction(node) {
+  return ["ArrowFunctionExpression", "FunctionDeclaration", "FunctionExpression"].includes(
+    node?.type,
+  );
+}
+
+function walkArchiveWithAncestors(node, visitor, ancestors = []) {
+  if (!node || typeof node !== "object") return;
+  if (node.type) visitor(node, ancestors);
+  const nextAncestors = node.type ? [...ancestors, node] : ancestors;
+  for (const [key, child] of Object.entries(node)) {
+    if (key === "type" || key === "start" || key === "end") continue;
+    if (Array.isArray(child)) {
+      for (const item of child) walkArchiveWithAncestors(item, visitor, nextAncestors);
+    } else {
+      walkArchiveWithAncestors(child, visitor, nextAncestors);
+    }
+  }
+}
+
+function walkOwnArchiveFunction(root, visitor) {
+  function visit(node, ancestors) {
+    if (!node || typeof node !== "object") return;
+    if (node !== root && isArchiveFunction(node)) return;
+    if (node.type) visitor(node, ancestors);
+    const nextAncestors = node.type ? [...ancestors, node] : ancestors;
+    for (const [key, child] of Object.entries(node)) {
+      if (key === "type" || key === "start" || key === "end") continue;
+      if (Array.isArray(child)) {
+        for (const item of child) visit(item, nextAncestors);
+      } else {
+        visit(child, nextAncestors);
+      }
+    }
+  }
+  visit(root, []);
+}
+
 function archiveLiteral(node) {
   if (node?.type === "Literal") return node.value;
   if (node?.type === "TemplateLiteral" && node.expressions.length === 0) {
@@ -349,7 +387,11 @@ function objectPatternBinding(pattern, name) {
 
 function callbackForWrappedRoute(property) {
   const value = property?.value;
-  if (value?.type !== "CallExpression" || value.arguments.length !== 1) return null;
+  if (
+    value?.type !== "CallExpression" ||
+    value.callee.type !== "Identifier" ||
+    value.arguments.length !== 1
+  ) return null;
   const callback = value.arguments[0];
   if (
     callback?.type !== "ArrowFunctionExpression" &&
@@ -359,37 +401,101 @@ function callbackForWrappedRoute(property) {
 }
 
 function directCallbackCalls(callback) {
-  const calls = [];
-  function visit(node) {
-    if (!node || typeof node !== "object") return;
-    if (node !== callback && ["ArrowFunctionExpression", "FunctionExpression", "FunctionDeclaration"].includes(node.type)) return;
-    if (node.type === "CallExpression") calls.push(node);
-    for (const [key, child] of Object.entries(node)) {
-      if (key === "type" || key === "start" || key === "end") continue;
-      if (Array.isArray(child)) child.forEach(visit);
-      else visit(child);
+  const expressions = [];
+  if (callback.body.type === "BlockStatement") {
+    for (const statement of callback.body.body) {
+      if (statement.type === "ExpressionStatement") expressions.push(statement.expression);
+      if (statement.type === "ReturnStatement" && statement.argument) expressions.push(statement.argument);
     }
+  } else {
+    expressions.push(callback.body);
   }
-  visit(callback.body);
-  return calls;
+  return expressions
+    .map((expression) => {
+      let current = expression;
+      while (["AwaitExpression", "ChainExpression"].includes(current?.type)) {
+        current = current.argument ?? current.expression;
+      }
+      return current?.type === "CallExpression" ? current : null;
+    })
+    .filter(Boolean);
+}
+
+function assignedArchiveIdentifier(node, ancestors) {
+  const parent = ancestors.at(-1);
+  if (parent?.type === "VariableDeclarator" && parent.init === node && parent.id.type === "Identifier") {
+    return parent.id.name;
+  }
+  if (
+    parent?.type === "AssignmentExpression" &&
+    parent.operator === "=" &&
+    parent.right === node &&
+    parent.left.type === "Identifier"
+  ) {
+    return parent.left.name;
+  }
+  return null;
+}
+
+function isLiveArchiveRouter(ast, ancestors) {
+  const routeObject = ancestors.at(-1);
+  if (routeObject?.type !== "ObjectExpression") return false;
+  const binding = assignedArchiveIdentifier(routeObject, ancestors.slice(0, -1));
+  if (!binding) return false;
+  const consumers = [];
+  walkArchive(ast, (node) => {
+    if (
+      node.type !== "CallExpression" ||
+      node.callee.type !== "MemberExpression" ||
+      (node.callee.property?.name ?? archiveLiteral(node.callee.property)) !== "setMessageHandler" ||
+      node.arguments.length !== 1 ||
+      !isArchiveFunction(node.arguments[0])
+    ) return;
+    const handler = node.arguments[0];
+    const routeKey = handler.params[0]?.type === "Identifier" ? handler.params[0].name : null;
+    if (!routeKey || handler.params.some((param) => param.type === "Identifier" && param.name === binding)) {
+      return;
+    }
+    const dispatches = [];
+    let shadowed = false;
+    walkOwnArchiveFunction(handler, (inner) => {
+      if (
+        inner.type === "VariableDeclarator" &&
+        inner.id.type === "Identifier" &&
+        inner.id.name === binding
+      ) shadowed = true;
+      if (
+        inner.type === "CallExpression" &&
+        inner.callee.type === "MemberExpression" &&
+        inner.callee.computed &&
+        inner.callee.object.type === "Identifier" &&
+        inner.callee.object.name === binding &&
+        inner.callee.property.type === "Identifier" &&
+        inner.callee.property.name === routeKey
+      ) dispatches.push(inner);
+    });
+    if (!shadowed && dispatches.length === 1) consumers.push(node);
+  });
+  return consumers.length === 1;
 }
 
 function inspectArchiveAppMainSource(source) {
   const ast = parseArchiveSource(source, "archive app-main");
   const properties = { native: [], legacy: [] };
   const tokens = { native: 0, legacy: 0 };
-  walkArchive(ast, (node) => {
+  walkArchiveWithAncestors(ast, (node, ancestors) => {
     const value = archiveLiteral(node);
     if (value === "delete-archived-conversation") tokens.native += 1;
     if (value === "delete-conversation") tokens.legacy += 1;
     if (node.type !== "Property") return;
     const name = archivePropertyName(node);
-    if (name === "delete-archived-conversation") properties.native.push(node);
-    if (name === "delete-conversation") properties.legacy.push(node);
+    if (name === "delete-archived-conversation") properties.native.push({ property: node, ancestors });
+    if (name === "delete-conversation") properties.legacy.push({ property: node, ancestors });
   });
-  const native = properties.native.filter((property) => {
+  const native = properties.native.filter(({ property, ancestors }) => {
     const callback = callbackForWrappedRoute(property);
     if (!callback || callback.params.length !== 2 || callback.params[0].type !== "Identifier") return false;
+    if (!isLiveArchiveRouter(ast, ancestors)) return false;
     const manager = callback.params[0].name;
     const conversationId = objectPatternBinding(callback.params[1], "conversationId");
     if (!conversationId) return false;
@@ -406,9 +512,10 @@ function inspectArchiveAppMainSource(source) {
     );
     return calls.length === 1;
   });
-  const legacy = properties.legacy.filter((property) => {
+  const legacy = properties.legacy.filter(({ property, ancestors }) => {
     const callback = callbackForWrappedRoute(property);
     if (!callback || callback.params.length !== 2 || callback.params[0].type !== "Identifier") return false;
+    if (!isLiveArchiveRouter(ast, ancestors)) return false;
     const manager = callback.params[0].name;
     const conversationId = objectPatternBinding(callback.params[1], "conversationId");
     if (!conversationId) return false;
@@ -491,6 +598,205 @@ function patchAppMainSource(source) {
   };
 }
 
+function archiveObjectProperty(object, name) {
+  if (object?.type !== "ObjectExpression") return null;
+  return object.properties.find(
+    (property) => property.type === "Property" && archivePropertyName(property) === name,
+  );
+}
+
+function archiveStaticBoolean(node) {
+  if (node?.type === "Literal" && typeof node.value === "boolean") return node.value;
+  if (
+    node?.type === "UnaryExpression" &&
+    node.operator === "!" &&
+    node.argument?.type === "Literal"
+  ) return !node.argument.value;
+  return null;
+}
+
+function walkExecutableArchiveFunction(root, visitor) {
+  function visit(node, owner, parent, ancestors) {
+    if (!node || typeof node !== "object") return;
+    let activeOwner = owner;
+    if (node !== root && isArchiveFunction(node)) {
+      const isMappedCallback =
+        parent?.type === "CallExpression" &&
+        parent.arguments.includes(node) &&
+        parent.callee.type === "MemberExpression" &&
+        (parent.callee.property?.name ?? archiveLiteral(parent.callee.property)) === "map";
+      if (!isMappedCallback) return;
+      activeOwner = node;
+    }
+    if (node.type) visitor(node, activeOwner, ancestors);
+    const nextAncestors = node.type ? [...ancestors, node] : ancestors;
+    if (node.type === "IfStatement") {
+      const value = archiveStaticBoolean(node.test);
+      visit(node.test, activeOwner, node, nextAncestors);
+      if (value !== false) visit(node.consequent, activeOwner, node, nextAncestors);
+      if (value !== true) visit(node.alternate, activeOwner, node, nextAncestors);
+      return;
+    }
+    if (node.type === "ConditionalExpression") {
+      const value = archiveStaticBoolean(node.test);
+      visit(node.test, activeOwner, node, nextAncestors);
+      if (value !== false) visit(node.consequent, activeOwner, node, nextAncestors);
+      if (value !== true) visit(node.alternate, activeOwner, node, nextAncestors);
+      return;
+    }
+    for (const [key, child] of Object.entries(node)) {
+      if (key === "type" || key === "start" || key === "end") continue;
+      if (Array.isArray(child)) {
+        for (const item of child) visit(item, activeOwner, node, nextAncestors);
+      } else {
+        visit(child, activeOwner, node, nextAncestors);
+      }
+    }
+  }
+  visit(root, root, null, []);
+}
+
+function archiveFunctionParameterNames(fn) {
+  return new Set(
+    fn.params.filter((param) => param.type === "Identifier").map((param) => param.name),
+  );
+}
+
+function archiveExpressionReferencesParameter(expression, fn) {
+  const parameters = archiveFunctionParameterNames(fn);
+  let found = false;
+  walkArchive(expression, (node) => {
+    if (node.type === "Identifier" && parameters.has(node.name)) found = true;
+  });
+  return found;
+}
+
+function collectExecutableArchiveEvidence(fn) {
+  const calls = [];
+  const confirmMembers = [];
+  const returns = [];
+  walkExecutableArchiveFunction(fn, (node, owner) => {
+    if (node.type === "CallExpression") calls.push({ call: node, owner });
+    if (
+      node.type === "MemberExpression" &&
+      (node.property?.name ?? archiveLiteral(node.property)) === "codexConfirmDelete"
+    ) confirmMembers.push(node);
+    if (node.type === "ReturnStatement") returns.push(node);
+  });
+  return { calls, confirmMembers, returns };
+}
+
+function nativeArchiveRouteDetail(entry) {
+  const { call, owner } = entry;
+  if (
+    call.callee.type !== "Identifier" ||
+    archiveLiteral(call.arguments[0]) !== "delete-archived-conversation" ||
+    call.arguments[1]?.type !== "ObjectExpression"
+  ) return null;
+  const conversationId = archiveObjectProperty(call.arguments[1], "conversationId")?.value;
+  if (!conversationId || !archiveExpressionReferencesParameter(conversationId, owner)) return null;
+  return { ...entry, callee: call.callee.name, conversationId };
+}
+
+function nativeArchiveThreadDetail(entry) {
+  const { call, owner } = entry;
+  if (!call.arguments.some((argument) => archiveLiteral(argument) === "thread/delete")) {
+    return null;
+  }
+  if (!call.arguments.some((argument) => archiveExpressionReferencesParameter(argument, owner))) {
+    return null;
+  }
+  return entry;
+}
+
+function isDirectNativeArchiveFunction(fn) {
+  const evidence = collectExecutableArchiveEvidence(fn);
+  const routes = evidence.calls.map(nativeArchiveRouteDetail).filter(Boolean);
+  const threadDeletes = evidence.calls.map(nativeArchiveThreadDetail).filter(Boolean);
+  if (routes.length !== 2 || threadDeletes.length !== 1) return false;
+  const callee = routes[0].callee;
+  const parameters = archiveFunctionParameterNames(fn);
+  if (!parameters.has(callee) || routes.some((route) => route.callee !== callee)) return false;
+  if (
+    routes.some((route) => route.conversationId.type !== "Identifier") ||
+    new Set(routes.map((route) => route.conversationId.name)).size !== 1
+  ) return false;
+  const threadDelete = threadDeletes[0].call;
+  if (
+    !threadDelete.arguments.some(
+      (argument) => argument.type === "Identifier" && argument.name === callee,
+    )
+  ) return false;
+  return evidence.returns.some(
+    (statement) =>
+      statement.argument &&
+      statement.argument.start <= threadDelete.start &&
+      statement.argument.end >= threadDelete.end,
+  );
+}
+
+function collectArchiveFunctionBindings(fn) {
+  const bindings = new Map();
+  const add = (name, value) => {
+    if (!isArchiveFunction(value)) return;
+    const values = bindings.get(name) ?? [];
+    values.push(value);
+    bindings.set(name, values);
+  };
+  walkExecutableArchiveFunction(fn, (node) => {
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier") {
+      add(node.id.name, node.init);
+    }
+    if (
+      node.type === "AssignmentExpression" &&
+      node.operator === "=" &&
+      node.left.type === "Identifier"
+    ) add(node.left.name, node.right);
+  });
+  return bindings;
+}
+
+function isLiveNativeArchiveMutation(fn) {
+  const functionBindings = collectArchiveFunctionBindings(fn);
+  const options = [];
+  const calls = [];
+  walkExecutableArchiveFunction(fn, (node, _owner, ancestors) => {
+    if (node.type === "CallExpression") calls.push(node);
+    if (node.type !== "ObjectExpression") return;
+    const mutationFn = archiveObjectProperty(node, "mutationFn")?.value;
+    const onError = archiveObjectProperty(node, "onError")?.value;
+    if (mutationFn?.type !== "Identifier" || onError?.type !== "Identifier") return;
+    const mutationFunctions = functionBindings.get(mutationFn.name) ?? [];
+    const errorFunctions = functionBindings.get(onError.name) ?? [];
+    const binding = assignedArchiveIdentifier(node, ancestors);
+    if (binding && mutationFunctions.length === 1 && errorFunctions.length === 1) {
+      options.push({
+        binding,
+        mutationFunction: mutationFunctions[0],
+        errorFunction: errorFunctions[0],
+      });
+    }
+  });
+  const liveOptions = options.filter(({ binding, mutationFunction, errorFunction }) => {
+    const consumed = calls.filter((call) =>
+      call.arguments.some(
+        (argument) => argument.type === "Identifier" && argument.name === binding,
+      ),
+    );
+    if (consumed.length !== 1) return false;
+    const mutationEvidence = collectExecutableArchiveEvidence(mutationFunction);
+    const routes = mutationEvidence.calls.map(nativeArchiveRouteDetail).filter(Boolean);
+    if (
+      routes.length !== 2 ||
+      routes.some((route) => route.callee !== routes[0].callee)
+    ) return false;
+    const errorEvidence = collectExecutableArchiveEvidence(errorFunction);
+    const threadDeletes = errorEvidence.calls.map(nativeArchiveThreadDetail).filter(Boolean);
+    return threadDeletes.length === 1;
+  });
+  return liveOptions.length === 1;
+}
+
 function inspectArchiveDataControlsSource(source) {
   const ast = parseArchiveSource(source, "archive data-controls");
   const tokenCounts = new Map([
@@ -517,33 +823,31 @@ function inspectArchiveDataControlsSource(source) {
   const legacyFunctions = [];
   walkArchive(ast, (node) => {
     if (node.type !== "FunctionDeclaration" && node.type !== "FunctionExpression") return;
-    const nativeCalls = [];
-    const threadDeleteCalls = [];
+    const functionSource = source.slice(node.start, node.end);
+    const hasNativeContext =
+      functionSource.includes("delete-archived-conversation") ||
+      functionSource.includes("thread/delete");
+    if (
+      hasNativeContext &&
+      (isDirectNativeArchiveFunction(node) || isLiveNativeArchiveMutation(node))
+    ) {
+      nativeFunctions.push(node);
+    }
+    if (!functionSource.includes("delete-conversation")) return;
+    const evidence = collectExecutableArchiveEvidence(node);
     const legacyCalls = [];
-    let confirmMembers = 0;
-    walkArchive(node.body, (inner) => {
-      if (inner.type === "MemberExpression" && (inner.property?.name ?? archiveLiteral(inner.property)) === "codexConfirmDelete") {
-        confirmMembers += 1;
-      }
-      if (inner.type !== "CallExpression") return;
+    for (const { call } of evidence.calls) {
       if (
-        archiveLiteral(inner.arguments[0]) === "delete-archived-conversation" &&
-        inner.arguments[1]?.type === "ObjectExpression" &&
-        inner.arguments[1].properties.some((item) => archivePropertyName(item) === "conversationId")
-      ) nativeCalls.push(inner);
-      if (inner.arguments.some((argument) => archiveLiteral(argument) === "thread/delete")) {
-        threadDeleteCalls.push(inner);
-      }
-      if (
-        archiveLiteral(inner.arguments[0]) === "delete-conversation" &&
-        inner.arguments[1]?.type === "ObjectExpression" &&
+        archiveLiteral(call.arguments[0]) === "delete-conversation" &&
+        call.arguments[1]?.type === "ObjectExpression" &&
         ["conversationId", "hostId"].every((name) =>
-          inner.arguments[1].properties.some((item) => archivePropertyName(item) === name),
+          call.arguments[1].properties.some((item) => archivePropertyName(item) === name),
         )
-      ) legacyCalls.push(inner);
-    });
-    if (nativeCalls.length === 2 && threadDeleteCalls.length === 1) nativeFunctions.push(node);
-    if (legacyCalls.length === 1 && confirmMembers > 0) legacyFunctions.push(node);
+      ) legacyCalls.push(call);
+    }
+    if (legacyCalls.length === 1 && evidence.confirmMembers.length > 0) {
+      legacyFunctions.push(node);
+    }
   });
   const nativeEvidence =
     labelProperties.length === 1 &&

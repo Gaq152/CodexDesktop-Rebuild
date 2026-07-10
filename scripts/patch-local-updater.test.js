@@ -359,6 +359,33 @@ test("rejects empty and unrendered titlebar helper and descriptor shells", () =>
   );
 });
 
+test("rejects a canonical titlebar rendered only inside a dead function", () => {
+  const patched = applyLocalUpdaterPlan(makeCleanLocalUpdaterSources());
+  const file = "webview/assets/app-shell-CVVppk_a.js";
+  patched.files[file] = patched.files[file].replace(
+    "(0,Di.jsx)(Ti,{});",
+    "function deadRender(){(0,Di.jsx)(Ti,{})}",
+  );
+
+  assert.throws(
+    () => planLocalUpdaterSources(patched),
+    /titlebar|rendered JSX attachment|Program|postcondition/i,
+  );
+});
+
+test("accepts a canonical titlebar through a live Program component chain", () => {
+  const patched = applyLocalUpdaterPlan(makeCleanLocalUpdaterSources());
+  const file = "webview/assets/app-shell-CVVppk_a.js";
+  patched.files[file] = patched.files[file].replace(
+    "(0,Di.jsx)(Ti,{});",
+    "function LiveTitlebar(){return (0,Di.jsx)(Ti,{})};(0,Di.jsx)(LiveTitlebar,{});",
+  );
+
+  const plan = planLocalUpdaterSources(patched);
+  assert.equal(plan.status, "already");
+  assert.equal(plan.changes.length, 0);
+});
+
 test("rejects stale or mismatched canonical updater block versions", () => {
   const patched = applyLocalUpdaterPlan(makeCleanLocalUpdaterSources());
   patched.files[".vite/build/bootstrap-BXjiq4qE.js"] +=

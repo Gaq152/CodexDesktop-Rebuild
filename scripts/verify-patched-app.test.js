@@ -112,7 +112,9 @@ const MARKERS = [
     id: "delete-route",
     contract: "archive-delete",
     file: "webview/assets/app-main-fixture.js",
-    text: "let routes={\"delete-archived-conversation\":q7((manager,{conversationId:id})=>manager.deleteArchivedConversation(id))};",
+    text: withLiveArchiveRouter(
+      '"delete-archived-conversation":q7((manager,{conversationId:id})=>manager.deleteArchivedConversation(id))',
+    ),
   },
   {
     id: "delete-protocol",
@@ -177,6 +179,10 @@ function writeText(filePath, text, append = false) {
 function writeExact(filePath, text) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, text);
+}
+
+function withLiveArchiveRouter(routeEntries) {
+  return `let routes={${routeEntries}};bridge.setMessageHandler((key,payload)=>routes[key](manager,payload))`;
 }
 
 function withRealQuotedKeys(source) {
@@ -249,15 +255,17 @@ function installCanonicalUpdaterWhenComplete(fixture) {
 
 const STRUCTURAL_PLUGIN_MAIN = [
   "let He={browserPane:!1,inAppBrowserUse:!1,inAppBrowserUseAllowed:!1,externalBrowserUse:!1,externalBrowserUseAllowed:!1,computerUse:!1,computerUseNodeRepl:!1,control:!1,multiWindow:!1}",
+  "let featureKeys=Object.keys(He)",
   "let fr={\"features.js_repl\":!1}",
-  "let bs=[{isAvailable:({features:e})=>e.sites},{isAvailable:({features:e})=>e.inAppBrowserUseAllowed}],w=n=>bs.filter(r=>r.isAvailable({buildFlavor:i,features:n,platform:p}))",
+  "let bs=[{isAvailable:({features:e})=>e.sites},{isAvailable:({features:e})=>e.inAppBrowserUseAllowed}],w=n=>bs.filter(r=>r.isAvailable({buildFlavor:i,features:n,platform:p}));function reconcile(n){let i=w(n);logger.info(`bundled_plugins_reconcile_started`);return install({marketplacePluginDescriptors:i})}",
   "function Ud(){let e=i.a.readFromPackageMetadata(),t=e!=null&&i.a.shouldIncludeBrowserUsePeerAuthorization(e,process.platform),n=!t&&Bd(process.env);if(!t&&!n)return()=>({authorized:!0})}",
 ].join(";");
 const STRUCTURAL_PLUGIN_WEBVIEW = [
-  "function F(e){let{enabled:n,hostId:r}=e,s=v(`1506311413`),c={featureName:`computer_use`,hostId:r},l=j(c),y=l.enabled,b=l.isFetching,x=l.isLoading,_=l.reason;return{available:y,isFetching:b,isLoading:x,reason:_}}",
-  "function I(e){let{enabled:n}=e,r=(0,B.useContext)(x)?.authMethod===`chatgpt`;return{enabled:n&&r}}",
-  "function H(e){let{hostId:n}=e,a=v(`410065390`),o={featureName:`browser_use_external`,hostId:n},s=j(o),l=s.enabled,u=l===`available`,d=l===`available`,f=l===`loading`;return{allowed:u,available:d,isLoading:f,reason:l}}",
-  "function K(e){let{hostId:n}=e,a=v(`410262010`),o={featureName:`browser_use`,hostId:n},s=j(o),l=s.enabled,h=l===`available`,_=l===`available`,y=l===`loading`;return{allowed:h,available:_,isLoading:y,reason:l}}",
+  "function F(e){let{enabled:n,hostId:r}=e,s=v(`1506311413`),c={featureName:`computer_use`,hostId:r},l=j(c),p=I({enabled:n}),y=l.enabled&&p.enabled&&s,b=l.isFetching,x=l.isLoading,_=s?l.reason:`statsig-disabled`;return{available:y,isFetching:b,isLoading:x,reason:_}}",
+  "function I(e){let t=(0,z.c)(21),{enabled:n}=e,r=(0,B.useContext)(x)?.authMethod===`chatgpt`;return{enabled:n&&r}}",
+  "function H(e){let{hostId:n}=e,a=v(`410065390`),o={featureName:`browser_use_external`,hostId:n},s=j(o),l=a?s.enabled:`statsig-disabled`,u=l===`available`,d=l===`available`,f=l===`loading`;return{allowed:u,available:d,isLoading:f,reason:l}}",
+  "function K(e){let{hostId:n}=e,a=v(`410262010`),o={featureName:`browser_use`,hostId:n},s=j(o),l=a?s.enabled:`statsig-disabled`,h=l===`available`,_=l===`available`,y=l===`loading`;return{allowed:h,available:_,isLoading:y,reason:l}}",
+  "export{F as c,K as i,H as o}",
 ].join(";");
 const STRUCTURAL_THREAD_ACTIONS = [
   "let $=g({archiveThread:{id:`sidebarElectron.archiveThread`,defaultMessage:`Archive task`,description:`Menu item to archive a local task`}})",
@@ -316,8 +324,10 @@ function installStructuralFeatureFixtures(fixture) {
   );
 
   const nativeAppMain = fixture.includedMarkers.has("delete-route")
-    ? "let routes={\"delete-archived-conversation\":q7((manager,{conversationId:id})=>manager.deleteArchivedConversation(id))};"
-    : "let routes={};";
+    ? withLiveArchiveRouter(
+        '"delete-archived-conversation":q7((manager,{conversationId:id})=>manager.deleteArchivedConversation(id))',
+      )
+    : withLiveArchiveRouter("");
   const nativeDataControls = fixture.includedMarkers.has("delete-protocol")
     ? "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};async function remove(send,id){send(`delete-archived-conversation`,{conversationId:id});send(`delete-archived-conversation`,{conversationId:id});return classify(send,`thread/delete`)}"
     : "let value=1;";
@@ -877,6 +887,22 @@ test("updater rejects empty and unrendered titlebar shells", (t) => {
   );
 });
 
+test("updater rejects a canonical titlebar rendered only by a dead function", (t) => {
+  const fixture = createFixture(t);
+  const installed = installCanonicalUpdater(fixture);
+  const relative = "webview/assets/app-shell-CVVppk_a.js";
+  const inert = installed.files[relative].replace(
+    "(0,Di.jsx)(Ti,{});",
+    "function deadRender(){(0,Di.jsx)(Ti,{})}",
+  );
+  writeExact(path.join(fixture.asarRoot, ...relative.split("/")), inert);
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("updater"),
+  );
+});
+
 test("updater rejects stale or mismatched canonical block versions", (t) => {
   const fixture = createFixture(t);
   const installed = installCanonicalUpdater(fixture);
@@ -995,7 +1021,9 @@ test("archive-delete accepts the unambiguous legacy custom route", (t) => {
   const fixture = createFixture(t, { omitMarkers: ["delete-route", "delete-protocol"] });
   writeText(
     path.join(fixture.asarRoot, "webview", "assets", "app-main-fixture.js"),
-    "let routes={\"delete-conversation\":K7(async(manager,{conversationId:id})=>{await manager.sendRequest(`thread/delete`,{threadId:id})})};",
+    withLiveArchiveRouter(
+      '"delete-conversation":K7(async(manager,{conversationId:id})=>{await manager.sendRequest(`thread/delete`,{threadId:id})})',
+    ),
   );
   writeText(
     path.join(fixture.asarRoot, "webview", "assets", "data-controls-fixture.js"),
@@ -1028,10 +1056,13 @@ test("archive-delete rejects a data-controls-only route and error-code decoy", (
 
 test("archive-delete rejects simultaneous native and legacy route modes", (t) => {
   const fixture = createFixture(t);
+  const nativeRoute =
+    '"delete-archived-conversation":q7((manager,{conversationId:id})=>manager.deleteArchivedConversation(id))';
+  const legacyRoute =
+    '"delete-conversation":K7(async(manager,{conversationId:id})=>{await manager.sendRequest("thread/delete",{threadId:id})})';
   writeText(
     path.join(fixture.asarRoot, "webview", "assets", "app-main-fixture.js"),
-    'let legacy={"delete-conversation":K7(async(manager,{conversationId:id})=>{await manager.sendRequest("thread/delete",{threadId:id})})};',
-    true,
+    withLiveArchiveRouter(`${nativeRoute},${legacyRoute}`),
   );
 
   assert.throws(

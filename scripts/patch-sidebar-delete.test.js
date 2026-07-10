@@ -115,3 +115,19 @@ test("rejects an inert sidebar hover and row marker shell", () => {
     /sidebar|hover|row|structural|postcondition/i,
   );
 });
+
+test("rejects a delete action whose route and returned binding are inert", () => {
+  const inert = [
+    "let $=g({archiveThread:{id:`sidebarElectron.archiveThread`},deleteThread:{id:`sidebarElectron.deleteThread`},deleteThreadConfirmAction:{id:`sidebarElectron.deleteThreadConfirmAction`},deleteThreadError:{id:`sidebarElectron.deleteThreadError`}})",
+    "function ne(){",
+    "/* CodexSidebarDeleteAction */let CodexSidebarDeleteAction=e=>{function dead(){let{conversationId:n,hostId:i}=e;v(`delete-archived-conversation`,{conversationId:n,hostId:i})}};",
+    "const unused={deleteThread:CodexSidebarDeleteAction};",
+    "return {archiveThread:()=>{},copyConversationMarkdown:()=>{}}",
+    "}",
+  ].join(";");
+
+  assert.throws(
+    () => patchThreadActionsSource(inert),
+    /thread-actions|delete parameters|delete route|returned|binding|postcondition/i,
+  );
+});

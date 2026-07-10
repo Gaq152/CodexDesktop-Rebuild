@@ -491,6 +491,79 @@ function objectProperty(object, name) {
     : null;
 }
 
+function isFunctionNode(node) {
+  return ["ArrowFunctionExpression", "FunctionExpression", "FunctionDeclaration"].includes(
+    node?.type,
+  );
+}
+
+function walkOwnExecutableBody(node, visitor) {
+  function visit(current) {
+    if (!current || typeof current !== "object" || isFunctionNode(current)) return;
+    visitor(current);
+    if (current.type === "IfStatement" && typeof literalValue(current.test) === "boolean") {
+      visit(literalValue(current.test) ? current.consequent : current.alternate);
+      return;
+    }
+    for (const [key, value] of Object.entries(current)) {
+      if (["type", "start", "end"].includes(key)) continue;
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object" && value.type) visit(value);
+    }
+  }
+  visit(node);
+}
+
+function returnedObjectExpression(argument) {
+  if (argument?.type === "ObjectExpression") return argument;
+  if (argument?.type === "AssignmentExpression" && argument.right.type === "ObjectExpression") {
+    return argument.right;
+  }
+  if (argument?.type !== "SequenceExpression") return null;
+  const result = argument.expressions.at(-1);
+  if (result?.type === "ObjectExpression") return result;
+  if (result?.type !== "Identifier") return null;
+  const assignments = [];
+  for (const expression of argument.expressions.slice(0, -1)) {
+    walkOwnExecutableBody(expression, (candidate) => {
+      if (
+        candidate.type === "AssignmentExpression" &&
+        candidate.operator === "=" &&
+        candidate.left.type === "Identifier" &&
+        candidate.left.name === result.name &&
+        candidate.right.type === "ObjectExpression"
+      ) {
+        assignments.push(candidate.right);
+      }
+    });
+  }
+  return assignments.length === 1 ? assignments[0] : null;
+}
+
+function directFunctionBinding(functionNode, name) {
+  const candidates = [];
+  for (const statement of functionNode.body.body) {
+    walkOwnExecutableBody(statement, (candidate) => {
+      if (candidate.type === "VariableDeclarator") {
+        if (
+          candidate.id.type === "Identifier" &&
+          candidate.id.name === name &&
+          isFunctionNode(candidate.init)
+        ) candidates.push(candidate.init);
+        return;
+      }
+      if (
+        candidate.type === "AssignmentExpression" &&
+        candidate.operator === "=" &&
+        candidate.left.type === "Identifier" &&
+        candidate.left.name === name &&
+        isFunctionNode(candidate.right)
+      ) candidates.push(candidate.right);
+    });
+  }
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 function inspectThreadActionsPostcondition(code) {
   const { ast, comments } = parseSidebarDocument(code, "sidebar thread-actions");
   const markerComments = exactSidebarComments(comments, "CodexSidebarDeleteAction");
@@ -553,21 +626,22 @@ function inspectThreadActionsPostcondition(code) {
     throw new Error("sidebar thread-actions delete action is not executable");
   }
   const parameter = declaration.init.params[0];
-  const bindingPatterns = [];
-  walk(declaration.init.body, (node) => {
-    if (
-      node.type === "VariableDeclarator" &&
-      node.id.type === "ObjectPattern" &&
-      node.init?.type === "Identifier" &&
-      parameter.type === "Identifier" &&
-      node.init.name === parameter.name
-    ) bindingPatterns.push(node.id);
-  });
+  const bindingPatterns = declaration.init.body.body
+    .filter((node) => node.type === "VariableDeclaration")
+    .flatMap((node) => node.declarations)
+    .filter(
+      (node) =>
+        node.id.type === "ObjectPattern" &&
+        node.init?.type === "Identifier" &&
+        parameter.type === "Identifier" &&
+        node.init.name === parameter.name,
+    )
+    .map((node) => node.id);
   if (bindingPatterns.length !== 1) throw new Error("sidebar thread-actions delete parameters are missing");
   const conversationId = patternBinding(bindingPatterns[0], "conversationId");
   const hostId = patternBinding(bindingPatterns[0], "hostId");
   const routeCalls = [];
-  walk(declaration.init.body, (node) => {
+  walkOwnExecutableBody(declaration.init.body, (node) => {
     if (
       node.type === "CallExpression" &&
       literalValue(node.arguments[0]) === "delete-archived-conversation" &&
@@ -590,6 +664,38 @@ function inspectThreadActionsPostcondition(code) {
     (fn) => fn.start < statement.start && fn.end > statement.end && fn.start < deleteBindings[0].start && fn.end > deleteBindings[0].end,
   );
   if (enclosing.length !== 1) throw new Error("sidebar thread-actions delete binding is detached");
+  const owner = enclosing[0];
+  if (!owner.body.body.includes(statement)) {
+    throw new Error("sidebar thread-actions delete action is not a live factory statement");
+  }
+  const directReturns = owner.body.body.filter((node) => node.type === "ReturnStatement");
+  if (directReturns.length !== 1) {
+    throw new Error("sidebar thread-actions returned action object is ambiguous");
+  }
+  const returnedObject = returnedObjectExpression(directReturns[0].argument);
+  const returnedDelete = objectProperty(returnedObject, "deleteThread");
+  if (returnedDelete !== deleteBindings[0]) {
+    throw new Error("sidebar thread-actions delete binding is not in the returned action object");
+  }
+  const archiveBinding = objectProperty(returnedObject, "archiveThread")?.value;
+  if (archiveBinding?.type !== "Identifier") {
+    throw new Error("sidebar thread-actions returned archive binding is missing");
+  }
+  const archiveAction = directFunctionBinding(owner, archiveBinding.name);
+  if (!archiveAction) throw new Error("sidebar thread-actions live archive action is missing");
+  const archiveCalls = [];
+  walkOwnExecutableBody(archiveAction.body, (node) => {
+    if (
+      node.type === "CallExpression" &&
+      literalValue(node.arguments[0]) === "archive-conversation"
+    ) archiveCalls.push(node);
+  });
+  if (
+    archiveCalls.length !== 1 ||
+    sourceFor(code, archiveCalls[0].callee) !== sourceFor(code, routeCalls[0].callee)
+  ) {
+    throw new Error("sidebar thread-actions delete route is not bound to the live bridge");
+  }
   return { status: "already" };
 }
 

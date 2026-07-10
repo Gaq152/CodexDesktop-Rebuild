@@ -1133,38 +1133,177 @@ function updaterDescriptorElements(menuArray) {
 }
 
 function assertRenderedTitlebarComponent(ast, shape) {
-  const programFunctions = ast.body.filter(
-    (statement) =>
-      statement.type === "FunctionDeclaration" &&
-      statement.start === shape.menuFunction.start &&
-      statement.end === shape.menuFunction.end,
-  );
-  if (programFunctions.length !== 1) {
+  const programFunctions = new Map();
+  for (const statement of ast.body) {
+    if (statement.type !== "FunctionDeclaration" || statement.id?.type !== "Identifier") continue;
+    const matches = programFunctions.get(statement.id.name) ?? [];
+    matches.push(statement);
+    programFunctions.set(statement.id.name, matches);
+  }
+  const programBindings = (name) => {
+    const bindings = [];
+    for (const statement of ast.body) {
+      if (statement.type === "FunctionDeclaration" && statement.id?.name === name) {
+        bindings.push(statement);
+      } else if (statement.type === "VariableDeclaration") {
+        bindings.push(
+          ...statement.declarations.filter(
+            (declaration) =>
+              declaration.id.type === "Identifier" && declaration.id.name === name,
+          ),
+        );
+      } else if (statement.type === "ImportDeclaration") {
+        bindings.push(
+          ...statement.specifiers.filter(
+            (specifier) => specifier.local?.type === "Identifier" && specifier.local.name === name,
+          ),
+        );
+      }
+    }
+    return bindings;
+  };
+  const menuFunctions = programFunctions.get(shape.functionName) ?? [];
+  if (
+    menuFunctions.length !== 1 ||
+    menuFunctions[0].start !== shape.menuFunction.start ||
+    menuFunctions[0].end !== shape.menuFunction.end ||
+    programBindings(shape.functionName).length !== 1 ||
+    programBindings(shape.jsxAlias).length !== 1
+  ) {
     throw new Error(
-      "Windows webview updater titlebar component is not an executable Program declaration",
+      "Windows webview updater titlebar component is not an unambiguous Program binding",
     );
   }
-  const renderCalls = [];
-  walkAst(ast, (node) => {
-    if (
-      node.start >= shape.menuFunction.start &&
-      node.end <= shape.menuFunction.end
-    ) {
-      return;
+
+  const exportedBindings = new Set();
+  for (const statement of ast.body) {
+    if (statement.type !== "ExportNamedDeclaration") continue;
+    for (const specifier of statement.specifiers) {
+      if (specifier.local?.type === "Identifier") exportedBindings.add(specifier.local.name);
     }
+  }
+  const roots = new Set();
+  const renderEdges = new Map();
+  const targetCalls = [];
+  const addEdge = (owner, child) => {
+    const children = renderEdges.get(owner) ?? new Set();
+    children.add(child);
+    renderEdges.set(owner, children);
+  };
+  const isDirectProgramExpression = (ancestors) => {
+    const statementIndex = ancestors.findIndex(
+      (ancestor) => ancestor.type === "ExpressionStatement" && ast.body.includes(ancestor),
+    );
+    return (
+      statementIndex >= 0 &&
+      ancestors.slice(statementIndex + 1).every((ancestor) => ancestor.type === "SequenceExpression")
+    );
+  };
+
+  walkAstWithAncestors(ast, (node, ancestors) => {
+    if (node.type !== "CallExpression") return;
+    const jsxAlias = sequenceMember(node, "jsx") || sequenceMember(node, "jsxs");
+    const child = node.arguments[0]?.type === "Identifier" ? node.arguments[0].name : null;
     if (
-      node.type === "CallExpression" &&
-      (sequenceMember(node, "jsx") || sequenceMember(node, "jsxs")) &&
-      node.arguments[0]?.type === "Identifier" &&
-      node.arguments[0].name === shape.functionName &&
-      node.arguments[1]?.type === "ObjectExpression"
+      jsxAlias &&
+      child &&
+      node.arguments[1]?.type === "ObjectExpression" &&
+      (programFunctions.get(child)?.length ?? 0) === 1 &&
+      programBindings(jsxAlias).length === 1
     ) {
-      renderCalls.push(node);
+      const owner = [...ancestors]
+        .reverse()
+        .find((ancestor) =>
+          ["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"].includes(
+            ancestor.type,
+          ),
+        );
+      if (owner?.type === "FunctionDeclaration" && ast.body.includes(owner)) {
+        addEdge(owner.id.name, child);
+      } else if (!owner && isDirectProgramExpression(ancestors)) {
+        roots.add(child);
+      }
+      if (child === shape.functionName) targetCalls.push(node);
     }
+
+    const memoAlias = sequenceMember(node, "memo");
+    const rootFunction = node.arguments[0]?.type === "Identifier" ? node.arguments[0].name : null;
+    if (
+      !memoAlias ||
+      !rootFunction ||
+      (programFunctions.get(rootFunction)?.length ?? 0) !== 1 ||
+      programBindings(memoAlias).length !== 1
+    ) return;
+    const rootProperty = [...ancestors]
+      .reverse()
+      .find(
+        (ancestor) =>
+          ancestor.type === "Property" &&
+          propertyName(ancestor) === "Root" &&
+          node.start >= ancestor.value.start &&
+          node.end <= ancestor.value.end,
+      );
+    const rootObject = rootProperty
+      ? [...ancestors]
+          .reverse()
+          .find(
+            (ancestor) =>
+              ancestor.type === "ObjectExpression" &&
+              rootProperty.start >= ancestor.start &&
+              rootProperty.end <= ancestor.end,
+          )
+      : null;
+    const exportAssignment = rootObject
+      ? [...ancestors]
+          .reverse()
+          .find(
+            (ancestor) =>
+              ancestor.type === "AssignmentExpression" &&
+              ancestor.operator === "=" &&
+              ancestor.left.type === "Identifier" &&
+              ancestor.right === rootObject &&
+              exportedBindings.has(ancestor.left.name),
+          )
+      : null;
+    if (!exportAssignment) return;
+    const callback = [...ancestors]
+      .reverse()
+      .find((ancestor) => ancestor.type === "ArrowFunctionExpression");
+    const callbackIndex = callback ? ancestors.indexOf(callback) : -1;
+    const callbackCall = callbackIndex > 0 ? ancestors[callbackIndex - 1] : null;
+    const programDeclarator = callbackCall
+      ? ancestors
+          .slice(0, callbackIndex - 1)
+          .reverse()
+          .find((ancestor) => ancestor.type === "VariableDeclarator")
+      : null;
+    const programInitializer = programDeclarator && ast.body.some(
+      (statement) =>
+        statement.type === "VariableDeclaration" &&
+        statement.declarations.includes(programDeclarator),
+    );
+    if (
+      callbackCall?.type === "CallExpression" &&
+      callbackCall.arguments.includes(callback) &&
+      programInitializer
+    ) roots.add(rootFunction);
   });
-  if (renderCalls.length !== 1) {
+
+  const reachable = new Set(roots);
+  const pending = [...roots];
+  while (pending.length > 0) {
+    const owner = pending.pop();
+    for (const child of renderEdges.get(owner) ?? []) {
+      if (reachable.has(child)) continue;
+      reachable.add(child);
+      pending.push(child);
+    }
+  }
+  if (targetCalls.length !== 1 || !reachable.has(shape.functionName)) {
     throw new Error(
-      `Windows webview updater titlebar component expected exactly one rendered JSX attachment, found ${renderCalls.length}`,
+      `Windows webview updater titlebar component expected exactly one live rendered JSX attachment, found ${
+        reachable.has(shape.functionName) ? targetCalls.length : 0
+      }`,
     );
   }
 }

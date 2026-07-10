@@ -426,6 +426,396 @@ function walkOwnFunction(root, visitor) {
   visit(root);
 }
 
+function isPluginFunctionNode(node) {
+  return (
+    node?.type === "FunctionDeclaration" ||
+    node?.type === "FunctionExpression" ||
+    node?.type === "ArrowFunctionExpression"
+  );
+}
+
+function pluginPropertyName(node) {
+  const key = node?.type === "MemberExpression" ? node.property : node?.key;
+  if (!key) return null;
+  if (key.type === "Identifier" && !node.computed) return key.name;
+  return getLiteralValue(key);
+}
+
+function bindingIdentifiers(pattern, identifiers = []) {
+  if (!pattern) return identifiers;
+  if (pattern.type === "Identifier") identifiers.push(pattern);
+  else if (pattern.type === "AssignmentPattern") {
+    bindingIdentifiers(pattern.left, identifiers);
+  } else if (pattern.type === "RestElement") {
+    bindingIdentifiers(pattern.argument, identifiers);
+  } else if (pattern.type === "ArrayPattern") {
+    for (const element of pattern.elements) bindingIdentifiers(element, identifiers);
+  } else if (pattern.type === "ObjectPattern") {
+    for (const property of pattern.properties) {
+      bindingIdentifiers(
+        property.type === "RestElement" ? property.argument : property.value,
+        identifiers,
+      );
+    }
+  }
+  return identifiers;
+}
+
+// A deliberately small lexical model for the minified bundle contracts. It
+// resolves block/function shadowing without attempting whole-program JS flow.
+function buildPluginLexicalModel(ast) {
+  const scopeByNode = new WeakMap();
+  const bindingByDeclaration = new WeakMap();
+
+  function makeScope(kind, node, parent) {
+    return { kind, node, parent, bindings: new Map() };
+  }
+
+  const programScope = makeScope("program", ast, null);
+
+  function declarePattern(pattern, scope) {
+    for (const identifier of bindingIdentifiers(pattern)) {
+      let binding = scope.bindings.get(identifier.name);
+      if (!binding) {
+        binding = { name: identifier.name, scope };
+        scope.bindings.set(identifier.name, binding);
+      }
+      bindingByDeclaration.set(identifier, binding);
+      scopeByNode.set(identifier, scope);
+    }
+  }
+
+  function nearestVarScope(scope) {
+    let current = scope;
+    while (current.kind === "block") current = current.parent;
+    return current;
+  }
+
+  function visitChildren(node, scope) {
+    for (const [key, child] of Object.entries(node)) {
+      if (key === "type" || key === "start" || key === "end") continue;
+      if (Array.isArray(child)) {
+        for (const item of child) visit(item, scope);
+      } else {
+        visit(child, scope);
+      }
+    }
+  }
+
+  function visitFunction(node, parentScope) {
+    if (node.type === "FunctionDeclaration" && node.id) {
+      declarePattern(node.id, parentScope);
+    }
+    const functionScope = makeScope("function", node, parentScope);
+    scopeByNode.set(node, functionScope);
+    if (node.type === "FunctionExpression" && node.id) {
+      declarePattern(node.id, functionScope);
+    }
+    for (const parameter of node.params) declarePattern(parameter, functionScope);
+    if (node.body?.type === "BlockStatement") {
+      scopeByNode.set(node.body, functionScope);
+      for (const statement of node.body.body) visit(statement, functionScope);
+    } else {
+      visit(node.body, functionScope);
+    }
+  }
+
+  function visit(node, scope) {
+    if (!node || typeof node !== "object") return;
+    scopeByNode.set(node, scope);
+    if (isPluginFunctionNode(node)) {
+      visitFunction(node, scope);
+      return;
+    }
+    if (node.type === "BlockStatement") {
+      const blockScope = makeScope("block", node, scope);
+      scopeByNode.set(node, blockScope);
+      for (const statement of node.body) visit(statement, blockScope);
+      return;
+    }
+    if (node.type === "VariableDeclaration") {
+      const declarationScope = node.kind === "var" ? nearestVarScope(scope) : scope;
+      for (const declaration of node.declarations) {
+        scopeByNode.set(declaration, scope);
+        declarePattern(declaration.id, declarationScope);
+        visit(declaration.init, scope);
+      }
+      return;
+    }
+    visitChildren(node, scope);
+  }
+
+  scopeByNode.set(ast, programScope);
+  for (const statement of ast.body) visit(statement, programScope);
+
+  function resolve(identifier) {
+    if (identifier?.type !== "Identifier") return null;
+    let scope = scopeByNode.get(identifier);
+    while (scope) {
+      const binding = scope.bindings.get(identifier.name);
+      if (binding) return binding;
+      scope = scope.parent;
+    }
+    return null;
+  }
+
+  function nearestFunctionScope(node) {
+    let scope = scopeByNode.get(node);
+    while (scope?.kind === "block") scope = scope.parent;
+    return scope ?? null;
+  }
+
+  return {
+    bindingForDeclaration: (identifier) =>
+      bindingByDeclaration.get(identifier) ?? null,
+    nearestFunctionScope,
+    resolve,
+  };
+}
+
+function nodeContainsNode(container, target) {
+  return (
+    container != null &&
+    target != null &&
+    container.start <= target.start &&
+    target.end <= container.end
+  );
+}
+
+function functionReturnsNode(functionNode, target) {
+  if (
+    functionNode.type === "ArrowFunctionExpression" &&
+    functionNode.body.type !== "BlockStatement"
+  ) {
+    return nodeContainsNode(functionNode.body, target);
+  }
+  let found = false;
+  walkOwnFunction(functionNode, (node) => {
+    if (
+      node.type === "ReturnStatement" &&
+      nodeContainsNode(node.argument, target)
+    ) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+function collectFunctionBindings(ast, model) {
+  const bindingsByFunction = new Map();
+  const functionsByBinding = new Map();
+  walk(ast, (node) => {
+    let functionNode = null;
+    let binding = null;
+    if (node.type === "FunctionDeclaration" && node.id) {
+      functionNode = node;
+      binding = model.bindingForDeclaration(node.id);
+    } else if (
+      node.type === "VariableDeclarator" &&
+      node.id.type === "Identifier" &&
+      isPluginFunctionNode(node.init)
+    ) {
+      functionNode = node.init;
+      binding = model.bindingForDeclaration(node.id);
+    }
+    if (!functionNode || !binding) return;
+    bindingsByFunction.set(functionNode, binding);
+    functionsByBinding.set(binding, functionNode);
+  });
+  return { bindingsByFunction, functionsByBinding };
+}
+
+function walkExpression(node, visitor, parent = null) {
+  if (!node || typeof node !== "object") return;
+  if (isPluginFunctionNode(node)) return;
+  if (node.type) visitor(node, parent);
+  for (const [key, child] of Object.entries(node)) {
+    if (key === "type" || key === "start" || key === "end") continue;
+    if (Array.isArray(child)) {
+      for (const item of child) walkExpression(item, visitor, node);
+    } else {
+      walkExpression(child, visitor, node);
+    }
+  }
+}
+
+function isReferenceIdentifier(node, parent) {
+  if (node?.type !== "Identifier") return false;
+  if (!parent) return true;
+  if (parent.type === "MemberExpression" && parent.property === node && !parent.computed) {
+    return false;
+  }
+  if (
+    (parent.type === "Property" || parent.type === "MethodDefinition") &&
+    parent.key === node &&
+    !parent.computed &&
+    !(parent.type === "Property" && parent.shorthand && parent.value === node)
+  ) {
+    return false;
+  }
+  if (
+    (parent.type === "VariableDeclarator" && parent.id === node) ||
+    (isPluginFunctionNode(parent) &&
+      (parent.id === node || parent.params.includes(node))) ||
+    (parent.type === "LabeledStatement" && parent.label === node) ||
+    ((parent.type === "BreakStatement" || parent.type === "ContinueStatement") &&
+      parent.label === node)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function createFunctionReturnFlow(functionNode, model) {
+  const definitions = new Map();
+  const returnExpressions = [];
+
+  function addDefinition(binding, expression) {
+    if (!binding || !expression) return;
+    const expressions = definitions.get(binding) ?? [];
+    expressions.push(expression);
+    definitions.set(binding, expressions);
+  }
+
+  walkOwnFunction(functionNode, (node) => {
+    if (
+      node.type === "VariableDeclarator" &&
+      node.id.type === "Identifier" &&
+      node.init
+    ) {
+      addDefinition(model.bindingForDeclaration(node.id), node.init);
+    } else if (
+      node.type === "AssignmentExpression" &&
+      node.left.type === "Identifier"
+    ) {
+      addDefinition(model.resolve(node.left), node.right);
+    } else if (node.type === "ReturnStatement" && node.argument) {
+      returnExpressions.push(node.argument);
+    }
+  });
+  if (
+    functionNode.type === "ArrowFunctionExpression" &&
+    functionNode.body.type !== "BlockStatement"
+  ) {
+    returnExpressions.push(functionNode.body);
+  }
+
+  const liveExpressions = new Set();
+  const liveBindings = new Set();
+  const pendingBindings = [];
+
+  function addLiveExpression(expression) {
+    if (!expression || liveExpressions.has(expression)) return;
+    liveExpressions.add(expression);
+    walkExpression(expression, (node, parent) => {
+      if (!isReferenceIdentifier(node, parent)) return;
+      const binding = model.resolve(node);
+      if (!binding || liveBindings.has(binding)) return;
+      liveBindings.add(binding);
+      pendingBindings.push(binding);
+    });
+  }
+
+  for (const expression of returnExpressions) addLiveExpression(expression);
+  while (pendingBindings.length > 0) {
+    const binding = pendingBindings.shift();
+    for (const expression of definitions.get(binding) ?? []) {
+      addLiveExpression(expression);
+    }
+  }
+
+  return {
+    feedsReturn: (target) =>
+      [...liveExpressions].some((expression) => nodeContainsNode(expression, target)),
+  };
+}
+
+function collectWebviewHookTopology(ast) {
+  const model = buildPluginLexicalModel(ast);
+  const { functionsByBinding } = collectFunctionBindings(ast, model);
+  const exportedFunctions = new Set();
+
+  walk(ast, (node) => {
+    if (node.type !== "ExportNamedDeclaration" && node.type !== "ExportDefaultDeclaration") {
+      return;
+    }
+    if (isPluginFunctionNode(node.declaration)) {
+      exportedFunctions.add(node.declaration);
+    }
+    if (node.declaration?.type === "VariableDeclaration") {
+      for (const declaration of node.declaration.declarations) {
+        if (declaration.id.type !== "Identifier") continue;
+        const functionNode = functionsByBinding.get(
+          model.bindingForDeclaration(declaration.id),
+        );
+        if (functionNode) exportedFunctions.add(functionNode);
+      }
+    }
+    for (const specifier of node.specifiers ?? []) {
+      if (specifier.local?.type !== "Identifier") continue;
+      const functionNode = functionsByBinding.get(model.resolve(specifier.local));
+      if (functionNode) exportedFunctions.add(functionNode);
+    }
+  });
+
+  const hooksByContext = new Map(
+    [...FEATURE_CONTEXTS].map((context) => [context, []]),
+  );
+  walk(ast, (node) => {
+    if (!isPluginFunctionNode(node)) return;
+    const contexts = featureContextsInFunction(node);
+    if (contexts.length === 0) return;
+    if (contexts.length !== 1) {
+      throw new Error("plugin webview hook has ambiguous feature context");
+    }
+    hooksByContext.get(contexts[0]).push(node);
+  });
+
+  const hooks = new Map();
+  for (const context of FEATURE_CONTEXTS) {
+    const candidates = hooksByContext.get(context);
+    if (candidates.length !== 1) {
+      throw new Error(
+        `plugin webview hook ${context} expected exactly 1 function, found ${candidates.length}`,
+      );
+    }
+    const hook = candidates[0];
+    if (!exportedFunctions.has(hook)) {
+      throw new Error(`plugin webview hook ${context} is not exported`);
+    }
+    hooks.set(context, hook);
+  }
+
+  const flows = new Map();
+  function flowFor(functionNode) {
+    let flow = flows.get(functionNode);
+    if (!flow) {
+      flow = createFunctionReturnFlow(functionNode, model);
+      flows.set(functionNode, flow);
+    }
+    return flow;
+  }
+
+  const reachableFunctions = new Set(hooks.values());
+  const pending = [...hooks.values()].map((functionNode) => ({ functionNode, depth: 0 }));
+  // Current bundles call the auth helper directly from an exported hook. Two
+  // direct identifier-call hops leave adaptation room while keeping analysis bounded.
+  const MAX_HELPER_CALL_DEPTH = 2;
+  while (pending.length > 0) {
+    const { functionNode, depth } = pending.shift();
+    if (depth >= MAX_HELPER_CALL_DEPTH) continue;
+    walkOwnFunction(functionNode, (node) => {
+      if (node.type !== "CallExpression" || node.callee?.type !== "Identifier") return;
+      const called = functionsByBinding.get(model.resolve(node.callee));
+      if (!called || reachableFunctions.has(called)) return;
+      reachableFunctions.add(called);
+      pending.push({ functionNode: called, depth: depth + 1 });
+    });
+  }
+
+  return { hooks, model, reachableFunctions, flowFor };
+}
+
 function flattenLogical(node, operator, terms = []) {
   if (node?.type === "LogicalExpression" && node.operator === operator) {
     flattenLogical(node.left, operator, terms);
@@ -497,9 +887,26 @@ function logicalExpressionHasApiKey(node, source, operand) {
   return found;
 }
 
-function collectWebviewAuth(source, ast) {
+function collectWebviewAuth(source, ast, topology) {
   const patches = [];
   const already = [];
+  const evidence = [];
+
+  function evidenceFunction(node) {
+    const functionNode = topology.model.nearestFunctionScope(node)?.node;
+    if (!isPluginFunctionNode(functionNode)) return null;
+    return functionNode;
+  }
+
+  function isHookReturnEvidence(node) {
+    const functionNode = evidenceFunction(node);
+    return (
+      functionNode != null &&
+      topology.reachableFunctions.has(functionNode) &&
+      topology.flowFor(functionNode).feedsReturn(node)
+    );
+  }
+
   walkWithParent(ast, (node, parent) => {
     if (
       node.type === "LogicalExpression" &&
@@ -523,13 +930,18 @@ function collectWebviewAuth(source, ast) {
       if (terms.length !== 2 || chatTerms.length !== 1 || apiTerms.length !== 1 || apiTerms[0] !== operand) {
         throw new Error("plugin webview auth postcondition has extra or mismatched alternatives");
       }
-      already.push(node.start);
+      const live = isHookReturnEvidence(node);
+      evidence.push({ node, live });
+      if (live) already.push(node.start);
       return;
     }
     if (node.type !== "BinaryExpression" || node.operator !== "===") return;
     const operand = expressionForChatGptSide(node, source);
     if (operand == null || !operand.includes("authMethod")) return;
     if (parent?.type === "LogicalExpression" && parent.operator === "||") return;
+    const live = isHookReturnEvidence(node);
+    evidence.push({ node, live });
+    if (!live) return;
     const original = source.slice(node.start, node.end);
     patches.push({
       id: "plugin_webview_auth",
@@ -539,6 +951,15 @@ function collectWebviewAuth(source, ast) {
       replacement: `(${original}||${operand}===\`apikey\`)`,
     });
   });
+  const detached = evidence.filter((candidate) => !candidate.live);
+  if (detached.length > 0) {
+    if (evidence.length !== 1) {
+      throw new Error(
+        `plugin webview auth expected exactly 1 hook return target, found ${evidence.length}`,
+      );
+    }
+    throw new Error("plugin webview auth evidence is detached from an exported hook return path");
+  }
   return { patches: dedupePatches(patches), already: new Set(already).size };
 }
 
@@ -557,39 +978,34 @@ function featureContextsInFunction(node) {
   return [...contexts];
 }
 
-function collectAvailability(source, ast) {
+function collectAvailability(source, ast, topology) {
   const patches = [];
   const already = [];
-  const contexts = new Map([...FEATURE_CONTEXTS].map((context) => [context, []]));
-  walk(ast, (node) => {
-    if (node.type !== "FunctionDeclaration" && node.type !== "FunctionExpression") return;
-    const functionContexts = featureContextsInFunction(node);
-    if (functionContexts.length === 0) return;
-    if (functionContexts.length !== 1) {
-      throw new Error("plugin webview availability function has ambiguous feature context");
-    }
+  for (const [context, expectedNames] of AVAILABILITY_PROPERTIES_BY_CONTEXT) {
+    const hook = topology.hooks.get(context);
     const objects = [];
-    walkOwnFunction(node, (inner) => {
+    walkOwnFunction(hook, (inner) => {
       if (inner.type !== "ObjectExpression") return;
-      const names = inner.properties.map((property) => property.key?.name ?? property.key?.value);
+      const names = inner.properties.map((property) => pluginPropertyName(property));
       if (names.includes("available") && names.includes("isLoading")) objects.push(inner);
     });
-    if (objects.length > 0) contexts.get(functionContexts[0]).push(...objects);
-  });
-  for (const [context, expectedNames] of AVAILABILITY_PROPERTIES_BY_CONTEXT) {
-    const objects = contexts.get(context);
     if (objects.length !== 1) {
       throw new Error(
         `plugin webview availability ${context} expected exactly 1 object, found ${objects.length}`,
       );
     }
     const object = objects[0];
+    if (!topology.flowFor(hook).feedsReturn(object)) {
+      throw new Error(
+        `plugin webview availability ${context} is detached from the exported hook return path`,
+      );
+    }
     const properties = object.properties.filter((property) => property.type === "Property");
     const availabilityProperties = properties.filter((property) =>
-      ["allowed", "available"].includes(property.key?.name ?? property.key?.value),
+      ["allowed", "available"].includes(pluginPropertyName(property)),
     );
     const names = availabilityProperties.map(
-      (property) => property.key?.name ?? property.key?.value,
+      (property) => pluginPropertyName(property),
     );
     if (
       names.length !== expectedNames.length ||
@@ -600,7 +1016,7 @@ function collectAvailability(source, ast) {
       );
     }
     for (const property of availabilityProperties) {
-      const name = property.key?.name ?? property.key?.value;
+      const name = pluginPropertyName(property);
       const value = source.slice(property.value.start, property.value.end);
       if (value === "!0") already.push(property.value.start);
       else {
@@ -617,7 +1033,7 @@ function collectAvailability(source, ast) {
   return { patches: dedupePatches(patches), already: new Set(already).size };
 }
 
-function collectStatsig(source, ast, comments) {
+function collectStatsig(source, ast, comments, topology) {
   const markerComments = exactMarkerComments(comments, PLUGIN_STATSIG_MARKER);
   const markerBody = PLUGIN_STATSIG_MARKER.slice(2, -2).trim();
   if (
@@ -631,40 +1047,38 @@ function collectStatsig(source, ast, comments) {
   }
   const patches = [];
   const attached = [];
-  const contextFunctions = new Map([...FEATURE_CONTEXTS].map((context) => [context, []]));
-  walk(ast, (node) => {
-    if (node.type !== "FunctionDeclaration" && node.type !== "FunctionExpression") return;
-    const contexts = featureContextsInFunction(node);
-    if (contexts.length === 0) return;
-    if (contexts.length !== 1) {
-      throw new Error("plugin webview statsig function has ambiguous feature context");
-    }
-    contextFunctions.get(contexts[0]).push(node);
-  });
   for (const context of FEATURE_CONTEXTS) {
-    const functions = contextFunctions.get(context);
-    if (functions.length !== 1) {
-      throw new Error(
-        `plugin webview statsig ${context} expected exactly 1 function, found ${functions.length}`,
-      );
-    }
+    const hook = topology.hooks.get(context);
     const targets = [];
-    walkOwnFunction(functions[0], (inner) => {
+    const detached = [];
+    walkOwnFunction(hook, (inner) => {
+      let target = null;
       if (
         inner.type === "CallExpression" &&
         inner.callee?.type === "Identifier" &&
         inner.arguments?.length === 1 &&
         /^\d{6,}$/.test(String(getLiteralValue(inner.arguments[0]) ?? ""))
       ) {
-        targets.push({ kind: "patch", node: inner });
+        target = { kind: "patch", node: inner };
       }
       if (
         isAlwaysTrueExpression(inner) &&
         markerComments.some((comment) => comment.start === inner.end)
       ) {
-        targets.push({ kind: "already", node: inner });
+        target = { kind: "already", node: inner };
+      }
+      if (!target) return;
+      if (topology.flowFor(hook).feedsReturn(inner)) {
+        targets.push(target);
+      } else {
+        detached.push(target);
       }
     });
+    if (detached.length > 0) {
+      throw new Error(
+        `plugin webview statsig ${context} gate is detached from the exported hook return path`,
+      );
+    }
     if (targets.length !== 1) {
       throw new Error(
         `plugin webview statsig ${context} expected exactly 1 gate, found ${targets.length}`,
@@ -692,9 +1106,10 @@ function collectStatsig(source, ast, comments) {
 
 function patchPluginWebviewSource(source) {
   const { ast, comments } = parsePluginDocument(source, "plugin webview");
-  const auth = collectWebviewAuth(source, ast);
-  const availability = collectAvailability(source, ast);
-  const statsig = collectStatsig(source, ast, comments);
+  const topology = collectWebviewHookTopology(ast);
+  const auth = collectWebviewAuth(source, ast, topology);
+  const availability = collectAvailability(source, ast, topology);
+  const statsig = collectStatsig(source, ast, comments, topology);
   const counts = {
     auth: makeCount(auth.patches.length, auth.already, 1, "plugin webview auth"),
     availability: makeCount(
@@ -719,62 +1134,152 @@ function patchPluginWebviewSource(source) {
   };
 }
 
-function collectMainDefaults(source, ast) {
+function collectMainDefaults(source, ast, model) {
   const patches = [];
   const already = [];
-  const targets = [];
+  const featureObjects = [];
+  const jsReplObjects = [];
   walk(ast, (node) => {
-    if (node.type !== "ObjectExpression") return;
-    const keys = node.properties.map((property) => property.key?.name ?? property.key?.value);
-    const featureMatches = FEATURE_KEYS.filter((key) => keys.includes(key));
-    if (featureMatches.length >= 3) {
-      for (const property of node.properties) {
-        const name = property.key?.name ?? property.key?.value;
-        if (!FEATURE_KEYS.includes(name)) continue;
-        targets.push(property.value.start);
-        const value = source.slice(property.value.start, property.value.end);
-        if (value === "!1") {
-          patches.push({
-            id: `feature_default_${name}`,
-            start: property.value.start,
-            end: property.value.end,
-            original: value,
-            replacement: "!0",
-          });
-        } else if (value === "!0") already.push(property.value.start);
+    if (
+      node.type === "VariableDeclarator" &&
+      node.id.type === "Identifier" &&
+      node.init?.type === "ObjectExpression"
+    ) {
+      const properties = node.init.properties.filter(
+        (property) => property.type === "Property",
+      );
+      const featureProperties = properties.filter((property) =>
+        FEATURE_KEYS.includes(property.key?.name ?? property.key?.value),
+      );
+      const booleanFeatureProperties = featureProperties.filter((property) =>
+        ["!0", "!1"].includes(source.slice(property.value.start, property.value.end)),
+      );
+      if (
+        new Set(
+          featureProperties.map(
+            (property) => property.key?.name ?? property.key?.value,
+          ),
+        ).size >= 3 &&
+        booleanFeatureProperties.length === featureProperties.length
+      ) {
+        featureObjects.push({
+          binding: model.bindingForDeclaration(node.id),
+          node: node.init,
+          properties: featureProperties,
+        });
       }
     }
-    if (node.properties.length === 1) {
-      const property = node.properties[0];
-      const name = property.key?.name ?? property.key?.value;
-      if (name !== "features.js_repl") return;
-      targets.push(property.value.start);
-      const value = source.slice(property.value.start, property.value.end);
-      if (value === "!1") {
-        patches.push({
-          id: "feature_js_repl",
-          start: property.value.start,
-          end: property.value.end,
-          original: value,
-          replacement: "!0",
-        });
-      } else if (value === "!0") already.push(property.value.start);
+    if (node.type !== "ObjectExpression") return;
+    const properties = node.properties.filter((property) => property.type === "Property");
+    if (
+      properties.some(
+        (property) =>
+          (property.key?.name ?? property.key?.value) === "features.js_repl",
+      )
+    ) {
+      jsReplObjects.push({ node, properties });
     }
   });
-  return {
-    patches: dedupePatches(patches),
-    already: new Set(already).size,
-    targets: new Set(targets).size,
-  };
+
+  const objectKeysBindings = new Set();
+  walk(ast, (node) => {
+    if (
+      node.type !== "CallExpression" ||
+      node.callee?.type !== "MemberExpression" ||
+      node.callee.object?.type !== "Identifier" ||
+      node.callee.object.name !== "Object" ||
+      pluginPropertyName(node.callee) !== "keys" ||
+      node.arguments.length !== 1 ||
+      node.arguments[0].type !== "Identifier"
+    ) {
+      return;
+    }
+    const binding = model.resolve(node.arguments[0]);
+    if (binding) objectKeysBindings.add(binding);
+  });
+
+  if (featureObjects.length !== 1) {
+    throw new Error(
+      `plugin defaults expected exactly 1 desktop feature object, found ${featureObjects.length}`,
+    );
+  }
+  const featureObject = featureObjects[0];
+  if (!featureObject.binding || !objectKeysBindings.has(featureObject.binding)) {
+    throw new Error(
+      "plugin defaults desktop feature object binding must be live through Object.keys",
+    );
+  }
+  for (const key of FEATURE_KEYS) {
+    const matches = featureObject.properties.filter(
+      (property) => (property.key?.name ?? property.key?.value) === key,
+    );
+    if (matches.length !== 1) {
+      throw new Error(
+        `plugin defaults expected ${key} exactly once, found ${matches.length}`,
+      );
+    }
+    const property = matches[0];
+    const value = source.slice(property.value.start, property.value.end);
+    if (value === "!1") {
+      patches.push({
+        id: `feature_default_${key}`,
+        start: property.value.start,
+        end: property.value.end,
+        original: value,
+        replacement: "!0",
+      });
+    } else if (value === "!0") {
+      already.push(property.value.start);
+    }
+  }
+
+  if (jsReplObjects.length !== 1) {
+    throw new Error(
+      `plugin defaults features.js_repl expected exactly 1 object, found ${jsReplObjects.length}`,
+    );
+  }
+  const jsReplObject = jsReplObjects[0];
+  const jsReplProperties = jsReplObject.properties.filter(
+    (property) =>
+      (property.key?.name ?? property.key?.value) === "features.js_repl",
+  );
+  if (
+    jsReplObject.node.properties.length !== 1 ||
+    jsReplProperties.length !== 1
+  ) {
+    throw new Error("plugin defaults features.js_repl expected an exact singleton object");
+  }
+  const jsRepl = jsReplProperties[0];
+  const jsReplValue = source.slice(jsRepl.value.start, jsRepl.value.end);
+  if (jsReplValue === "!1") {
+    patches.push({
+      id: "feature_js_repl",
+      start: jsRepl.value.start,
+      end: jsRepl.value.end,
+      original: jsReplValue,
+      replacement: "!0",
+    });
+  } else if (jsReplValue === "!0") {
+    already.push(jsRepl.value.start);
+  } else {
+    throw new Error("plugin defaults features.js_repl expected exactly !1 or !0");
+  }
+
+  return { patches: dedupePatches(patches), already: new Set(already).size };
 }
 
-function collectMainFilter(source, ast, comments) {
+function collectMainFilter(source, ast, comments, model) {
   const patches = [];
   const already = [];
-  const declarations = new Map();
+  const { bindingsByFunction } = collectFunctionBindings(ast, model);
+  const initializersByBinding = new Map();
   walk(ast, (node) => {
     if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && node.init) {
-      declarations.set(node.id.name, node.init);
+      const binding = model.bindingForDeclaration(node.id);
+      if (!binding) return;
+      const initializers = initializersByBinding.get(binding) ?? [];
+      initializers.push(node.init);
+      initializersByBinding.set(binding, initializers);
     }
   });
   const markerComments = exactMarkerComments(comments, PLUGIN_FILTER_MARKER);
@@ -788,26 +1293,87 @@ function collectMainFilter(source, ast, comments) {
   ) {
     throw new Error("plugin bundled filter marker is malformed");
   }
+
+  const reconcileScopes = new Set();
+  walk(ast, (node) => {
+    if (
+      node.type === "CallExpression" &&
+      pluginPropertyName(node.callee) === "info" &&
+      getLiteralValue(node.arguments[0]) === "bundled_plugins_reconcile_started"
+    ) {
+      reconcileScopes.add(model.nearestFunctionScope(node));
+    }
+  });
+
+  function isDescriptorCollection(binding) {
+    const initializers = initializersByBinding.get(binding) ?? [];
+    return initializers.some(
+      (initializer) =>
+        initializer.type === "ArrayExpression" &&
+        initializer.elements.some(
+          (element) =>
+            element?.type === "ObjectExpression" &&
+            element.properties.some(
+              (property) => pluginPropertyName(property) === "isAvailable",
+            ),
+        ),
+    );
+  }
+
+  function reachesMarketplaceConsumer(filterCall) {
+    const functionScope = model.nearestFunctionScope(filterCall);
+    const selectorFunction = functionScope?.node;
+    if (
+      !isPluginFunctionNode(selectorFunction) ||
+      !functionReturnsNode(selectorFunction, filterCall)
+    ) {
+      return false;
+    }
+    const selectorBinding = bindingsByFunction.get(selectorFunction);
+    if (!selectorBinding) return false;
+
+    const resultBindings = new Set();
+    walk(ast, (node) => {
+      if (
+        node.type !== "VariableDeclarator" ||
+        node.id.type !== "Identifier" ||
+        node.init?.type !== "CallExpression" ||
+        node.init.callee?.type !== "Identifier" ||
+        model.resolve(node.init.callee) !== selectorBinding
+      ) {
+        return;
+      }
+      const binding = model.bindingForDeclaration(node.id);
+      if (binding) resultBindings.add(binding);
+    });
+
+    let reachesConsumer = false;
+    walk(ast, (node) => {
+      if (
+        node.type === "Property" &&
+        pluginPropertyName(node) === "marketplacePluginDescriptors" &&
+        node.value?.type === "Identifier" &&
+        resultBindings.has(model.resolve(node.value)) &&
+        reconcileScopes.has(model.nearestFunctionScope(node))
+      ) {
+        reachesConsumer = true;
+      }
+    });
+    return reachesConsumer;
+  }
+
   walk(ast, (node) => {
     if (
       node.type !== "CallExpression" ||
       node.callee?.type !== "MemberExpression" ||
-      node.callee.property?.name !== "filter" ||
+      pluginPropertyName(node.callee) !== "filter" ||
       node.arguments.length !== 1 ||
       node.arguments[0].type !== "ArrowFunctionExpression"
     ) return;
     if (node.callee.object.type !== "Identifier") return;
-    const collection = declarations.get(node.callee.object.name);
-    if (
-      collection?.type !== "ArrayExpression" ||
-      !collection.elements.some(
-        (element) =>
-          element?.type === "ObjectExpression" &&
-          element.properties.some(
-            (property) => (property.key?.name ?? property.key?.value) === "isAvailable",
-          ),
-      )
-    ) return;
+    const collectionBinding = model.resolve(node.callee.object);
+    if (!collectionBinding || !isDescriptorCollection(collectionBinding)) return;
+    if (!reachesMarketplaceConsumer(node)) return;
     const callback = node.arguments[0];
     const callbackSource = source.slice(callback.start, callback.end);
     if (callbackSource.includes("isAvailable") && callbackSource.includes("features")) {
@@ -871,8 +1437,9 @@ function collectMainPeer(source, ast) {
 
 function patchPluginMainSource(source) {
   const { ast, comments } = parsePluginDocument(source, "plugin main");
-  const defaults = collectMainDefaults(source, ast);
-  const filter = collectMainFilter(source, ast, comments);
+  const model = buildPluginLexicalModel(ast);
+  const defaults = collectMainDefaults(source, ast, model);
+  const filter = collectMainFilter(source, ast, comments, model);
   const peer = collectMainPeer(source, ast);
   const counts = {
     defaults: makeCount(defaults.patches.length, defaults.already, FEATURE_KEYS.length + 1, "plugin defaults"),
