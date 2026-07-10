@@ -20,6 +20,9 @@ const ROOT_PKG = path.join(__dirname, "..", "package.json");
 const SRC_DIR = path.join(__dirname, "..", "src");
 
 function findUpstreamPkg() {
+  const windowsAsarPackage = path.join(SRC_DIR, "win", "_asar", "package.json");
+  if (fs.existsSync(windowsAsarPackage)) return windowsAsarPackage;
+
   for (const plat of ["unix", "win"]) {
     const p = path.join(SRC_DIR, plat, "package.json");
     if (fs.existsSync(p)) return p;
@@ -35,7 +38,7 @@ function main() {
 
   const upstreamPath = findUpstreamPkg();
   if (!upstreamPath) {
-    console.error("[x] No upstream package.json found in src/{unix,win}/");
+    console.error("[x] No upstream package.json found in src/win/_asar or src/{unix,win}/");
     process.exit(1);
   }
 
