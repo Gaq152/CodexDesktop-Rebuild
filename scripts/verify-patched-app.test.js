@@ -46,7 +46,17 @@ const MARKERS = [
     id: "plugin-availability",
     contract: "plugin",
     file: ".vite/build/main-features.js",
-    text: "const availablePlugins = bundledPlugins.filter(()=>!0);",
+    text: [
+      "function setupBundledPlugins(features) {",
+      "  const selectBundledPlugins = current => bundledPlugins.filter(()=>!0);",
+      "  const reconcile = () => {",
+      "    const descriptors = selectBundledPlugins(features);",
+      "    logger.info(`bundled_plugins_reconcile_started`);",
+      "    return install({ marketplacePluginDescriptors:descriptors });",
+      "  };",
+      "  return reconcile;",
+      "}",
+    ].join("\n"),
   },
   {
     id: "delete-route",
@@ -155,6 +165,7 @@ function writeMarkerFile(fixture, relativeFile) {
     );
     source = [
       `const desktopFeatures = { browserPane:${browserValue}, inAppBrowserUse:${browserValue}, inAppBrowserUseAllowed:${browserValue}, externalBrowserUse:${browserValue}, externalBrowserUseAllowed:${browserValue}, computerUse:${computerValue}, computerUseNodeRepl:${computerValue}, control:!0, multiWindow:!0 };`,
+      "const desktopFeatureKeys = Object.keys(desktopFeatures);",
       fixture.includedMarkers.has(pluginMarker.id) ? pluginMarker.text : "",
     ]
       .filter(Boolean)
@@ -233,6 +244,67 @@ test("plugin rejects unrelated availability decoys", (t) => {
       "const windowsOverride = { ...defaults, inAppBrowserUse:!0, computerUse:!0, computerUseNodeRepl:!0 };",
       "const browser = { featureName:`browser_use`, available:!0, isLoading:!1 };",
       "const computer = { featureName:`computer_use`, available:!0, isLoading:!1 };",
+    ].join("\n"),
+    true,
+  );
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("plugin"),
+  );
+});
+
+test("plugin requires browser and computer defaults in the same object", (t) => {
+  const fixture = createFixture(t, {
+    omitMarkers: ["browser-availability", "computer-availability"],
+  });
+  writeText(
+    path.join(fixture.asarRoot, ".vite", "build", "main-features.js"),
+    [
+      "const browserOverride = { browserPane:!0, inAppBrowserUse:!0, inAppBrowserUseAllowed:!0, externalBrowserUse:!0, externalBrowserUseAllowed:!0, computerUse:!1, computerUseNodeRepl:!1, control:!0, multiWindow:!0 };",
+      "const computerOverride = { browserPane:!1, inAppBrowserUse:!1, inAppBrowserUseAllowed:!1, externalBrowserUse:!1, externalBrowserUseAllowed:!1, computerUse:!0, computerUseNodeRepl:!0, control:!0, multiWindow:!0 };",
+    ].join("\n"),
+    true,
+  );
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("plugin"),
+  );
+});
+
+test("plugin rejects unrelated always-true filter decoys", (t) => {
+  const fixture = createFixture(t, { omitMarkers: ["plugin-availability"] });
+  writeText(
+    path.join(fixture.asarRoot, ".vite", "build", "main-features.js"),
+    [
+      "const filterNote = `.filter(()=>!0)`;",
+      "/* bundledPlugins.filter(()=>!0) */",
+      "const unrelated = values.filter(()=>!0);",
+    ].join("\n"),
+    true,
+  );
+
+  assert.throws(
+    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
+    (error) => error.message.includes("plugin"),
+  );
+});
+
+test("plugin filter context does not cross a shadowed selector binding", (t) => {
+  const fixture = createFixture(t, { omitMarkers: ["plugin-availability"] });
+  writeText(
+    path.join(fixture.asarRoot, ".vite", "build", "main-features.js"),
+    [
+      "function decoySetup(features) {",
+      "  const selectBundledPlugins = current => bundledPlugins.filter(()=>!0);",
+      "  function unrelated(selectBundledPlugins) {",
+      "    const descriptors = selectBundledPlugins(features);",
+      "    logger.info(`bundled_plugins_reconcile_started`);",
+      "    return install({ marketplacePluginDescriptors:descriptors });",
+      "  }",
+      "  return unrelated;",
+      "}",
     ].join("\n"),
     true,
   );

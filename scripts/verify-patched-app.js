@@ -24,14 +24,6 @@ const FEATURE_DEFAULT_KEYS = new Set([
   "inAppBrowserUseAllowed",
   "multiWindow",
 ]);
-const BROWSER_DEFAULT_KEYS = [
-  "browserPane",
-  "externalBrowserUse",
-  "externalBrowserUseAllowed",
-  "inAppBrowserUse",
-  "inAppBrowserUseAllowed",
-];
-const COMPUTER_DEFAULT_KEYS = ["computerUse", "computerUseNodeRepl"];
 
 function walk(node, visitor, rootFunction = null) {
   if (!node || typeof node !== "object") return;
@@ -173,7 +165,42 @@ function isAlwaysTrue(node) {
   );
 }
 
-function hasPatchedFeatureDefaults(source, requiredKeys) {
+function collectScopes(ast) {
+  const scopes = [ast];
+  walk(ast, (node) => {
+    if (isFunctionNode(node)) scopes.push(node);
+  });
+  return scopes;
+}
+
+function isObjectKeysCallFor(node, bindingName) {
+  return (
+    node?.type === "CallExpression" &&
+    node.callee?.type === "MemberExpression" &&
+    !node.callee.computed &&
+    node.callee.object?.type === "Identifier" &&
+    node.callee.object.name === "Object" &&
+    node.callee.property?.type === "Identifier" &&
+    node.callee.property.name === "keys" &&
+    node.arguments.length === 1 &&
+    node.arguments[0]?.type === "Identifier" &&
+    node.arguments[0].name === bindingName
+  );
+}
+
+function scopeUsesDefaultFeatureKeys(scope, bindingName) {
+  let found = false;
+  walk(
+    scope,
+    (node) => {
+      if (isObjectKeysCallFor(node, bindingName)) found = true;
+    },
+    scope,
+  );
+  return found;
+}
+
+function hasPatchedDesktopFeatureDefaults(source) {
   if (
     !source.includes("browserPane") ||
     !source.includes("computerUse") ||
@@ -189,21 +216,217 @@ function hasPatchedFeatureDefaults(source, requiredKeys) {
     return false;
   }
 
+  return collectScopes(ast).some((scope) => {
+    let found = false;
+    walk(
+      scope,
+      (node) => {
+        if (
+          found ||
+          node.type !== "VariableDeclarator" ||
+          node.id?.type !== "Identifier" ||
+          node.init?.type !== "ObjectExpression"
+        ) {
+          return;
+        }
+        const properties = new Map();
+        for (const property of node.init.properties) {
+          const name = propertyName(property);
+          if (name) properties.set(name, property.value);
+        }
+        if (
+          [...FEATURE_DEFAULT_KEYS].every((name) =>
+            isAlwaysTrue(properties.get(name)),
+          ) &&
+          scopeUsesDefaultFeatureKeys(scope, node.id.name)
+        ) {
+          found = true;
+        }
+      },
+      scope,
+    );
+    return found;
+  });
+}
+
+function memberPropertyName(member) {
+  if (member?.type !== "MemberExpression") return null;
+  if (!member.computed && member.property?.type === "Identifier") {
+    return member.property.name;
+  }
+  return stringValue(member.property);
+}
+
+function isAlwaysTrueFilterCall(node) {
+  if (
+    node?.type !== "CallExpression" ||
+    memberPropertyName(node.callee) !== "filter" ||
+    node.arguments.length !== 1
+  ) {
+    return false;
+  }
+  const callback = node.arguments[0];
+  return (
+    callback?.type === "ArrowFunctionExpression" &&
+    callback.params.length === 0 &&
+    isAlwaysTrue(callback.body)
+  );
+}
+
+function containsBundledReconcileStartCall(node) {
+  let found = false;
+  walk(node, (child) => {
+    if (
+      child.type === "CallExpression" &&
+      memberPropertyName(child.callee) === "info" &&
+      stringValue(child.arguments[0]) === "bundled_plugins_reconcile_started"
+    ) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+function directSelectorBindings(functionNode) {
+  const bindings = [];
+  walk(
+    functionNode,
+    (node) => {
+      if (
+        node.type === "VariableDeclarator" &&
+        node.id?.type === "Identifier" &&
+        node.init?.type === "ArrowFunctionExpression" &&
+        isAlwaysTrueFilterCall(node.init.body)
+      ) {
+        bindings.push(node.id.name);
+      }
+    },
+    functionNode,
+  );
+  return bindings;
+}
+
+function descendantFunctionScopes(functionNode) {
+  const scopes = [functionNode];
+  walk(functionNode, (node) => {
+    if (node !== functionNode && isFunctionNode(node)) scopes.push(node);
+  });
+  return scopes;
+}
+
+function patternBindsName(pattern, bindingName) {
+  if (!pattern) return false;
+  if (pattern.type === "Identifier") return pattern.name === bindingName;
+  if (pattern.type === "AssignmentPattern") {
+    return patternBindsName(pattern.left, bindingName);
+  }
+  if (pattern.type === "RestElement") {
+    return patternBindsName(pattern.argument, bindingName);
+  }
+  if (pattern.type === "ArrayPattern") {
+    return pattern.elements.some((element) =>
+      patternBindsName(element, bindingName),
+    );
+  }
+  if (pattern.type === "ObjectPattern") {
+    return pattern.properties.some((property) =>
+      property.type === "RestElement"
+        ? patternBindsName(property.argument, bindingName)
+        : patternBindsName(property.value, bindingName),
+    );
+  }
+  return false;
+}
+
+function scopeShadowsBinding(scope, bindingName) {
+  if (
+    (scope.id?.type === "Identifier" && scope.id.name === bindingName) ||
+    scope.params?.some((param) => patternBindsName(param, bindingName))
+  ) {
+    return true;
+  }
+
+  let found = false;
+  walk(
+    scope,
+    (node) => {
+      if (
+        node.type === "VariableDeclarator" &&
+        patternBindsName(node.id, bindingName)
+      ) {
+        found = true;
+      }
+    },
+    scope,
+  );
+  return found;
+}
+
+function bindingFeedsMarketplaceDescriptors(scope, selectorName) {
+  const resultBindings = new Set();
+  walk(
+    scope,
+    (node) => {
+      if (
+        node.type === "VariableDeclarator" &&
+        node.id?.type === "Identifier" &&
+        node.init?.type === "CallExpression" &&
+        node.init.callee?.type === "Identifier" &&
+        node.init.callee.name === selectorName
+      ) {
+        resultBindings.add(node.id.name);
+      }
+    },
+    scope,
+  );
+  if (resultBindings.size === 0) return false;
+
+  let found = false;
+  walk(scope, (node) => {
+    if (
+      node.type === "Property" &&
+      propertyName(node) === "marketplacePluginDescriptors" &&
+      node.value?.type === "Identifier" &&
+      resultBindings.has(node.value.name)
+    ) {
+      found = true;
+    }
+  });
+  return found && containsBundledReconcileStartCall(scope);
+}
+
+function hasPatchedBundledPluginFilter(source) {
+  if (
+    !source.includes("bundled_plugins_reconcile_started") ||
+    !source.includes("marketplacePluginDescriptors") ||
+    !source.includes(".filter")
+  ) {
+    return false;
+  }
+
+  let ast;
+  try {
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  } catch {
+    return false;
+  }
+
   let found = false;
   walk(ast, (node) => {
-    if (found || node.type !== "ObjectExpression" || node.properties.length < 5) {
+    if (
+      found ||
+      !isFunctionNode(node) ||
+      !containsBundledReconcileStartCall(node)
+    ) {
       return;
     }
-    const properties = new Map();
-    for (const property of node.properties) {
-      const name = propertyName(property);
-      if (name) properties.set(name, property.value);
-    }
-    const featureKeyCount = [...properties.keys()].filter((name) =>
-      FEATURE_DEFAULT_KEYS.has(name),
-    ).length;
-    if (featureKeyCount < 5) return;
-    found = requiredKeys.every((name) => isAlwaysTrue(properties.get(name)));
+    const scopes = descendantFunctionScopes(node);
+    found = directSelectorBindings(node).some((selectorName) =>
+      scopes.some((scope) =>
+        (scope === node || !scopeShadowsBinding(scope, selectorName)) &&
+        bindingFeedsMarketplaceDescriptors(scope, selectorName),
+      ),
+    );
   });
   return found;
 }
@@ -236,18 +459,12 @@ const CONTRACT_DEFINITIONS = [
     sameBundle: true,
     markers: [
       {
-        label: "browser availability postcondition",
-        matches: (source) =>
-          hasPatchedFeatureDefaults(source, BROWSER_DEFAULT_KEYS),
-      },
-      {
-        label: "computer availability postcondition",
-        matches: (source) =>
-          hasPatchedFeatureDefaults(source, COMPUTER_DEFAULT_KEYS),
+        label: "browser/computer default-feature object postcondition",
+        matches: hasPatchedDesktopFeatureDefaults,
       },
       {
         label: "bundled plugin availability postcondition",
-        matches: (source) => /\.filter\(\s*\(\s*\)\s*=>\s*!0\s*\)/.test(source),
+        matches: hasPatchedBundledPluginFilter,
       },
     ],
   },
