@@ -38,6 +38,10 @@ Thumbs.db
 *.tmp
 *.temp
 
+# Local agent design and implementation plans
+/docs/superpowers/
+/.superpowers/
+
 # Native binaries (downloaded via npm in CI)
 resources/bin/
 resources/codex

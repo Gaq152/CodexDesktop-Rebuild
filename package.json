@@ -68,5 +68,8 @@
   "codexBuildNumber": "1272",
   "codexSparkleFeedUrl": "https://persistent.oaistatic.com/codex-app-prod/appcast.xml",
   "codexSparklePublicKey": "rhcBvttuqDFriyNqwTQJR3L4UT1WjIK4QxtwtwusVic=",
-  "codexRebuildWindowsUpdateUrl": "https://github.com/Gaq152/CodexDesktop-Rebuild/releases/download/windows-update-feed"
+  "codexRebuildWindowsUpdateUrl": "https://github.com/Gaq152/CodexDesktop-Rebuild/releases/download/windows-update-feed",
+  "optionalDependencies": {
+    "@openai/codex": "0.144.1"
+  }
 }
