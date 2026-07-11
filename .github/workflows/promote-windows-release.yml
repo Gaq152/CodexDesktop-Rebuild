@@ -1,0 +1,103 @@
+name: Promote Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: GitHub Actions run ID containing the Windows artifacts
+        required: true
+        type: string
+      release_version:
+        description: Exact Windows release version to promote
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  promote:
+    name: Promote Windows artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@v7
+        with:
+          name: Codex-Windows-Installer-x64-${{ inputs.release_version }}
+          path: artifacts/installer
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download Windows portable archive
+        uses: actions/download-artifact@v7
+        with:
+          name: Codex-Windows-Portable-x64-${{ inputs.release_version }}
+          path: artifacts/portable
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download Windows update feed
+        uses: actions/download-artifact@v7
+        with:
+          name: Codex-Windows-UpdateFeed-x64
+          path: artifacts/update-feed
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Resolve Windows installer version
+        id: installer_artifacts
+        run: node scripts/resolve-release-artifacts.js --root artifacts/installer --github-output
+
+      - name: Resolve Windows portable version
+        id: portable_artifacts
+        run: node scripts/resolve-release-artifacts.js --root artifacts/portable --github-output
+
+      - name: Resolve Windows full package version
+        id: package_artifacts
+        run: node scripts/resolve-release-artifacts.js --root artifacts/update-feed --github-output
+
+      - name: Validate exact Windows artifact versions
+        env:
+          EXPECTED_VERSION: ${{ inputs.release_version }}
+          INSTALLER_VERSION: ${{ steps.installer_artifacts.outputs.windows_installer_version }}
+          PORTABLE_VERSION: ${{ steps.portable_artifacts.outputs.windows_portable_version }}
+          PACKAGE_VERSION: ${{ steps.package_artifacts.outputs.windows_installer_version }}
+        run: |
+          set -euo pipefail
+          for pair in \
+            "installer:$INSTALLER_VERSION" \
+            "portable:$PORTABLE_VERSION" \
+            "full package:$PACKAGE_VERSION"
+          do
+            kind="${pair%%:*}"
+            actual="${pair#*:}"
+            if [ -z "$actual" ] || [ "$actual" != "$EXPECTED_VERSION" ]; then
+              echo "Expected $kind version $EXPECTED_VERSION, found ${actual:-missing}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Create or update Windows-only release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ inputs.release_version }}
+          name: Codex ${{ inputs.release_version }}
+          body: |
+            Windows-only release promoted from GitHub Actions run `${{ inputs.source_run_id }}`.
+
+            - App 26.707.31428
+            - CLI 0.144.1
+            - Windows installer: full-only, no delta
+          files: |
+            artifacts/installer/CodexSetup-win-x64-${{ inputs.release_version }}.exe
+            artifacts/portable/Codex-win-x64-${{ inputs.release_version }}.zip
+            artifacts/update-feed/Codex-${{ inputs.release_version }}-full.nupkg
+            artifacts/update-feed/RELEASES
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+          make_latest: true
