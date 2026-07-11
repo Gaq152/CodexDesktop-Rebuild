@@ -81,6 +81,9 @@ jobs:
             fi
           done
 
+      - name: Validate Windows update feed integrity
+        run: node scripts/validate-windows-release-feed.js --root artifacts/update-feed --version "${{ inputs.release_version }}"
+
       - name: Create or update Windows-only release
         uses: softprops/action-gh-release@v3
         with:
@@ -101,3 +104,35 @@ jobs:
           draft: false
           prerelease: false
           make_latest: true
+
+      - name: Reconcile exact release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ inputs.release_version }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          desired_assets="$(mktemp)"
+          actual_assets="$(mktemp)"
+          trap 'rm -f "$desired_assets" "$actual_assets"' EXIT
+          printf '%s\n' \
+            "CodexSetup-win-x64-${RELEASE_VERSION}.exe" \
+            "Codex-win-x64-${RELEASE_VERSION}.zip" \
+            "Codex-${RELEASE_VERSION}-full.nupkg" \
+            "RELEASES" \
+            | sort > "$desired_assets"
+
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' \
+            | while IFS= read -r asset; do
+                if ! grep -Fxq "$asset" "$desired_assets"; then
+                  gh release delete-asset "$RELEASE_TAG" "$asset" -y
+                fi
+              done
+
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' \
+            | sort > "$actual_assets"
+          if ! cmp -s "$desired_assets" "$actual_assets"; then
+            echo "Release asset reconciliation failed for $RELEASE_TAG" >&2
+            diff -u "$desired_assets" "$actual_assets" >&2 || true
+            exit 1
+          fi

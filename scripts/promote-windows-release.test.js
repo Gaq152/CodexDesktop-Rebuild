@@ -57,6 +57,10 @@ test("promotion workflow validates installer portable and full package versions"
   assert.match(workflow, /PORTABLE_VERSION: \$\{\{ steps\.portable_artifacts\.outputs\.windows_portable_version \}\}/);
   assert.match(workflow, /PACKAGE_VERSION: \$\{\{ steps\.package_artifacts\.outputs\.windows_installer_version \}\}/);
   assert.match(workflow, /\[ -z "\$actual" \] \|\| \[ "\$actual" != "\$EXPECTED_VERSION" \]/);
+  assert.match(
+    workflow,
+    /validate-windows-release-feed\.js --root artifacts\/update-feed --version "\$\{\{ inputs\.release_version \}\}"/,
+  );
 });
 
 test("promotion workflow publishes the exact Windows-only release contract", () => {
@@ -74,4 +78,26 @@ test("promotion workflow publishes the exact Windows-only release contract", () 
   assert.match(workflow, /artifacts\/update-feed\/Codex-\$\{\{ inputs\.release_version \}\}-full\.nupkg/);
   assert.match(workflow, /artifacts\/update-feed\/RELEASES/);
   assert.match(workflow, /make_latest: true/);
+});
+
+test("promotion workflow reconciles the release to exactly four Windows assets", () => {
+  const workflow = readWorkflow();
+  const step = workflow.match(
+    /      - name: Reconcile exact release assets\n(?<body>[\s\S]*?)$/,
+  )?.groups.body;
+  assert.ok(step, "release asset reconciliation step should exist after upload");
+  assert.match(step, /GH_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.match(step, /gh release view "\$RELEASE_TAG" --json assets --jq '\.assets\[\]\.name'/);
+  assert.match(step, /gh release delete-asset "\$RELEASE_TAG" "\$asset" -y/);
+  assert.match(step, /sort > "\$actual_assets"/);
+  assert.match(step, /cmp -s "\$desired_assets" "\$actual_assets"/);
+
+  const expectedAssets = [
+    "CodexSetup-win-x64-${RELEASE_VERSION}.exe",
+    "Codex-win-x64-${RELEASE_VERSION}.zip",
+    "Codex-${RELEASE_VERSION}-full.nupkg",
+    "RELEASES",
+  ];
+  for (const asset of expectedAssets) assert.ok(step.includes(`"${asset}"`));
+  assert.doesNotMatch(step, /\.dmg|delta|\*\.nupkg|\*\.zip|\*\.exe/i);
 });
