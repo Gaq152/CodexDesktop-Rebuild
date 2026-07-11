@@ -66,14 +66,44 @@ test("resolveSquirrelReleaseOptions rejects invalid no-delta values", () => {
   );
 });
 
+function assertWindowsUpdateFeedBranches(workflow) {
+  const normalized = workflow.replace(/\r\n/g, "\n");
+  const stepMatch = normalized.match(
+    /      - name: Configure Windows update feed\n(?<step>[\s\S]*?)(?=\n      - name:)/,
+  );
+  assert.ok(stepMatch, "Configure Windows update feed step should exist");
+  const runMatch = stepMatch.groups.step.match(/        run: \|\n(?<runBlock>[\s\S]*)$/);
+  assert.ok(runMatch, "Configure Windows update feed should have a PowerShell run block");
+  const branches = runMatch.groups.runBlock.match(
+    /^(?<before>[\s\S]*?)          if \(\"\$\{\{ inputs\.skip_windows_delta \}\}\" -eq \"true\"\) \{\n(?<trueBranch>[\s\S]*?)          \} else \{\n(?<falseBranch>[\s\S]*?)          \}\n?$/,
+  );
+  assert.ok(branches, "update feed run block should contain the skip_windows_delta if/else");
+
+  const { before, trueBranch, falseBranch } = branches.groups;
+  assert.match(before, /CODEX_REBUILD_UPDATE_URL=\$feed/);
+  assert.doesNotMatch(`${trueBranch}${falseBranch}`, /CODEX_REBUILD_UPDATE_URL/);
+  assert.match(trueBranch, /CODEX_REBUILD_NO_DELTA=1/);
+  assert.doesNotMatch(trueBranch, /CODEX_REBUILD_REMOTE_RELEASES/);
+  assert.match(falseBranch, /CODEX_REBUILD_REMOTE_RELEASES=\$feed/);
+  assert.doesNotMatch(falseBranch, /CODEX_REBUILD_NO_DELTA/);
+}
+
 test("Windows workflow configures mutually exclusive delta modes", () => {
   const workflow = fs.readFileSync(path.join(__dirname, "..", ".github", "workflows", "build.yml"), "utf-8");
   assert.match(workflow, /skip_windows_delta:\s*\n(?:\s+.*\n)*?\s+default: false\s*\n\s+type: boolean/);
-  assert.match(workflow, /CODEX_REBUILD_UPDATE_URL=\$feed/);
-  assert.match(workflow, /if \(\"\$\{\{ inputs\.skip_windows_delta \}\}\" -eq \"true\"\)/);
-  assert.match(workflow, /CODEX_REBUILD_NO_DELTA=1/);
-  assert.match(workflow, /\}\s*else\s*\{/);
-  assert.match(workflow, /CODEX_REBUILD_REMOTE_RELEASES=\$feed/);
+  assertWindowsUpdateFeedBranches(workflow);
+
+  const remoteInTrueBranch = workflow.replace(
+    "CODEX_REBUILD_NO_DELTA=1",
+    "CODEX_REBUILD_REMOTE_RELEASES=$feed",
+  );
+  assert.throws(() => assertWindowsUpdateFeedBranches(remoteInTrueBranch));
+
+  const noDeltaInFalseBranch = workflow.replace(
+    "CODEX_REBUILD_REMOTE_RELEASES=$feed",
+    "CODEX_REBUILD_NO_DELTA=1",
+  );
+  assert.throws(() => assertWindowsUpdateFeedBranches(noDeltaInFalseBranch));
 });
 
 function writePeWithoutVersionInfo(file) {
