@@ -23,7 +23,7 @@ function loadInstallerInternals() {
   const filename = path.join(__dirname, "build-win-installer.js");
   const isolatedSource = source.replace(
     /main\(\)\.catch\(\(error\) => \{[\s\S]*?\n\}\);\s*$/,
-    "module.exports = { markSquirrelAware };\n",
+    "module.exports = { markSquirrelAware, resolveSquirrelReleaseOptions };\n",
   );
   const module = { exports: {} };
   vm.runInNewContext(isolatedSource, {
@@ -36,6 +36,45 @@ function loadInstallerInternals() {
   }, { filename });
   return module.exports;
 }
+
+test("resolveSquirrelReleaseOptions uses remote releases for delta builds", () => {
+  const { resolveSquirrelReleaseOptions } = loadInstallerInternals();
+  assert.deepEqual(resolveSquirrelReleaseOptions({
+    CODEX_REBUILD_REMOTE_RELEASES: "https://example.test/feed",
+  }), {
+    noDelta: false,
+    remoteReleases: "https://example.test/feed",
+  });
+});
+
+test("resolveSquirrelReleaseOptions disables remote releases for full-only builds", () => {
+  const { resolveSquirrelReleaseOptions } = loadInstallerInternals();
+  assert.deepEqual(resolveSquirrelReleaseOptions({
+    CODEX_REBUILD_NO_DELTA: "1",
+    CODEX_REBUILD_REMOTE_RELEASES: "https://example.test/feed",
+  }), {
+    noDelta: true,
+    remoteReleases: undefined,
+  });
+});
+
+test("resolveSquirrelReleaseOptions rejects invalid no-delta values", () => {
+  const { resolveSquirrelReleaseOptions } = loadInstallerInternals();
+  assert.throws(
+    () => resolveSquirrelReleaseOptions({ CODEX_REBUILD_NO_DELTA: "true" }),
+    /CODEX_REBUILD_NO_DELTA.*expected 1/,
+  );
+});
+
+test("Windows workflow configures mutually exclusive delta modes", () => {
+  const workflow = fs.readFileSync(path.join(__dirname, "..", ".github", "workflows", "build.yml"), "utf-8");
+  assert.match(workflow, /skip_windows_delta:\s*\n(?:\s+.*\n)*?\s+default: false\s*\n\s+type: boolean/);
+  assert.match(workflow, /CODEX_REBUILD_UPDATE_URL=\$feed/);
+  assert.match(workflow, /if \(\"\$\{\{ inputs\.skip_windows_delta \}\}\" -eq \"true\"\)/);
+  assert.match(workflow, /CODEX_REBUILD_NO_DELTA=1/);
+  assert.match(workflow, /\}\s*else\s*\{/);
+  assert.match(workflow, /CODEX_REBUILD_REMOTE_RELEASES=\$feed/);
+});
 
 function writePeWithoutVersionInfo(file) {
   const executable = ResEdit.NtExecutable.createEmpty(false, false);

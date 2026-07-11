@@ -316,6 +316,18 @@ function markSquirrelAware(appDirectory, exeName) {
   console.log("   [ok] marked Codex.exe as Squirrel-aware");
 }
 
+function resolveSquirrelReleaseOptions(env) {
+  const raw = env.CODEX_REBUILD_NO_DELTA;
+  if (raw !== undefined && raw !== "" && raw !== "1") {
+    throw new Error("CODEX_REBUILD_NO_DELTA expected 1 when set");
+  }
+  const noDelta = raw === "1";
+  return {
+    noDelta,
+    remoteReleases: noDelta ? undefined : env.CODEX_REBUILD_REMOTE_RELEASES || undefined,
+  };
+}
+
 function getPatchedAppVersion() {
   const packageJsonPath = path.join(PROJECT_ROOT, "src", "win", "_asar", "package.json");
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
@@ -355,6 +367,7 @@ async function main() {
   console.log(`-- additional root runtime entries: ${additionalFiles.length}`);
   const installerVersion = process.env.CODEX_REBUILD_INSTALLER_VERSION || getPatchedAppVersion();
   console.log(`-- installer version: ${installerVersion}`);
+  const squirrelReleaseOptions = resolveSquirrelReleaseOptions(process.env);
 
   await createWindowsInstaller({
     appDirectory,
@@ -372,7 +385,8 @@ async function main() {
     skipUpdateIcon: true,
     setupIcon: path.join(PROJECT_ROOT, "resources", "electron.ico"),
     iconUrl: "https://raw.githubusercontent.com/Gaq152/CodexDesktop-Rebuild/master/resources/electron.ico",
-    remoteReleases: process.env.CODEX_REBUILD_REMOTE_RELEASES || undefined,
+    noDelta: squirrelReleaseOptions.noDelta,
+    remoteReleases: squirrelReleaseOptions.remoteReleases,
   });
 
   const projectSquirrelDir = path.join(PROJECT_ROOT, "out", "make", "squirrel.windows", "x64");
