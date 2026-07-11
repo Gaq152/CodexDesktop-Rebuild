@@ -17,13 +17,19 @@ const LATEST_NATIVE_APP_MAIN =
     '"delete-archived-conversation":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t))',
   );
 const LATEST_NATIVE_DATA_CONTROLS =
-  "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};async function D(e,t){await e(`delete-archived-conversation`,{conversationId:t});await e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)}";
+  "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};async function D(e,t){await e(`delete-archived-conversation`,{conversationId:t});await e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)}export{D as DataControlsSettings}";
 const LEGACY_DATA_CONTROLS =
-  "function legacy(event,send,conversationId,hostId){if(event.currentTarget.dataset.codexConfirmDelete!==`true`)return;send(`delete-conversation`,{conversationId,hostId})}";
+  "function legacy(event,send,conversationId,hostId){if(event.currentTarget.dataset.codexConfirmDelete!==`true`)return;send(`delete-conversation`,{conversationId,hostId})}export{legacy as DataControlsSettings}";
 const UNUSED_NATIVE_APP_MAIN =
   "let unusedRoutes={\"delete-archived-conversation\":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t))}";
 const DEAD_NATIVE_DATA_CONTROLS =
   "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};function Controls(){let neverCalled=(e,t)=>{e(`delete-archived-conversation`,{conversationId:t});e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)};return null}";
+const DEAD_NATIVE_ROUTER =
+  "function dead(){let routes={\"delete-archived-conversation\":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t))};bridge.setMessageHandler((key,payload)=>routes[key](manager,payload))}";
+const DEAD_DECLARATION_DATA_CONTROLS =
+  "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};function Controls(){function neverCalled(e,t){e(`delete-archived-conversation`,{conversationId:t});e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)}return null}";
+const UNUSED_TOP_LEVEL_DATA_CONTROLS =
+  "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};function Unused(e,t){e(`delete-archived-conversation`,{conversationId:t});e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)}function Live(){return null}export{Live as DataControlsSettings}";
 
 test("recognizes the latest native archive-delete path without injecting a redundant route", () => {
   assert.equal(
@@ -181,4 +187,40 @@ test("rejects native archive UI calls inside an uninvoked nested function", () =
     () => patchDataControlsSource(DEAD_NATIVE_DATA_CONTROLS),
     /native archive-delete UI.*(?:live|return|detached|malformed)/i,
   );
+});
+
+test("rejects a native router wholly owned by an uninvoked function", () => {
+  const routeBody = "let routes={\"delete-archived-conversation\":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t))};bridge.setMessageHandler((key,payload)=>routes[key](manager,payload))";
+  for (const source of [
+    DEAD_NATIVE_ROUTER,
+    `const dead=function(){${routeBody}}`,
+    `const dead=()=>{${routeBody}}`,
+  ]) {
+    assert.throws(
+      () => patchAppMainSource(source),
+      /native archive route.*(?:live|router|owner|detached|malformed)/i,
+    );
+  }
+});
+
+test("rejects native archive UI inside an uninvoked function declaration", () => {
+  assert.throws(
+    () => patchDataControlsSource(DEAD_DECLARATION_DATA_CONTROLS),
+    /native archive-delete UI.*(?:live|return|owner|detached|malformed)/i,
+  );
+});
+
+test("rejects native archive UI in an unused top-level function", () => {
+  const body = "e(`delete-archived-conversation`,{conversationId:t});e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)";
+  const label = "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};";
+  for (const source of [
+    UNUSED_TOP_LEVEL_DATA_CONTROLS,
+    `${label}const Unused=function(e,t){${body}};function Live(){return null}export{Live as DataControlsSettings}`,
+    `${label}const Unused=(e,t)=>{${body}};function Live(){return null}export{Live as DataControlsSettings}`,
+  ]) {
+    assert.throws(
+      () => patchDataControlsSource(source),
+      /native archive-delete UI.*(?:live|return|owner|detached|malformed)/i,
+    );
+  }
 });

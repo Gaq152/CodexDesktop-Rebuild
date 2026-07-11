@@ -437,13 +437,138 @@ function assignedArchiveIdentifier(node, ancestors) {
   return null;
 }
 
-function isLiveArchiveRouter(ast, ancestors) {
+function archiveExecutionOwner(ast, ancestors) {
+  return [...ancestors].reverse().find(isArchiveFunction) ?? ast;
+}
+
+function archiveCalledMemberName(call) {
+  let callee = call?.callee;
+  if (callee?.type === "SequenceExpression") callee = callee.expressions.at(-1);
+  if (callee?.type !== "MemberExpression") return null;
+  return callee.property?.name ?? archiveLiteral(callee.property);
+}
+
+function createArchiveReachability(ast) {
+  const bindings = new Map();
+  const ownerParents = new Map([[ast, null]]);
+  const addBinding = (owner, name, fn) => {
+    if (!name || !isArchiveFunction(fn)) return;
+    let ownerBindings = bindings.get(owner);
+    if (!ownerBindings) bindings.set(owner, (ownerBindings = new Map()));
+    const values = ownerBindings.get(name) ?? [];
+    if (!values.includes(fn)) values.push(fn);
+    ownerBindings.set(name, values);
+  };
+  walkArchiveWithAncestors(ast, (node, ancestors) => {
+    if (!isArchiveFunction(node)) return;
+    const owner = archiveExecutionOwner(ast, ancestors);
+    ownerParents.set(node, owner);
+    const parent = ancestors.at(-1);
+    if (node.type === "FunctionDeclaration") addBinding(owner, node.id?.name, node);
+    if (parent?.type === "VariableDeclarator" && parent.init === node) {
+      addBinding(owner, parent.id?.type === "Identifier" ? parent.id.name : null, node);
+    }
+    if (parent?.type === "AssignmentExpression" && parent.operator === "=" && parent.right === node) {
+      addBinding(owner, parent.left?.type === "Identifier" ? parent.left.name : null, node);
+    }
+    const call = parent?.type === "CallExpression" && parent.arguments.includes(node) ? parent : null;
+    const declarator = call && ancestors.at(-2)?.type === "VariableDeclarator"
+      ? ancestors.at(-2)
+      : null;
+    const declaration = declarator && ancestors.at(-3)?.type === "VariableDeclaration"
+      ? ancestors.at(-3)
+      : null;
+    if (
+      owner === ast &&
+      call &&
+      declarator?.init === call &&
+      declarator.id.type === "Identifier" &&
+      declaration &&
+      ast.body.includes(declaration) &&
+      call.arguments.filter(isArchiveFunction).length === 1
+    ) addBinding(ast, declarator.id.name, node);
+  });
+
+  const resolve = (owner, name) => {
+    for (let current = owner; current; current = ownerParents.get(current)) {
+      const values = bindings.get(current)?.get(name) ?? [];
+      if (values.length === 1) return values[0];
+      if (values.length > 1) return null;
+    }
+    return null;
+  };
+  const reachable = new Set([ast]);
+  const queue = [ast];
+  const enqueue = (fn) => {
+    if (!isArchiveFunction(fn) || reachable.has(fn)) return;
+    reachable.add(fn);
+    queue.push(fn);
+  };
+
+  for (const statement of ast.body) {
+    if (statement.type !== "ExportNamedDeclaration") continue;
+    if (statement.declaration?.type === "FunctionDeclaration") enqueue(statement.declaration);
+    for (const specifier of statement.specifiers ?? []) {
+      if (specifier.local?.type === "Identifier") enqueue(resolve(ast, specifier.local.name));
+    }
+  }
+  function walkExecutableOwner(node, owner, parent = null) {
+    if (!node || typeof node !== "object") return;
+    if (node !== owner && isArchiveFunction(node)) {
+      if (parent?.type === "CallExpression" && parent.callee === node) enqueue(node);
+      return;
+    }
+    if (node.type === "CallExpression") {
+      let callee = node.callee;
+      if (callee.type === "SequenceExpression") callee = callee.expressions.at(-1);
+      if (callee?.type === "Identifier") enqueue(resolve(owner, callee.name));
+      if (callee?.type === "CallExpression") {
+        for (const argument of callee.arguments) {
+          if (isArchiveFunction(argument)) enqueue(argument);
+        }
+      }
+      const memberName = archiveCalledMemberName(node);
+      if (["jsx", "jsxs", "createElement"].includes(memberName)) {
+        const component = node.arguments[0];
+        if (component?.type === "Identifier") enqueue(resolve(owner, component.name));
+      }
+      if (["setMessageHandler", "useEffect", "useLayoutEffect"].includes(memberName)) {
+        for (const argument of node.arguments) {
+          if (isArchiveFunction(argument)) enqueue(argument);
+          if (argument?.type === "Identifier") enqueue(resolve(owner, argument.name));
+        }
+      }
+    }
+    for (const [key, child] of Object.entries(node)) {
+      if (key === "type" || key === "start" || key === "end") continue;
+      if (Array.isArray(child)) {
+        for (const item of child) walkExecutableOwner(item, owner, node);
+      } else {
+        walkExecutableOwner(child, owner, node);
+      }
+    }
+  }
+
+  while (queue.length > 0) {
+    const owner = queue.shift();
+    walkExecutableOwner(owner, owner);
+  }
+  return {
+    isReachable(owner) {
+      return reachable.has(owner);
+    },
+  };
+}
+
+function isLiveArchiveRouter(ast, ancestors, reachability) {
   const routeObject = ancestors.at(-1);
   if (routeObject?.type !== "ObjectExpression") return false;
   const binding = assignedArchiveIdentifier(routeObject, ancestors.slice(0, -1));
   if (!binding) return false;
+  const routeOwner = archiveExecutionOwner(ast, ancestors);
+  if (!reachability.isReachable(routeOwner)) return false;
   const consumers = [];
-  walkArchive(ast, (node) => {
+  walkArchiveWithAncestors(ast, (node, callAncestors) => {
     if (
       node.type !== "CallExpression" ||
       node.callee.type !== "MemberExpression" ||
@@ -451,6 +576,8 @@ function isLiveArchiveRouter(ast, ancestors) {
       node.arguments.length !== 1 ||
       !isArchiveFunction(node.arguments[0])
     ) return;
+    const callOwner = archiveExecutionOwner(ast, callAncestors);
+    if (!reachability.isReachable(callOwner)) return;
     const handler = node.arguments[0];
     const routeKey = handler.params[0]?.type === "Identifier" ? handler.params[0].name : null;
     if (!routeKey || handler.params.some((param) => param.type === "Identifier" && param.name === binding)) {
@@ -481,6 +608,7 @@ function isLiveArchiveRouter(ast, ancestors) {
 
 function inspectArchiveAppMainSource(source) {
   const ast = parseArchiveSource(source, "archive app-main");
+  const reachability = createArchiveReachability(ast);
   const properties = { native: [], legacy: [] };
   const tokens = { native: 0, legacy: 0 };
   walkArchiveWithAncestors(ast, (node, ancestors) => {
@@ -495,7 +623,7 @@ function inspectArchiveAppMainSource(source) {
   const native = properties.native.filter(({ property, ancestors }) => {
     const callback = callbackForWrappedRoute(property);
     if (!callback || callback.params.length !== 2 || callback.params[0].type !== "Identifier") return false;
-    if (!isLiveArchiveRouter(ast, ancestors)) return false;
+    if (!isLiveArchiveRouter(ast, ancestors, reachability)) return false;
     const manager = callback.params[0].name;
     const conversationId = objectPatternBinding(callback.params[1], "conversationId");
     if (!conversationId) return false;
@@ -515,7 +643,7 @@ function inspectArchiveAppMainSource(source) {
   const legacy = properties.legacy.filter(({ property, ancestors }) => {
     const callback = callbackForWrappedRoute(property);
     if (!callback || callback.params.length !== 2 || callback.params[0].type !== "Identifier") return false;
-    if (!isLiveArchiveRouter(ast, ancestors)) return false;
+    if (!isLiveArchiveRouter(ast, ancestors, reachability)) return false;
     const manager = callback.params[0].name;
     const conversationId = objectPatternBinding(callback.params[1], "conversationId");
     if (!conversationId) return false;
@@ -799,6 +927,7 @@ function isLiveNativeArchiveMutation(fn) {
 
 function inspectArchiveDataControlsSource(source) {
   const ast = parseArchiveSource(source, "archive data-controls");
+  const reachability = createArchiveReachability(ast);
   const tokenCounts = new Map([
     ["delete-archived-conversation", 0],
     ["settings.dataControls.archivedChats.delete", 0],
@@ -821,8 +950,9 @@ function inspectArchiveDataControlsSource(source) {
   });
   const nativeFunctions = [];
   const legacyFunctions = [];
-  walkArchive(ast, (node) => {
-    if (node.type !== "FunctionDeclaration" && node.type !== "FunctionExpression") return;
+  walkArchiveWithAncestors(ast, (node, ancestors) => {
+    if (!isArchiveFunction(node)) return;
+    if (!reachability.isReachable(node)) return;
     const functionSource = source.slice(node.start, node.end);
     const hasNativeContext =
       functionSource.includes("delete-archived-conversation") ||

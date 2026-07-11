@@ -120,7 +120,7 @@ const MARKERS = [
     id: "delete-protocol",
     contract: "archive-delete",
     file: "webview/assets/data-controls-fixture.js",
-    text: "const labels={delete:{id:`settings.dataControls.archivedChats.delete`}};function remove(send,conversationId){send(`delete-archived-conversation`,{conversationId});send(`delete-archived-conversation`,{conversationId});return classify(send,`thread/delete`)}",
+    text: "const labels={delete:{id:`settings.dataControls.archivedChats.delete`}};function remove(send,conversationId){send(`delete-archived-conversation`,{conversationId});send(`delete-archived-conversation`,{conversationId});return classify(send,`thread/delete`)}export{remove as DataControlsSettings}",
   },
   {
     id: "sidebar-thread-actions",
@@ -329,7 +329,7 @@ function installStructuralFeatureFixtures(fixture) {
       )
     : withLiveArchiveRouter("");
   const nativeDataControls = fixture.includedMarkers.has("delete-protocol")
-    ? "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};async function remove(send,id){send(`delete-archived-conversation`,{conversationId:id});send(`delete-archived-conversation`,{conversationId:id});return classify(send,`thread/delete`)}"
+    ? "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};async function remove(send,id){send(`delete-archived-conversation`,{conversationId:id});send(`delete-archived-conversation`,{conversationId:id});return classify(send,`thread/delete`)}export{remove as DataControlsSettings}"
     : "let value=1;";
   writeText(
     path.join(fixture.asarRoot, "webview", "assets", "app-main-fixture.js"),
@@ -1027,7 +1027,7 @@ test("archive-delete accepts the unambiguous legacy custom route", (t) => {
   );
   writeText(
     path.join(fixture.asarRoot, "webview", "assets", "data-controls-fixture.js"),
-    "function legacy(event,send,conversationId,hostId){if(event.currentTarget.dataset.codexConfirmDelete!==`true`)return;send(`delete-conversation`,{conversationId,hostId})}",
+    "function legacy(event,send,conversationId,hostId){if(event.currentTarget.dataset.codexConfirmDelete!==`true`)return;send(`delete-conversation`,{conversationId,hostId})}export{legacy as DataControlsSettings}",
   );
   const result = verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION);
   assert.deepEqual(result.contracts["archive-delete"], [
