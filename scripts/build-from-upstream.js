@@ -25,6 +25,7 @@ const {
   getExpectedWindowsMsixVersion,
   resolvePrimaryExecutableNameFromManifest,
 } = require("./windows-app-entry");
+const { resolveMacAppBundle } = require("./mac-app-bundle");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SRC_DIR = path.join(PROJECT_ROOT, "src");
@@ -71,21 +72,12 @@ function buildMac(platform) {
   const variant = platform === "mac-arm64" ? "arm64" : "x64";
   const extractDir = path.join(tempDir, `${variant}-extract`);
 
-  // Find Codex.app
-  let appPath = null;
-  if (fs.existsSync(extractDir)) {
-    const findApp = (dir) => {
-      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (e.name === "Codex.app" && e.isDirectory()) return path.join(dir, e.name);
-        if (e.isDirectory()) { const r = findApp(path.join(dir, e.name)); if (r) return r; }
-      }
-      return null;
-    };
-    appPath = findApp(extractDir);
-  }
-
-  if (!appPath) {
-    console.error(`[x] Codex.app not found in cache. Run sync-upstream first.`);
+  const expectedVersion = getVersion(asarDir);
+  let appPath;
+  try {
+    appPath = resolveMacAppBundle(extractDir, { expectedVersion });
+  } catch (error) {
+    console.error(`[x] ${error.message}. Run sync-upstream first.`);
     process.exit(1);
   }
 
