@@ -1485,6 +1485,48 @@ function classifyPluginTarget(fileName, source) {
   return null;
 }
 
+function planPluginPlatform({ platform, candidates, warn = console.warn }) {
+  const named = {
+    main: candidates.filter((candidate) => /^main-.*\.js$/.test(candidate.fileName)),
+    webview: candidates.filter((candidate) =>
+      /^use-is-plugins-enabled-.*\.js$/.test(candidate.fileName),
+    ),
+  };
+  const matches = { main: [], webview: [] };
+  for (const candidate of candidates) {
+    const kind = classifyPluginTarget(candidate.fileName, candidate.source);
+    if (kind) matches[kind].push(candidate);
+  }
+  if (named.main.length !== matches.main.length) {
+    throw new Error(`plugin main target set is incomplete for ${platform}`);
+  }
+  if (matches.main.length !== 1) {
+    throw new Error(
+      `plugin main expected exactly 1 target for ${platform}, found ${matches.main.length}`,
+    );
+  }
+  if (platform.startsWith("mac-") && named.webview.length === 0) {
+    warn(`[skip] plugin-auth: unsupported target layout on ${platform}`);
+    return { status: "skipped", writes: [] };
+  }
+  if (named.webview.length !== matches.webview.length) {
+    throw new Error(`plugin webview target set is incomplete for ${platform}`);
+  }
+  if (matches.webview.length !== 1) {
+    throw new Error(
+      `plugin webview expected exactly 1 target for ${platform}, found ${matches.webview.length}`,
+    );
+  }
+  const result = patchPluginContracts({
+    mainSource: matches.main[0].source,
+    webviewSource: matches.webview[0].source,
+  });
+  return {
+    status: "ready",
+    writes: [{ matches, result }],
+  };
+}
+
 // ── Target location ──
 
 function locateTargets(platform) {
@@ -1574,29 +1616,20 @@ function main() {
       path.join(SRC_DIR, platformName, "_asar", ".vite", "build"),
       path.join(SRC_DIR, platformName, "_asar", "webview", "assets"),
     ];
-    const matches = { main: [], webview: [] };
+    const candidates = [];
     for (const root of roots) {
       if (!fs.existsSync(root)) continue;
       for (const fileName of fs.readdirSync(root)) {
         if (!fileName.endsWith(".js")) continue;
         const filePath = path.join(root, fileName);
         const source = fs.readFileSync(filePath, "utf-8");
-        const kind = classifyPluginTarget(fileName, source);
-        if (kind) matches[kind].push({ filePath, source });
+        candidates.push({ fileName, filePath, source });
       }
     }
-    for (const kind of ["main", "webview"]) {
-      if (matches[kind].length !== 1) {
-        throw new Error(
-          `plugin ${kind} expected exactly 1 target for ${platformName}, found ${matches[kind].length}`,
-        );
-      }
+    const platformPlan = planPluginPlatform({ platform: platformName, candidates });
+    for (const write of platformPlan.writes) {
+      plans.push({ platform: platformName, ...write });
     }
-    const result = patchPluginContracts({
-      mainSource: matches.main[0].source,
-      webviewSource: matches.webview[0].source,
-    });
-    plans.push({ platform: platformName, matches, result });
   }
 
   for (const plan of plans) {
@@ -1627,4 +1660,5 @@ module.exports = {
   patchPluginWebviewSource,
   patchPluginContracts,
   classifyPluginTarget,
+  planPluginPlatform,
 };

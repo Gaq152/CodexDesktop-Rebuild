@@ -6,6 +6,7 @@ const {
   patchAppMainSource,
   patchDataControlsSource,
   patchArchiveContracts,
+  planArchivePlatform,
 } = require("./patch-archive-delete");
 
 function withLiveRouter(routeEntries) {
@@ -231,4 +232,46 @@ test("rejects native archive UI in an unused top-level function", () => {
       /native archive-delete UI.*(?:live|return|owner|detached|malformed)/i,
     );
   }
+});
+
+test("platform matrix skips only an absent macOS archive route layer", () => {
+  const targets = {
+    appMainTargets: [{ fileName: "app-main-mac.js", source: "const routes={}" }],
+    dataControlsTargets: [{ fileName: "data-controls-mac.js", source: "const controls={}" }],
+  };
+  for (const platform of ["mac-arm64", "mac-x64"]) {
+    const warnings = [];
+    const result = planArchivePlatform({
+      platform,
+      ...targets,
+      warn: (message) => warnings.push(message),
+    });
+    assert.deepEqual(result, { status: "skipped", writes: [] });
+    assert.deepEqual(warnings, [
+      `[skip] archive-delete: unsupported target layout on ${platform}`,
+    ]);
+  }
+  assert.throws(
+    () => planArchivePlatform({ platform: "win", ...targets }),
+    /route.*expected exactly 1.*found 0/i,
+  );
+  assert.throws(
+    () => planArchivePlatform({
+      platform: "mac-arm64",
+      appMainTargets: [{ fileName: "app-main-mac.js", source: 'const route="archive-conversation"' }],
+      dataControlsTargets: targets.dataControlsTargets,
+    }),
+    /route|router|incomplete|expected exactly 1/i,
+  );
+  assert.throws(
+    () => planArchivePlatform({
+      platform: "mac-x64",
+      appMainTargets: [
+        { fileName: "app-main-a.js", source: LATEST_NATIVE_APP_MAIN },
+        { fileName: "app-main-b.js", source: LATEST_NATIVE_APP_MAIN },
+      ],
+      dataControlsTargets: [{ fileName: "data-controls.js", source: LATEST_NATIVE_DATA_CONTROLS }],
+    }),
+    /app-main.*expected exactly 1.*found 2/i,
+  );
 });

@@ -7,6 +7,7 @@ const {
   patchPluginWebviewSource,
   patchPluginContracts,
   classifyPluginTarget,
+  planPluginPlatform,
 } = require("./patch-plugin-auth");
 
 const LATEST_WEBVIEW_FIXTURE = [
@@ -228,4 +229,45 @@ test("classifies the latest main and use-is-plugins-enabled bundles as required 
     "webview",
   );
   assert.equal(classifyPluginTarget("unrelated.js", "const value = 1"), null);
+});
+
+test("platform matrix skips only an absent macOS plugin webview layer with zero writes", () => {
+  const main = { fileName: "main-mac.js", source: LATEST_MAIN_FIXTURE };
+  for (const platform of ["mac-arm64", "mac-x64"]) {
+    const warnings = [];
+    const result = planPluginPlatform({
+      platform,
+      candidates: [main],
+      warn: (message) => warnings.push(message),
+    });
+    assert.deepEqual(result, { status: "skipped", writes: [] });
+    assert.deepEqual(warnings, [
+      `[skip] plugin-auth: unsupported target layout on ${platform}`,
+    ]);
+  }
+  assert.throws(
+    () => planPluginPlatform({ platform: "win", candidates: [main] }),
+    /webview.*expected exactly 1.*found 0/i,
+  );
+  assert.throws(
+    () => planPluginPlatform({
+      platform: "mac-arm64",
+      candidates: [
+        main,
+        { fileName: "use-is-plugins-enabled-incomplete.js", source: "const authMethod=`chatgpt`" },
+      ],
+    }),
+    /webview|incomplete|expected exactly 1/i,
+  );
+  assert.throws(
+    () => planPluginPlatform({
+      platform: "mac-x64",
+      candidates: [
+        main,
+        { fileName: "use-is-plugins-enabled-a.js", source: LATEST_WEBVIEW_FIXTURE },
+        { fileName: "use-is-plugins-enabled-b.js", source: LATEST_WEBVIEW_FIXTURE },
+      ],
+    }),
+    /webview.*expected exactly 1.*found 2/i,
+  );
 });

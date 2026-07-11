@@ -1314,6 +1314,42 @@ function findExactSidebarAsset(platform, pattern, label) {
   return path.join(directory, matches[0]);
 }
 
+function planSidebarPlatform({
+  platform,
+  threadActionTargets,
+  sidebarTargets,
+  warn = console.warn,
+}) {
+  if (threadActionTargets.length !== 1) {
+    throw new Error(
+      `sidebar thread-actions expected exactly 1 bundle for ${platform}, found ${threadActionTargets.length}`,
+    );
+  }
+  if (sidebarTargets.length !== 1) {
+    throw new Error(
+      `sidebar flat-sections expected exactly 1 bundle for ${platform}, found ${sidebarTargets.length}`,
+    );
+  }
+  const threadActions = threadActionTargets[0];
+  const sidebar = sidebarTargets[0];
+  const hasThreadActionsLayer =
+    /archiveThread|sidebarElectron\.archiveThread|archive-conversation|CodexSidebarDeleteAction/.test(
+      threadActions.source,
+    );
+  if (platform.startsWith("mac-") && !hasThreadActionsLayer) {
+    warn(`[skip] sidebar-delete: unsupported target layout on ${platform}`);
+    return { status: "skipped", writes: [] };
+  }
+  const result = patchSidebarContracts({
+    threadActionsSource: threadActions.source,
+    sidebarSource: sidebar.source,
+  });
+  return {
+    status: "ready",
+    writes: [{ threadActions, sidebar, result }],
+  };
+}
+
 function main() {
   const args = process.argv.slice(2);
   const isCheck = args.includes("--check");
@@ -1324,7 +1360,7 @@ function main() {
         fs.existsSync(path.join(SRC_DIR, name, "_asar")),
       );
   if (platforms.length === 0) throw new Error("sidebar-delete expected at least one platform");
-  const plans = platforms.map((platformName) => {
+  const plans = platforms.flatMap((platformName) => {
     const threadActionsPath = findExactSidebarAsset(
       platformName,
       /^thread-actions-.*\.js$/,
@@ -1337,14 +1373,19 @@ function main() {
     );
     const threadActionsSource = fs.readFileSync(threadActionsPath, "utf-8");
     const sidebarSource = fs.readFileSync(sidebarPath, "utf-8");
-    return {
+    const platformPlan = planSidebarPlatform({
       platform: platformName,
-      threadActionsPath,
-      sidebarPath,
-      threadActionsSource,
-      sidebarSource,
-      result: patchSidebarContracts({ threadActionsSource, sidebarSource }),
-    };
+      threadActionTargets: [{ fileName: path.basename(threadActionsPath), path: threadActionsPath, source: threadActionsSource }],
+      sidebarTargets: [{ fileName: path.basename(sidebarPath), path: sidebarPath, source: sidebarSource }],
+    });
+    return platformPlan.writes.map(({ threadActions, sidebar, result }) => ({
+      platform: platformName,
+      threadActionsPath: threadActions.path,
+      sidebarPath: sidebar.path,
+      threadActionsSource: threadActions.source,
+      sidebarSource: sidebar.source,
+      result,
+    }));
   });
   for (const plan of plans) {
     console.log(`  [${plan.platform}] ${isCheck ? "check" : plan.result.status}: thread=${JSON.stringify(plan.result.threadActions.counts)} sidebar=${JSON.stringify(plan.result.sidebar.counts)}`);
@@ -1370,4 +1411,5 @@ module.exports = {
   patchThreadActionsSource,
   patchSidebarSource,
   patchSidebarContracts,
+  planSidebarPlatform,
 };

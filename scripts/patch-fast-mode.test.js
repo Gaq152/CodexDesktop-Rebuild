@@ -2,7 +2,11 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { patchFastModeSource, planFastModeTargets } = require("./patch-fast-mode");
+const {
+  patchFastModeSource,
+  planFastModeTargets,
+  planFastModePlatform,
+} = require("./patch-fast-mode");
 
 const LATEST_FAST_MODE_FIXTURE =
   "function J(e){let t=(0,Y.c)(6),n=i(h),r=e?.hostId??n,a=I(r),o=a?.authMethod===`chatgpt`,c=a?.authMethod??null,l;t[0]!==r||t[1]!==c?(l={authMethod:c,hostId:r},t[0]=r,t[1]=c,t[2]=l):l=t[2];let{data:u,isPending:d}=s(j,l),f=!!a?.isLoading||o&&d,p=o&&!f&&u!=null&&u?.requirements?.featureRequirements?.fast_mode!==!1,m;return t[3]!==f||t[4]!==p?(m={isServiceTierAllowed:p,isLoading:f},t[3]=f,t[4]=p,t[5]=m):m=t[5],m}";
@@ -156,4 +160,47 @@ test("ignores token-only decoy bundles and plans both semantic fast_mode targets
       total: 1,
     });
   }
+});
+
+test("platform matrix skips only an absent macOS fast-mode settings layer", () => {
+  const request = {
+    fileName: "read-service-tier-for-request-mac.js",
+    source: LATEST_FAST_REQUEST_FIXTURE,
+  };
+  for (const platform of ["mac-arm64", "mac-x64"]) {
+    const warnings = [];
+    const result = planFastModePlatform({
+      platform,
+      candidates: [request],
+      warn: (message) => warnings.push(message),
+    });
+    assert.deepEqual(result, { status: "skipped", writes: [] });
+    assert.deepEqual(warnings, [
+      `[skip] fast-mode: unsupported target layout on ${platform}`,
+    ]);
+  }
+  assert.throws(
+    () => planFastModePlatform({ platform: "win", candidates: [request] }),
+    /settings.*expected exactly 1.*found 0/i,
+  );
+
+  const incomplete = {
+    fileName: "use-service-tier-settings-incomplete.js",
+    source: "function settings(){return `fast_mode`}",
+  };
+  assert.throws(
+    () => planFastModePlatform({ platform: "mac-arm64", candidates: [request, incomplete] }),
+    /settings|incomplete|expected exactly 1/i,
+  );
+  assert.throws(
+    () => planFastModePlatform({
+      platform: "mac-x64",
+      candidates: [
+        request,
+        { fileName: "use-service-tier-settings-a.js", source: LATEST_FAST_MODE_FIXTURE },
+        { fileName: "use-service-tier-settings-b.js", source: LATEST_FAST_MODE_FIXTURE },
+      ],
+    }),
+    /settings.*expected exactly 1.*found 2/i,
+  );
 });

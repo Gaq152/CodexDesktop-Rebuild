@@ -1073,6 +1073,42 @@ function findExactAsset(platform, pattern, label) {
   return path.join(directory, matches[0]);
 }
 
+function planArchivePlatform({
+  platform,
+  appMainTargets,
+  dataControlsTargets,
+  warn = console.warn,
+}) {
+  if (appMainTargets.length !== 1) {
+    throw new Error(
+      `archive app-main expected exactly 1 bundle for ${platform}, found ${appMainTargets.length}`,
+    );
+  }
+  if (dataControlsTargets.length !== 1) {
+    throw new Error(
+      `archive data-controls expected exactly 1 bundle for ${platform}, found ${dataControlsTargets.length}`,
+    );
+  }
+  const appMain = appMainTargets[0];
+  const dataControls = dataControlsTargets[0];
+  const hasArchiveRouteLayer =
+    /archive-conversation|delete-archived-conversation|delete-conversation|thread\/delete/.test(
+      appMain.source,
+    );
+  if (platform.startsWith("mac-") && !hasArchiveRouteLayer) {
+    warn(`[skip] archive-delete: unsupported target layout on ${platform}`);
+    return { status: "skipped", writes: [] };
+  }
+  const result = patchArchiveContracts({
+    appMainSource: appMain.source,
+    dataControlsSource: dataControls.source,
+  });
+  return {
+    status: "ready",
+    writes: [{ appMain, dataControls, result }],
+  };
+}
+
 // ─── Main ───────────────────────────────────────────────────────
 
 function main() {
@@ -1087,7 +1123,7 @@ function main() {
         fs.existsSync(path.join(SRC_DIR, name, "_asar")),
       );
   if (platforms.length === 0) throw new Error("archive-delete expected at least one platform");
-  const plans = platforms.map((platformName) => {
+  const plans = platforms.flatMap((platformName) => {
     const appMainPath = findExactAsset(platformName, /^app-main-.*\.js$/, "archive app-main");
     const dataControlsPath = findExactAsset(
       platformName,
@@ -1096,14 +1132,19 @@ function main() {
     );
     const appMainSource = fs.readFileSync(appMainPath, "utf-8");
     const dataControlsSource = fs.readFileSync(dataControlsPath, "utf-8");
-    return {
+    const platformPlan = planArchivePlatform({
       platform: platformName,
-      appMainPath,
-      dataControlsPath,
-      appMainSource,
-      dataControlsSource,
-      result: patchArchiveContracts({ appMainSource, dataControlsSource }),
-    };
+      appMainTargets: [{ fileName: path.basename(appMainPath), path: appMainPath, source: appMainSource }],
+      dataControlsTargets: [{ fileName: path.basename(dataControlsPath), path: dataControlsPath, source: dataControlsSource }],
+    });
+    return platformPlan.writes.map(({ appMain, dataControls, result }) => ({
+      platform: platformName,
+      appMainPath: appMain.path,
+      dataControlsPath: dataControls.path,
+      appMainSource: appMain.source,
+      dataControlsSource: dataControls.source,
+      result,
+    }));
   });
   for (const plan of plans) {
     console.log(`  [${plan.platform}] ${isCheck ? "check" : plan.result.status}: ${JSON.stringify(plan.result.counts)}`);
@@ -1129,4 +1170,5 @@ module.exports = {
   patchAppMainSource,
   patchDataControlsSource,
   patchArchiveContracts,
+  planArchivePlatform,
 };

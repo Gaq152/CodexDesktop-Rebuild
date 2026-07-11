@@ -367,7 +367,7 @@ function patchFastModeSource(source) {
   return result;
 }
 
-function planFastModeTargets(candidates, platform = "platform") {
+function collectFastModeTargetMatches(candidates) {
   const matches = new Map(FAST_MODE_CONTRACT_IDS.map((id) => [id, []]));
   for (const candidate of candidates) {
     const result = analyzeFastModeSource(candidate.source);
@@ -389,6 +389,11 @@ function planFastModeTargets(candidates, platform = "platform") {
     if (!FAST_MODE_FILE_PATTERNS.get(targetId).test(fileName)) continue;
     matches.get(targetId).push({ ...candidate, result });
   }
+  return matches;
+}
+
+function planFastModeTargets(candidates, platform = "platform") {
+  const matches = collectFastModeTargetMatches(candidates);
   for (const targetId of FAST_MODE_CONTRACT_IDS) {
     const contractMatches = matches.get(targetId);
     if (contractMatches.length !== 1) {
@@ -399,6 +404,27 @@ function planFastModeTargets(candidates, platform = "platform") {
     }
   }
   return FAST_MODE_CONTRACT_IDS.map((targetId) => matches.get(targetId)[0]);
+}
+
+function planFastModePlatform({ platform, candidates, warn = console.warn }) {
+  const settingsCandidates = candidates.filter((candidate) =>
+    FAST_MODE_FILE_PATTERNS.get("fast_mode_settings_auth_gate").test(
+      candidate.fileName ?? path.basename(candidate.path ?? ""),
+    ),
+  );
+  if (platform.startsWith("mac-") && settingsCandidates.length === 0) {
+    const matches = collectFastModeTargetMatches(candidates);
+    const requestMatches = matches.get("fast_mode_request_auth_gate");
+    if (requestMatches.length !== 1) {
+      throw new Error(
+        `fast_mode fast_mode_request_auth_gate expected exactly 1 target bundle for ${platform}, found ${requestMatches.length}`,
+      );
+    }
+    warn(`[skip] fast-mode: unsupported target layout on ${platform}`);
+    return { status: "skipped", writes: [] };
+  }
+  const plans = planFastModeTargets(candidates, platform);
+  return { status: "ready", writes: plans };
 }
 
 function main() {
@@ -424,9 +450,7 @@ function main() {
       }
       const fp = path.join(assetsDir, f);
       const src = fs.readFileSync(fp, "utf-8");
-      if (src.includes("fast_mode")) {
-        candidates.push({ platform: plat, path: fp, fileName: f, source: src });
-      }
+      candidates.push({ platform: plat, path: fp, fileName: f, source: src });
     }
   }
 
@@ -435,7 +459,11 @@ function main() {
       (candidate) => candidate.platform === platformName,
     );
     const t0 = Date.now();
-    const platformPlans = planFastModeTargets(platformCandidates, platformName);
+    const platformPlan = planFastModePlatform({
+      platform: platformName,
+      candidates: platformCandidates,
+    });
+    const platformPlans = platformPlan.writes;
     for (const plan of platformPlans) {
       console.log(
         `  [${platformName}] ${relPath(plan.path)} (parse ${Date.now() - t0}ms)`,
@@ -470,4 +498,5 @@ module.exports = {
   analyzeFastModeSource,
   patchFastModeSource,
   planFastModeTargets,
+  planFastModePlatform,
 };

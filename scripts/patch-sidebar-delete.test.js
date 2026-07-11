@@ -6,6 +6,7 @@ const {
   patchThreadActionsSource,
   patchSidebarSource,
   patchSidebarContracts,
+  planSidebarPlatform,
 } = require("./patch-sidebar-delete");
 
 const LATEST_THREAD_ACTIONS = [
@@ -143,5 +144,47 @@ test("rejects a delete action whose route and returned binding are inert", () =>
   assert.throws(
     () => patchThreadActionsSource(inert),
     /thread-actions|delete parameters|delete route|returned|binding|postcondition/i,
+  );
+});
+
+test("platform matrix skips only an absent macOS sidebar thread-actions layer", () => {
+  const targets = {
+    threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const actions={}" }],
+    sidebarTargets: [{ fileName: "sidebar-flat-sections-mac.js", source: LATEST_SIDEBAR }],
+  };
+  for (const platform of ["mac-arm64", "mac-x64"]) {
+    const warnings = [];
+    const result = planSidebarPlatform({
+      platform,
+      ...targets,
+      warn: (message) => warnings.push(message),
+    });
+    assert.deepEqual(result, { status: "skipped", writes: [] });
+    assert.deepEqual(warnings, [
+      `[skip] sidebar-delete: unsupported target layout on ${platform}`,
+    ]);
+  }
+  assert.throws(
+    () => planSidebarPlatform({ platform: "win", ...targets }),
+    /messages.*found 0/i,
+  );
+  assert.throws(
+    () => planSidebarPlatform({
+      platform: "mac-arm64",
+      threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const archiveThread=1" }],
+      sidebarTargets: targets.sidebarTargets,
+    }),
+    /thread-actions|messages|action|incomplete/i,
+  );
+  assert.throws(
+    () => planSidebarPlatform({
+      platform: "mac-x64",
+      threadActionTargets: [
+        { fileName: "thread-actions-a.js", source: LATEST_THREAD_ACTIONS },
+        { fileName: "thread-actions-b.js", source: LATEST_THREAD_ACTIONS },
+      ],
+      sidebarTargets: targets.sidebarTargets,
+    }),
+    /thread-actions.*expected exactly 1.*found 2/i,
   );
 });
