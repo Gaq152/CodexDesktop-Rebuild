@@ -1320,7 +1320,8 @@ function inspectThreadActionsLayer(code) {
   walk(ast, (node) => {
     if (
       (node.type === "Identifier" && node.name === "archiveThread") ||
-      literalValue(node) === "archive-conversation"
+      literalValue(node) === "archive-conversation" ||
+      literalValue(node) === "sidebarElectron.archiveThread"
     ) recognizedEvidence = true;
     if (node.type === "Property" && propertyName(node) === "archiveThread") {
       const idProperty = node.value?.type === "ObjectExpression"

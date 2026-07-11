@@ -193,6 +193,20 @@ test("platform matrix skips only an absent macOS sidebar thread-actions layer", 
 test("macOS sidebar skip strictly rejects malformed sidebar evidence", () => {
   assert.throws(
     () => planSidebarPlatform({
+      platform: "mac-arm64",
+      threadActionTargets: [{
+        fileName: "thread-actions-mac.js",
+        source: "const messages={wrong:{id:`sidebarElectron.archiveThread`}}",
+      }],
+      sidebarTargets: [{
+        fileName: "sidebar-flat-sections-mac.js",
+        source: "const sections={}",
+      }],
+    }),
+    /thread-actions|messages|action|malformed|incomplete/i,
+  );
+  assert.throws(
+    () => planSidebarPlatform({
       platform: "mac-x64",
       threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const actions={}" }],
       sidebarTargets: [{
