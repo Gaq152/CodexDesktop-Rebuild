@@ -1,0 +1,222 @@
+name: Promote macOS Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: GitHub Actions run ID containing the macOS artifacts
+        required: true
+        type: string
+      release_version:
+        description: Exact macOS release version to promote
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: promote-macos-v26.707.41301
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote macOS artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate promotion inputs
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid source_run_id: expected a positive integer" >&2
+            exit 1
+          fi
+          if [ "$RELEASE_VERSION" != "26.707.41301" ]; then
+            echo "Invalid release_version: expected 26.707.41301" >&2
+            exit 1
+          fi
+
+      - name: Validate source run provenance
+        id: source_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          CURRENT_REF: ${{ github.ref }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          repository_json="$(gh api "repos/${GITHUB_REPOSITORY}")"
+          default_branch="$(jq -er '.default_branch | select(length > 0)' <<<"$repository_json")"
+          if [ "$CURRENT_REF" != "refs/heads/${default_branch}" ]; then
+            echo "Promotion must run from the default branch refs/heads/${default_branch}" >&2
+            exit 1
+          fi
+          default_ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${default_branch}")"
+          default_sha="$(jq -er '.object.sha | select(length > 0)' <<<"$default_ref_json")"
+          if [ "$CURRENT_SHA" != "$default_sha" ]; then
+            echo "Promotion SHA must be the current default branch head" >&2
+            exit 1
+          fi
+
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}")"
+          if ! jq -e \
+            --argjson source_run_id "$SOURCE_RUN_ID" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg default_branch "$default_branch" \
+            '
+              .id == $source_run_id and
+              .repository.full_name == $repository and
+              .head_repository.full_name == $repository and
+              .head_branch == $default_branch and
+              .path == ".github/workflows/build.yml" and
+              .event == "workflow_dispatch" and
+              .status == "completed" and
+              .conclusion == "success"
+            ' <<<"$run_json" >/dev/null
+          then
+            echo "Source run is not a successful completed build.yml dispatch from this repository" >&2
+            exit 1
+          fi
+
+          source_head_sha="$(jq -er '.head_sha | select(test("^[0-9a-f]{40}$"))' <<<"$run_json")"
+          echo "source_head_sha=$source_head_sha" >> "$GITHUB_OUTPUT"
+
+          artifacts_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100")"
+          if ! jq -e '
+            .total_count == 2 and
+            ([.artifacts[].name] | sort) == ["Codex-macOS-arm64", "Codex-macOS-x64"] and
+            all(.artifacts[]; .expired == false)
+          ' <<<"$artifacts_json" >/dev/null
+          then
+            echo "Source run must contain exactly the two unexpired macOS architecture artifacts" >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download macOS arm64 artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: Codex-macOS-arm64
+          path: artifacts/arm64
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download macOS x64 artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: Codex-macOS-x64
+          path: artifacts/x64
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate exact macOS artifacts
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: node scripts/validate-macos-release-artifacts.js --root artifacts --version "$RELEASE_VERSION"
+
+      - name: Require unused target release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v26.707.41301
+        run: |
+          set -euo pipefail
+          release_json="$(mktemp)"
+          tag_json="$(mktemp)"
+          trap 'rm -f "$release_json" "$tag_json"' EXIT
+
+          if ! release_status="$(curl --silent --show-error \
+            --output "$release_json" \
+            --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          then
+            echo "Unable to query existing release $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          case "$release_status" in
+            200)
+              echo "Target release $RELEASE_TAG already exists; refusing overwrite or retry" >&2
+              exit 1
+              ;;
+            404)
+              ;;
+            *)
+              echo "Unexpected API status $release_status while querying release $RELEASE_TAG" >&2
+              exit 1
+              ;;
+          esac
+
+          if ! tag_status="$(curl --silent --show-error \
+            --output "$tag_json" \
+            --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          then
+            echo "Unable to query existing tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          case "$tag_status" in
+            200)
+              echo "Target tag $RELEASE_TAG already exists; refusing overwrite or retry" >&2
+              exit 1
+              ;;
+            404)
+              ;;
+            *)
+              echo "Unexpected API status $tag_status while querying tag $RELEASE_TAG" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Create macOS-only release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v26.707.41301
+          name: Codex 26.707.41301
+          target_commitish: ${{ steps.source_run.outputs.source_head_sha }}
+          body: |
+            macOS-only release promoted from GitHub Actions run `${{ inputs.source_run_id }}`.
+
+            - macOS arm64 DMG
+            - macOS x64 DMG
+          files: |
+            artifacts/arm64/Codex-mac-arm64-26.707.41301.dmg
+            artifacts/x64/Codex-mac-x64-26.707.41301.dmg
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          draft: false
+          prerelease: false
+          make_latest: false
+
+      - name: Verify exact promoted release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v26.707.41301
+        run: |
+          set -euo pipefail
+          desired_assets="$(mktemp)"
+          actual_assets="$(mktemp)"
+          trap 'rm -f "$desired_assets" "$actual_assets"' EXIT
+          printf '%s\n' \
+            "Codex-mac-arm64-26.707.41301.dmg" \
+            "Codex-mac-x64-26.707.41301.dmg" \
+            | sort > "$desired_assets"
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' \
+            | sort > "$actual_assets"
+          if ! cmp -s "$desired_assets" "$actual_assets"; then
+            echo "Exact macOS release asset verification failed for $RELEASE_TAG" >&2
+            diff -u "$desired_assets" "$actual_assets" >&2 || true
+            exit 1
+          fi
