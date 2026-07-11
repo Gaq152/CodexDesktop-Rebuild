@@ -284,13 +284,35 @@ function collectAdditionalFiles(appDirectory, exeName) {
 }
 
 function markSquirrelAware(appDirectory, exeName) {
-  const rcedit = path.join(PROJECT_ROOT, "node_modules", "electron-winstaller", "vendor", "rcedit.exe");
   const exePath = path.join(appDirectory, exeName);
-  if (!fs.existsSync(rcedit) || !fs.existsSync(exePath)) return;
+  if (!fs.existsSync(exePath)) {
+    throw new Error(`Packaged executable ${exePath} was not found; cannot mark it Squirrel-aware.`);
+  }
 
-  execFileSync(rcedit, [exePath, "--set-version-string", "SquirrelAwareVersion", "1"], {
-    stdio: "inherit",
-  });
+  const ResEdit = require("resedit");
+  const executable = ResEdit.NtExecutable.from(fs.readFileSync(exePath), { ignoreCert: true });
+  const resources = ResEdit.NtExecutableResource.from(executable);
+  let versions = ResEdit.Resource.VersionInfo.fromEntries(resources.entries);
+
+  if (versions.length === 0) {
+    const version = ResEdit.Resource.VersionInfo.createEmpty();
+    version.lang = 1033;
+    versions = [version];
+  }
+
+  for (const version of versions) {
+    const languages = version.getAllLanguagesForStringValues();
+    const targets = languages.length > 0
+      ? languages
+      : [{ lang: typeof version.lang === "number" ? version.lang : 1033, codepage: 1200 }];
+    for (const language of targets) {
+      version.setStringValue(language, "SquirrelAwareVersion", "1");
+    }
+    version.outputToResourceEntries(resources.entries);
+  }
+
+  resources.outputResource(executable);
+  fs.writeFileSync(exePath, Buffer.from(executable.generate()));
   console.log("   [ok] marked Codex.exe as Squirrel-aware");
 }
 
