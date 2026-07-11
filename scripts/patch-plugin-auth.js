@@ -1486,6 +1486,31 @@ function classifyPluginTarget(fileName, source) {
 }
 
 function planPluginPlatform({ platform, candidates, warn = console.warn }) {
+  if (platform === "win") {
+    const matches = { main: [], webview: [] };
+    for (const candidate of candidates) {
+      const kind = classifyPluginTarget(candidate.fileName, candidate.source);
+      if (kind) matches[kind].push(candidate);
+    }
+    for (const kind of ["main", "webview"]) {
+      if (matches[kind].length !== 1) {
+        throw new Error(
+          `plugin ${kind} expected exactly 1 target for ${platform}, found ${matches[kind].length}`,
+        );
+      }
+    }
+    return {
+      status: "ready",
+      writes: [{
+        matches,
+        result: patchPluginContracts({
+          mainSource: matches.main[0].source,
+          webviewSource: matches.webview[0].source,
+        }),
+      }],
+    };
+  }
+
   const named = {
     main: candidates.filter((candidate) => /^main-.*\.js$/.test(candidate.fileName)),
     webview: candidates.filter((candidate) =>

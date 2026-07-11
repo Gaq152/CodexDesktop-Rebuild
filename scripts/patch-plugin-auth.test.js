@@ -232,6 +232,33 @@ test("classifies the latest main and use-is-plugins-enabled bundles as required 
   assert.equal(classifyPluginTarget("unrelated.js", "const value = 1"), null);
 });
 
+test("Windows plugin planning ignores a webview main bootstrap decoy", () => {
+  const realMain = {
+    fileName: "main-CZpDUN17.js",
+    filePath: ".vite/build/main-CZpDUN17.js",
+    source: LATEST_MAIN_FIXTURE,
+  };
+  const bootstrapDecoy = {
+    fileName: "main-CK8yaEB6.js",
+    filePath: "webview/assets/main-CK8yaEB6.js",
+    source: "import{bootstrap}from`./bootstrap.js`;bootstrap();",
+  };
+  const webview = {
+    fileName: "use-is-plugins-enabled-D8AJYG6G.js",
+    filePath: "webview/assets/use-is-plugins-enabled-D8AJYG6G.js",
+    source: LATEST_WEBVIEW_FIXTURE,
+  };
+
+  const result = planPluginPlatform({
+    platform: "win",
+    candidates: [realMain, bootstrapDecoy, webview],
+  });
+
+  assert.equal(result.status, "ready");
+  assert.deepEqual(result.writes[0].matches.main, [realMain]);
+  assert.deepEqual(result.writes[0].matches.webview, [webview]);
+});
+
 test("platform matrix skips only an absent macOS plugin webview layer with zero writes", () => {
   const main = { fileName: "main-mac.js", source: LATEST_MAIN_FIXTURE };
   for (const platform of ["mac-arm64", "mac-x64"]) {

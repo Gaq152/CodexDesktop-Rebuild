@@ -25,6 +25,12 @@ const LATEST_COMBINED_APP_MAIN = withLiveRouter(
   '"delete-archived-conversation":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t)),' +
     ACTIVE_ROUTE,
 );
+const WINDOWS_COMBINED_APP_MAIN =
+  withLiveRouter(
+    '"archive-conversation":K7(async(e,{conversationId:t,cleanupWorktree:n,source:r})=>{await e.archiveConversation(t,{cleanupWorktree:n,source:r})}),' +
+      '"delete-archived-conversation":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t)),' +
+      ACTIVE_ROUTE,
+  ) + ';const archiveAction="archive-conversation"';
 const LATEST_NATIVE_DATA_CONTROLS =
   "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};async function D(e,t){await e(`delete-archived-conversation`,{conversationId:t});await e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)}export{D as DataControlsSettings}";
 const LEGACY_DATA_CONTROLS =
@@ -275,6 +281,21 @@ test("platform matrix skips only an absent macOS archive route layer", () => {
     }),
     /app-main.*expected exactly 1.*found 2/i,
   );
+});
+
+test("Windows archive planning bypasses macOS absence analysis for a valid combined contract", () => {
+  const appMain = { fileName: "app-main-BEs0GGm0.js", source: WINDOWS_COMBINED_APP_MAIN };
+  const dataControls = { fileName: "data-controls-C3wlrF7v.js", source: LATEST_NATIVE_DATA_CONTROLS };
+
+  const result = planArchivePlatform({
+    platform: "win",
+    appMainTargets: [appMain],
+    dataControlsTargets: [dataControls],
+  });
+
+  assert.equal(result.status, "ready");
+  assert.equal(result.writes[0].result.status, "already");
+  assert.equal(result.writes[0].result.appMain.code, WINDOWS_COMBINED_APP_MAIN);
 });
 
 test("macOS archive skip strictly rejects malformed data-controls evidence", () => {

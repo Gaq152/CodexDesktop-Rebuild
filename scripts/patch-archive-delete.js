@@ -724,8 +724,7 @@ function analyzeArchiveAppMainLayer(source) {
 }
 
 function patchAppMainSource(source) {
-  const analysis = analyzeArchiveAppMainLayer(source);
-  const { inspection } = analysis;
+  const inspection = inspectArchiveAppMainSource(source);
   if (inspection && inspection.mode !== "native") {
     return {
       code: source,
@@ -738,7 +737,8 @@ function patchAppMainSource(source) {
     };
   }
 
-  const matches = analysis.patchableRoutes;
+  const routeRe = /(["`])archive-conversation\1:(\w+)\(async\((\w+),\{conversationId:(\w+),cleanupWorktree:(\w+),source:(\w+)\}\)=>\{\s*await \3\.archiveConversation\(\4,\{cleanupWorktree:\5,source:\6\}\)\s*\}\)/g;
+  const matches = [...source.matchAll(routeRe)];
   if (matches.length !== 1) {
     throw new Error(`archive route expected exactly 1 target, found ${matches.length}`);
   }
@@ -1113,6 +1113,19 @@ function planArchivePlatform({
   }
   const appMain = appMainTargets[0];
   const dataControls = dataControlsTargets[0];
+  if (platform === "win") {
+    return {
+      status: "ready",
+      writes: [{
+        appMain,
+        dataControls,
+        result: patchArchiveContracts({
+          appMainSource: appMain.source,
+          dataControlsSource: dataControls.source,
+        }),
+      }],
+    };
+  }
   const appMainAnalysis = analyzeArchiveAppMainLayer(appMain.source);
   const dataControlsInspection = inspectArchiveDataControlsSource(dataControls.source);
   const appMainAbsent = appMainAnalysis.state === "absent";
