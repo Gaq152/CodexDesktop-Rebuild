@@ -22,6 +22,10 @@ const fs = require("fs");
 const path = require("path");
 const { parse } = require("acorn");
 const { relPath, SRC_DIR } = require("./patch-util");
+const {
+  planRequiredRoles,
+  commitValidatedPlan,
+} = require("./mac-contract-locator");
 
 const CHATGPT_AUTH = "chatgpt";
 const APIKEY_AUTH = "apikey";
@@ -406,7 +410,147 @@ function planFastModeTargets(candidates, platform = "platform") {
   return FAST_MODE_CONTRACT_IDS.map((targetId) => matches.get(targetId)[0]);
 }
 
-function planFastModePlatform({ platform, candidates, warn = console.warn }) {
+function memberPropertyName(node) {
+  if (node?.type !== "MemberExpression") return null;
+  if (!node.computed && node.property.type === "Identifier") {
+    return node.property.name;
+  }
+  if (node.computed && node.property.type === "Literal") {
+    return node.property.value;
+  }
+  return null;
+}
+
+function isFastModeFeatureAccess(node) {
+  if (memberPropertyName(node) !== "fast_mode") return false;
+  const owner = node.object?.type === "ChainExpression" ? node.object.expression : node.object;
+  return memberPropertyName(owner) === "featureRequirements";
+}
+
+function walkFunctionContract(root, visitor) {
+  function visit(node, parent = null) {
+    if (!node || typeof node !== "object") return;
+    if (node !== root && isFunctionNode(node)) return;
+    if (node.type) visitor(node, parent);
+    for (const key of Object.keys(node)) {
+      if (key === "type" || key === "start" || key === "end") continue;
+      const child = node[key];
+      if (Array.isArray(child)) {
+        for (const item of child) visit(item, node);
+      } else {
+        visit(child, node);
+      }
+    }
+  }
+  visit(root);
+}
+
+function roleMarkerEvidence(source, targetId) {
+  const operator =
+    targetId === "fast_mode_settings_auth_gate" ? "===" : "!==";
+  let ast;
+  try {
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  } catch {
+    return [];
+  }
+
+  let markerCount = 0;
+  walk(ast, (node) => {
+    if (!isFunctionNode(node)) return;
+    let hasFastModeFeatureAccess = false;
+    let hasRoleAuthGate = false;
+    walkFunctionContract(node, (child) => {
+      if (isFastModeFeatureAccess(child)) hasFastModeFeatureAccess = true;
+      if (
+        child.type === "BinaryExpression" &&
+        child.operator === operator &&
+        expressionSourceForChatGptSide(child, source) != null
+      ) {
+        hasRoleAuthGate = true;
+      }
+    });
+    if (hasFastModeFeatureAccess && hasRoleAuthGate) markerCount += 1;
+  });
+  return markerCount > 0
+    ? [`${targetId}: exact marker count=${markerCount}`]
+    : [];
+}
+
+function probeMacFastModeRole(candidate, targetId) {
+  const evidence = roleMarkerEvidence(candidate.source, targetId);
+  if (evidence.length === 0) return { state: "irrelevant", evidence: [] };
+
+  let result;
+  try {
+    result = analyzeFastModeSource(candidate.source);
+  } catch (error) {
+    return { state: "owned-malformed", evidence, error };
+  }
+
+  const roleTargets = result.targetIds.filter((id) => id === targetId).length;
+  if (
+    result.counts.total !== 1 ||
+    result.targetIds.length !== 1 ||
+    roleTargets !== 1
+  ) {
+    return {
+      state: "owned-malformed",
+      evidence,
+      error: new Error(
+        `${targetId} strict analyzer expected exactly 1 isolated target, ` +
+          `found role=${roleTargets} total=${result.counts.total}`,
+      ),
+    };
+  }
+  return {
+    state: "exact",
+    evidence: [...evidence, "strict analyzer target count=1"],
+    result,
+  };
+}
+
+function selectedFastModeWrite(selected) {
+  return {
+    role: selected.role,
+    ...selected.candidate,
+    result: selected.result,
+  };
+}
+
+function planMacFastModePlatform({ platform, candidates }) {
+  const plan = planRequiredRoles({
+    platform,
+    roles: [
+      {
+        role: "fast-settings",
+        candidates,
+        probe: (candidate) =>
+          probeMacFastModeRole(candidate, "fast_mode_settings_auth_gate"),
+      },
+      {
+        role: "fast-request",
+        candidates,
+        probe: (candidate) =>
+          probeMacFastModeRole(candidate, "fast_mode_request_auth_gate"),
+      },
+    ],
+  });
+  return {
+    status: "ready",
+    plan,
+    writes: plan.roles.map(selectedFastModeWrite),
+  };
+}
+
+function planFastModePlatform({
+  platform,
+  candidates,
+  warn = console.warn,
+}) {
+  if (platform.startsWith("mac-")) {
+    return planMacFastModePlatform({ platform, candidates });
+  }
   const matches = collectFastModeTargetMatches(candidates);
   const namedCandidates = new Map(
     FAST_MODE_CONTRACT_IDS.map((targetId) => [
@@ -423,19 +567,62 @@ function planFastModePlatform({ platform, candidates, warn = console.warn }) {
       throw new Error(`fast_mode ${targetId} target set is incomplete for ${platform}`);
     }
   }
-  const settingsCandidates = namedCandidates.get("fast_mode_settings_auth_gate");
-  if (platform.startsWith("mac-") && settingsCandidates.length === 0) {
-    const requestMatches = matches.get("fast_mode_request_auth_gate");
-    if (requestMatches.length !== 1) {
-      throw new Error(
-        `fast_mode fast_mode_request_auth_gate expected exactly 1 target bundle for ${platform}, found ${requestMatches.length}`,
-      );
-    }
-    warn(`[skip] fast-mode: unsupported target layout on ${platform}`);
-    return { status: "skipped", writes: [] };
-  }
   const plans = planFastModeTargets(candidates, platform);
-  return { status: "ready", writes: plans };
+  const plan = planRequiredRoles({
+    platform,
+    roles: plans.map((selected, index) => ({
+      role: index === 0 ? "fast-settings" : "fast-request",
+      candidates: [
+        {
+          path: selected.path ?? selected.fileName,
+          fileName: selected.fileName ?? path.basename(selected.path ?? ""),
+          source: selected.source,
+        },
+      ],
+      probe: () => ({
+        state: "exact",
+        evidence: ["Windows exact filename and strict analyzer target"],
+        result: selected.result,
+      }),
+    })),
+  });
+  return {
+    status: "ready",
+    plan,
+    writes: plan.roles.map(selectedFastModeWrite),
+  };
+}
+
+function commitFastModePlatforms({
+  platformPlans,
+  isCheck = false,
+  writeFile = fs.writeFileSync,
+}) {
+  return platformPlans.flatMap(({ plan }) =>
+    commitValidatedPlan({
+      plan,
+      writer: (selected) => {
+        const write = selectedFastModeWrite(selected);
+        if (!isCheck && write.result.code !== write.source) {
+          writeFile(write.path, write.result.code, "utf-8");
+        }
+        return write;
+      },
+    }),
+  );
+}
+
+function executeFastModePlatforms({
+  platformInputs,
+  isCheck = false,
+  writeFile = fs.writeFileSync,
+}) {
+  const platformPlans = platformInputs.map(({ platform, candidates }) => ({
+    platform,
+    ...planFastModePlatform({ platform, candidates }),
+  }));
+  const writes = commitFastModePlatforms({ platformPlans, isCheck, writeFile });
+  return { platformPlans, writes };
 }
 
 function formatFastModeSummary(outcomes) {
@@ -462,7 +649,11 @@ function main() {
     const assetsDir = path.join(SRC_DIR, plat, "_asar", "webview", "assets");
     if (!fs.existsSync(assetsDir)) continue;
     for (const f of fs.readdirSync(assetsDir)) {
-      if (![...FAST_MODE_FILE_PATTERNS.values()].some((pattern) => pattern.test(f))) {
+      const isJavaScript = f.endsWith(".js");
+      const isNamedWindowsTarget = [...FAST_MODE_FILE_PATTERNS.values()].some(
+        (pattern) => pattern.test(f),
+      );
+      if (!isJavaScript || (plat === "win" && !isNamedWindowsTarget)) {
         continue;
       }
       const fp = path.join(assetsDir, f);
@@ -471,35 +662,30 @@ function main() {
     }
   }
 
-  const outcomes = [];
-  const plans = platforms.flatMap((platformName) => {
-    const platformCandidates = candidates.filter(
-      (candidate) => candidate.platform === platformName,
-    );
-    const t0 = Date.now();
-    const platformPlan = planFastModePlatform({
+  const startedAt = Date.now();
+  const execution = executeFastModePlatforms({
+    platformInputs: platforms.map((platformName) => ({
       platform: platformName,
-      candidates: platformCandidates,
-    });
-    outcomes.push({ platform: platformName, status: platformPlan.status });
-    const platformPlans = platformPlan.writes;
-    for (const plan of platformPlans) {
+      candidates: candidates.filter(
+        (candidate) => candidate.platform === platformName,
+      ),
+    })),
+    isCheck,
+  });
+  const outcomes = execution.platformPlans.map(({ platform: platformName, status }) => ({
+    platform: platformName,
+    status,
+  }));
+  for (const platformPlan of execution.platformPlans) {
+    for (const plan of platformPlan.writes) {
       console.log(
-        `  [${platformName}] ${relPath(plan.path)} (parse ${Date.now() - t0}ms)`,
+        `  [${platformPlan.platform}] ${relPath(plan.path)} (parse ${Date.now() - startedAt}ms)`,
       );
       console.log(
         `    [${isCheck ? "check" : plan.result.status}] patchable=${plan.result.counts.patchable} already=${plan.result.counts.already} expected=1`,
       );
       for (const patch of plan.result.patches) {
         console.log(`    ${isCheck ? "?" : "*"} ${patch.original} -> ${patch.replacement}`);
-      }
-    }
-    return platformPlans;
-  });
-  if (!isCheck) {
-    for (const plan of plans) {
-      if (plan.result.code !== plan.source) {
-        fs.writeFileSync(plan.path, plan.result.code, "utf-8");
       }
     }
   }
@@ -516,5 +702,6 @@ module.exports = {
   patchFastModeSource,
   planFastModeTargets,
   planFastModePlatform,
+  executeFastModePlatforms,
   formatFastModeSummary,
 };

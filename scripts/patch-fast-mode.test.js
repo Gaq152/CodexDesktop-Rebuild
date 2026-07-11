@@ -6,6 +6,7 @@ const {
   patchFastModeSource,
   planFastModeTargets,
   planFastModePlatform,
+  executeFastModePlatforms,
   formatFastModeSummary,
 } = require("./patch-fast-mode");
 
@@ -163,75 +164,262 @@ test("ignores token-only decoy bundles and plans both semantic fast_mode targets
   }
 });
 
-test("platform matrix skips only an absent macOS fast-mode settings layer", () => {
-  const request = {
-    fileName: "read-service-tier-for-request-mac.js",
-    source: LATEST_FAST_REQUEST_FIXTURE,
-  };
+test("macOS matrix locates consolidated structural roles and ignores token decoys", () => {
   for (const platform of ["mac-arm64", "mac-x64"]) {
-    const warnings = [];
+    const visited = [];
     const result = planFastModePlatform({
       platform,
-      candidates: [request],
-      warn: (message) => warnings.push(message),
-    });
-    assert.deepEqual(result, { status: "skipped", writes: [] });
-    assert.deepEqual(warnings, [
-      `[skip] fast-mode: unsupported target layout on ${platform}`,
-    ]);
-  }
-  assert.throws(
-    () => planFastModePlatform({ platform: "win", candidates: [request] }),
-    /settings.*expected exactly 1.*found 0/i,
-  );
-
-  const incomplete = {
-    fileName: "use-service-tier-settings-incomplete.js",
-    source: "function settings(){return `fast_mode`}",
-  };
-  assert.throws(
-    () => planFastModePlatform({ platform: "mac-arm64", candidates: [request, incomplete] }),
-    /settings|incomplete|expected exactly 1/i,
-  );
-  assert.throws(
-    () => planFastModePlatform({
-      platform: "mac-x64",
       candidates: [
-        request,
-        { fileName: "use-service-tier-settings-a.js", source: LATEST_FAST_MODE_FIXTURE },
-        { fileName: "use-service-tier-settings-b.js", source: LATEST_FAST_MODE_FIXTURE },
+        {
+          path: "webview/assets/main-bootstrap.js",
+          fileName: "main-bootstrap.js",
+          source:
+            "import './fast_mode.js';const token=`fast_mode chatgpt`;" +
+            "function unrelated(auth){const label=`fast_mode`;return auth===`chatgpt`}",
+        },
+        {
+          path: "webview/assets/broken-token-decoy.js",
+          fileName: "broken-token-decoy.js",
+          source:
+            "function broken(auth,r){return r.featureRequirements.fast_mode&&auth===`chatgpt`",
+        },
+        {
+          path: "webview/assets/app-initial~app-main~onboarding-page-D4eTO0KG.js",
+          fileName: "app-initial~app-main~onboarding-page-D4eTO0KG.js",
+          source: LATEST_FAST_MODE_FIXTURE,
+        },
+        {
+          path: "webview/assets/chatgpt~gwqc41kz-Bj9ubaFn.js",
+          fileName: "chatgpt~gwqc41kz-Bj9ubaFn.js",
+          source: LATEST_FAST_REQUEST_FIXTURE,
+        },
       ],
-    }),
-    /settings.*expected exactly 1.*found 2/i,
+    });
+    assert.equal(result.status, "ready");
+    visited.push(...result.writes.map((selected) => selected.role));
+    assert.deepEqual(visited, ["fast-settings", "fast-request"]);
+    assert.deepEqual(
+      result.writes.map((selected) => selected.fileName),
+      [
+        "app-initial~app-main~onboarding-page-D4eTO0KG.js",
+        "chatgpt~gwqc41kz-Bj9ubaFn.js",
+      ],
+    );
+  }
+});
+
+test("macOS accepts already-patched structural settings and request roles", () => {
+  const settings = patchFastModeSource(LATEST_FAST_MODE_FIXTURE).code;
+  const request = patchFastModeSource(LATEST_FAST_REQUEST_FIXTURE).code;
+  const result = planFastModePlatform({
+    platform: "mac-arm64",
+    candidates: [
+      {
+        path: "webview/assets/consolidated-settings.js",
+        fileName: "consolidated-settings.js",
+        source: settings,
+      },
+      {
+        path: "webview/assets/consolidated-request.js",
+        fileName: "consolidated-request.js",
+        source: request,
+      },
+    ],
+  });
+  assert.deepEqual(
+    result.writes.map(({ result: writeResult }) => writeResult.status),
+    ["already", "already"],
   );
 });
 
-test("macOS fast-mode skip rejects every filename-recognized request half-contract", () => {
-  assert.throws(
-    () => planFastModePlatform({
-      platform: "mac-arm64",
-      candidates: [
+test("macOS malformed and duplicate role plans fail before any writer", async (t) => {
+  const cases = [
+    [
+      "owned malformed settings",
+      [
         {
-          fileName: "read-service-tier-for-request-valid.js",
+          path: "webview/assets/settings-malformed.js",
+          fileName: "settings-malformed.js",
+          source:
+            "function settings(auth,r){return r.featureRequirements.fast_mode&&(auth===`chatgpt`||auth===`apikey`||auth===`amazonBedrock`)}",
+        },
+        {
+          path: "webview/assets/request.js",
+          fileName: "request.js",
+          source: LATEST_FAST_REQUEST_FIXTURE,
+        },
+      ],
+      /fast-settings|settings-malformed|owned-malformed|extra alternatives/i,
+    ],
+    [
+      "duplicate exact settings",
+      [
+        {
+          path: "webview/assets/settings-one.js",
+          fileName: "settings-one.js",
+          source: LATEST_FAST_MODE_FIXTURE,
+        },
+        {
+          path: "webview/assets/settings-two.js",
+          fileName: "settings-two.js",
+          source: LATEST_FAST_MODE_FIXTURE,
+        },
+        {
+          path: "webview/assets/request.js",
+          fileName: "request.js",
+          source: LATEST_FAST_REQUEST_FIXTURE,
+        },
+      ],
+      /fast-settings|settings-one|settings-two|exact candidates: 2/i,
+    ],
+    [
+      "owned malformed request",
+      [
+        {
+          path: "webview/assets/settings.js",
+          fileName: "settings.js",
+          source: LATEST_FAST_MODE_FIXTURE,
+        },
+        {
+          path: "webview/assets/request-malformed.js",
+          fileName: "request-malformed.js",
+          source:
+            "function request(auth,r){if((auth!==`chatgpt`&&auth!==`apikey`)/* CodexRebuildFastModeRequestAuth */){return!0}return r.featureRequirements.fast_mode}",
+        },
+      ],
+      /fast-request|request-malformed|owned-malformed|strict mismatch/i,
+    ],
+    [
+      "duplicate exact request",
+      [
+        {
+          path: "webview/assets/settings.js",
+          fileName: "settings.js",
+          source: LATEST_FAST_MODE_FIXTURE,
+        },
+        {
+          path: "webview/assets/request-one.js",
+          fileName: "request-one.js",
           source: LATEST_FAST_REQUEST_FIXTURE,
         },
         {
-          fileName: "read-service-tier-for-request-half.js",
-          source: "function request(){return `fast_mode`}",
+          path: "webview/assets/request-two.js",
+          fileName: "request-two.js",
+          source: LATEST_FAST_REQUEST_FIXTURE,
         },
       ],
-    }),
-    /request|incomplete|expected exactly 1|found 2/i,
+      /fast-request|request-one|request-two|exact candidates: 2/i,
+    ],
+  ];
+
+  for (const platform of ["mac-arm64", "mac-x64"]) {
+    for (const [name, candidates, expected] of cases) {
+      await t.test(`${platform}: ${name}`, () => {
+        assert.throws(
+          () =>
+            planFastModePlatform({
+              platform,
+              candidates,
+            }),
+          expected,
+        );
+      });
+    }
+  }
+});
+
+function validMacCandidates(prefix) {
+  return [
+    {
+      path: `webview/assets/${prefix}-settings.js`,
+      fileName: `${prefix}-settings.js`,
+      source: LATEST_FAST_MODE_FIXTURE,
+    },
+    {
+      path: `webview/assets/${prefix}-request.js`,
+      fileName: `${prefix}-request.js`,
+      source: LATEST_FAST_REQUEST_FIXTURE,
+    },
+  ];
+}
+
+test("platform orchestrator plans every platform before commit writes", async (t) => {
+  await t.test("a later invalid platform leaves every file untouched", () => {
+    const writes = [];
+    assert.throws(
+      () =>
+        executeFastModePlatforms({
+          platformInputs: [
+            { platform: "mac-arm64", candidates: validMacCandidates("arm") },
+            {
+              platform: "mac-x64",
+              candidates: [
+                ...validMacCandidates("x64"),
+                {
+                  path: "webview/assets/x64-settings-duplicate.js",
+                  fileName: "x64-settings-duplicate.js",
+                  source: LATEST_FAST_MODE_FIXTURE,
+                },
+              ],
+            },
+          ],
+          writeFile: (...args) => writes.push(args),
+        }),
+      /mac-x64|fast-settings|exact candidates: 2/i,
+    );
+    assert.equal(writes.length, 0);
+  });
+
+  await t.test("successful writes occur in the unified commit phase", () => {
+    const writes = [];
+    const result = executeFastModePlatforms({
+      platformInputs: [
+        { platform: "mac-arm64", candidates: validMacCandidates("arm") },
+        { platform: "mac-x64", candidates: validMacCandidates("x64") },
+      ],
+      writeFile: (...args) => writes.push(args),
+    });
+    assert.equal(result.platformPlans.length, 2);
+    assert.equal(writes.length, 4);
+    assert.deepEqual(
+      writes.map(([filePath]) => filePath),
+      [
+        "webview/assets/arm-settings.js",
+        "webview/assets/arm-request.js",
+        "webview/assets/x64-settings.js",
+        "webview/assets/x64-request.js",
+      ],
+    );
+  });
+});
+
+test("Windows keeps filename-exact target selection", () => {
+  assert.throws(
+    () =>
+      planFastModePlatform({
+        platform: "win",
+        candidates: [
+          {
+            fileName: "consolidated-settings.js",
+            source: LATEST_FAST_MODE_FIXTURE,
+          },
+          {
+            fileName: "read-service-tier-for-request-win.js",
+            source: LATEST_FAST_REQUEST_FIXTURE,
+          },
+        ],
+      }),
+    /settings.*expected exactly 1.*found 0/i,
   );
 });
 
-test("fast-mode summary names skipped platforms without claiming parity", () => {
+test("fast-mode summary reports both macOS architectures ready", () => {
   const summary = formatFastModeSummary([
-    { platform: "mac-arm64", status: "skipped" },
-    { platform: "mac-x64", status: "skipped" },
+    { platform: "mac-arm64", status: "ready" },
+    { platform: "mac-x64", status: "ready" },
     { platform: "win", status: "ready" },
   ]);
-  assert.match(summary, /skipped=\[mac-arm64,mac-x64\]/);
-  assert.match(summary, /ready=\[win\]/);
+  assert.match(summary, /skipped=\[\]/);
+  assert.match(summary, /ready=\[mac-arm64,mac-x64,win\]/);
   assert.doesNotMatch(summary, /\bok\b|contracts satisfied/i);
 });
