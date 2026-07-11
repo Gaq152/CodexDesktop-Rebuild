@@ -15,7 +15,11 @@
 const fs = require("fs");
 const path = require("path");
 const acorn = require("acorn");
-const { locateBundles, relPath, SRC_DIR } = require("./patch-util");
+const { relPath, SRC_DIR } = require("./patch-util");
+const {
+  planRequiredRoles,
+  commitValidatedPlan,
+} = require("./mac-contract-locator");
 
 // ─── Layer 1: app-main route injection ──────────────────────────
 
@@ -1095,12 +1099,211 @@ function findExactAsset(platform, pattern, label) {
   return path.join(directory, matches[0]);
 }
 
+function normalizeArchiveCandidate(candidate) {
+  return {
+    path: candidate.filePath ?? candidate.path ?? candidate.fileName,
+    fileName:
+      candidate.fileName ?? path.basename(candidate.filePath ?? candidate.path ?? ""),
+    source: candidate.source,
+  };
+}
+
+function isArchiveWebviewAsset(candidate) {
+  const normalizedPath = candidate.path.replaceAll("\\", "/");
+  const inAssets =
+    normalizedPath.startsWith("webview/assets/") ||
+    normalizedPath.includes("/webview/assets/");
+  return inAssets && candidate.fileName.endsWith(".js");
+}
+
+function archiveRouteOwnershipEvidence(source) {
+  let ast;
+  try {
+    ast = parseArchiveSource(source, "archive route ownership");
+  } catch {
+    return [];
+  }
+  const reachability = createArchiveReachability(ast);
+  const liveRouteNames = new Set();
+  walkArchiveWithAncestors(ast, (node, ancestors) => {
+    if (node.type !== "Property") return;
+    const name = archivePropertyName(node);
+    if (
+      ![
+        "archive-conversation",
+        "delete-archived-conversation",
+        "delete-conversation",
+      ].includes(name)
+    ) {
+      return;
+    }
+    if (isLiveArchiveRouter(ast, ancestors, reachability)) {
+      liveRouteNames.add(name);
+    }
+  });
+  const evidence = [];
+  if (liveRouteNames.has("archive-conversation")) {
+    evidence.push("archive-conversation property reaches live router consumer");
+  }
+  if (liveRouteNames.has("delete-archived-conversation")) {
+    evidence.push("native archive route property reaches live router consumer");
+  }
+  if (liveRouteNames.has("delete-conversation")) {
+    evidence.push("legacy archive route property reaches live router consumer");
+  }
+  return evidence;
+}
+
+function probeArchiveRoute(candidate) {
+  const evidence = archiveRouteOwnershipEvidence(candidate.source);
+  if (evidence.length === 0) return { state: "irrelevant", evidence: [] };
+  try {
+    analyzeArchiveAppMainLayer(candidate.source);
+    return {
+      state: "exact",
+      evidence: [...evidence, "strict archive route helper satisfied"],
+      result: patchAppMainSource(candidate.source),
+    };
+  } catch (error) {
+    return { state: "owned-malformed", evidence, error };
+  }
+}
+
+function archiveDataControlsOwnershipEvidence(source) {
+  let ast;
+  try {
+    ast = parseArchiveSource(source, "archive data-controls ownership");
+  } catch {
+    return [];
+  }
+  const reachability = createArchiveReachability(ast);
+  let nativeBehaviorFamily = false;
+  let legacyBehaviorFamily = false;
+  walkArchive(ast, (node) => {
+    if (!isArchiveFunction(node)) return;
+    if (!reachability.isReachable(node)) return;
+    if (isDirectNativeArchiveFunction(node) || isLiveNativeArchiveMutation(node)) {
+      nativeBehaviorFamily = true;
+    }
+    const functionSource = source.slice(node.start, node.end);
+    if (
+      functionSource.includes("delete-conversation") &&
+      functionSource.includes("codexConfirmDelete")
+    ) {
+      legacyBehaviorFamily = true;
+    }
+  });
+  const evidence = [];
+  if (nativeBehaviorFamily) {
+    evidence.push("exported live native archive data-controls behavior family");
+  }
+  if (legacyBehaviorFamily) {
+    evidence.push("exported live legacy archive data-controls behavior family");
+  }
+  return evidence;
+}
+
+function probeArchiveDataControls(candidate) {
+  const evidence = archiveDataControlsOwnershipEvidence(candidate.source);
+  try {
+    const inspection = inspectArchiveDataControlsSource(candidate.source);
+    if (!inspection) return { state: "irrelevant", evidence: [] };
+    return {
+      state: "exact",
+      evidence: [
+        ...evidence,
+        `recognized ${inspection.mode} archive data-controls mode`,
+        "strict archive data-controls helper satisfied",
+      ],
+      result: patchDataControlsSource(candidate.source),
+    };
+  } catch (error) {
+    return evidence.length > 0
+      ? { state: "owned-malformed", evidence, error }
+      : { state: "irrelevant", evidence: [] };
+  }
+}
+
+function buildArchivePlan({ platform, route, dataControls, result }) {
+  return planRequiredRoles({
+    platform,
+    roles: [
+      {
+        role: "archive-route",
+        candidates: [normalizeArchiveCandidate(route)],
+        probe: () => ({
+          state: "exact",
+          evidence: ["Windows exact filename and strict archive route helper"],
+          result: result.appMain,
+        }),
+      },
+      {
+        role: "archive-data-controls",
+        candidates: [normalizeArchiveCandidate(dataControls)],
+        probe: () => ({
+          state: "exact",
+          evidence: ["Windows exact filename and strict archive data-controls helper"],
+          result: result.dataControls,
+        }),
+      },
+    ],
+  });
+}
+
+function archiveMatchFromRole(selected) {
+  return {
+    fileName: selected.candidate.fileName,
+    filePath: selected.candidate.path,
+    path: selected.candidate.path,
+    source: selected.candidate.source,
+  };
+}
+
+function previewArchivePlan(plan) {
+  const route = plan.roles.find((selected) => selected.role === "archive-route");
+  const dataControls = plan.roles.find(
+    (selected) => selected.role === "archive-data-controls",
+  );
+  const appMain = archiveMatchFromRole(route);
+  const controls = archiveMatchFromRole(dataControls);
+  return {
+    appMain,
+    dataControls: controls,
+    matches: { route: [appMain], dataControls: [controls] },
+    result: patchArchiveContracts({
+      appMainSource: appMain.source,
+      dataControlsSource: controls.source,
+    }),
+  };
+}
+
+function planMacArchivePlatform({ platform, candidates }) {
+  const scoped = candidates
+    .map(normalizeArchiveCandidate)
+    .filter(isArchiveWebviewAsset);
+  const plan = planRequiredRoles({
+    platform,
+    roles: [
+      { role: "archive-route", candidates: scoped, probe: probeArchiveRoute },
+      {
+        role: "archive-data-controls",
+        candidates: scoped,
+        probe: probeArchiveDataControls,
+      },
+    ],
+  });
+  return { status: "ready", plan, writes: [previewArchivePlan(plan)] };
+}
+
 function planArchivePlatform({
   platform,
   appMainTargets,
   dataControlsTargets,
-  warn = console.warn,
+  candidates,
 }) {
+  if (platform !== "win") {
+    return planMacArchivePlatform({ platform, candidates: candidates ?? [] });
+  }
   if (appMainTargets.length !== 1) {
     throw new Error(
       `archive app-main expected exactly 1 bundle for ${platform}, found ${appMainTargets.length}`,
@@ -1113,38 +1316,63 @@ function planArchivePlatform({
   }
   const appMain = appMainTargets[0];
   const dataControls = dataControlsTargets[0];
-  if (platform === "win") {
-    return {
-      status: "ready",
-      writes: [{
-        appMain,
-        dataControls,
-        result: patchArchiveContracts({
-          appMainSource: appMain.source,
-          dataControlsSource: dataControls.source,
-        }),
-      }],
-    };
-  }
-  const appMainAnalysis = analyzeArchiveAppMainLayer(appMain.source);
-  const dataControlsInspection = inspectArchiveDataControlsSource(dataControls.source);
-  const appMainAbsent = appMainAnalysis.state === "absent";
-  const dataControlsAbsent = dataControlsInspection == null;
-  if (platform.startsWith("mac-") && appMainAbsent && dataControlsAbsent) {
-    warn(`[skip] archive-delete: unsupported target layout on ${platform}`);
-    return { status: "skipped", writes: [] };
-  }
-  if (platform.startsWith("mac-") && appMainAbsent !== dataControlsAbsent) {
-    throw new Error(`archive target set is an incomplete half-contract for ${platform}`);
-  }
   const result = patchArchiveContracts({
     appMainSource: appMain.source,
     dataControlsSource: dataControls.source,
   });
+  const plan = buildArchivePlan({
+    platform,
+    route: appMain,
+    dataControls,
+    result,
+  });
   return {
     status: "ready",
+    plan,
     writes: [{ appMain, dataControls, result }],
   };
+}
+
+function selectedArchiveWrite(selected) {
+  return {
+    role: selected.role,
+    path: selected.candidate.path,
+    fileName: selected.candidate.fileName,
+    source: selected.candidate.source,
+    result: selected.result,
+  };
+}
+
+function commitArchivePlatforms({
+  platformPlans,
+  isCheck = false,
+  writeFile = fs.writeFileSync,
+}) {
+  return platformPlans.flatMap(({ plan }) =>
+    commitValidatedPlan({
+      plan,
+      writer: (selected) => {
+        const write = selectedArchiveWrite(selected);
+        if (!isCheck && write.result.code !== write.source) {
+          writeFile(write.path, write.result.code, "utf-8");
+        }
+        return write;
+      },
+    }),
+  );
+}
+
+function executeArchivePlatforms({
+  platformInputs,
+  isCheck = false,
+  writeFile = fs.writeFileSync,
+}) {
+  const platformPlans = platformInputs.map((input) => ({
+    platform: input.platform,
+    ...planArchivePlatform(input),
+  }));
+  const writes = commitArchivePlatforms({ platformPlans, isCheck, writeFile });
+  return { platformPlans, writes };
 }
 
 function formatArchiveSummary(outcomes) {
@@ -1167,43 +1395,52 @@ function main() {
         fs.existsSync(path.join(SRC_DIR, name, "_asar")),
       );
   if (platforms.length === 0) throw new Error("archive-delete expected at least one platform");
-  const outcomes = [];
-  const plans = platforms.flatMap((platformName) => {
-    const appMainPath = findExactAsset(platformName, /^app-main-.*\.js$/, "archive app-main");
-    const dataControlsPath = findExactAsset(
-      platformName,
-      /^data-controls-.*\.js$/,
-      "archive data-controls",
-    );
-    const appMainSource = fs.readFileSync(appMainPath, "utf-8");
-    const dataControlsSource = fs.readFileSync(dataControlsPath, "utf-8");
-    const platformPlan = planArchivePlatform({
-      platform: platformName,
-      appMainTargets: [{ fileName: path.basename(appMainPath), path: appMainPath, source: appMainSource }],
-      dataControlsTargets: [{ fileName: path.basename(dataControlsPath), path: dataControlsPath, source: dataControlsSource }],
-    });
-    outcomes.push({ platform: platformName, status: platformPlan.status });
-    return platformPlan.writes.map(({ appMain, dataControls, result }) => ({
-      platform: platformName,
-      appMainPath: appMain.path,
-      dataControlsPath: dataControls.path,
-      appMainSource: appMain.source,
-      dataControlsSource: dataControls.source,
-      result,
-    }));
-  });
-  for (const plan of plans) {
-    console.log(`  [${plan.platform}] ${isCheck ? "check" : plan.result.status}: ${JSON.stringify(plan.result.counts)}`);
-  }
-  if (!isCheck) {
-    for (const plan of plans) {
-      if (plan.result.appMain.code !== plan.appMainSource) {
-        fs.writeFileSync(plan.appMainPath, plan.result.appMain.code, "utf-8");
-      }
-      if (plan.result.dataControls.code !== plan.dataControlsSource) {
-        fs.writeFileSync(plan.dataControlsPath, plan.result.dataControls.code, "utf-8");
-      }
+  const platformInputs = platforms.map((platformName) => {
+    if (platformName === "win") {
+      const appMainPath = findExactAsset(platformName, /^app-main-.*\.js$/, "archive app-main");
+      const dataControlsPath = findExactAsset(
+        platformName,
+        /^data-controls-.*\.js$/,
+        "archive data-controls",
+      );
+      return {
+        platform: platformName,
+        appMainTargets: [{
+          fileName: path.basename(appMainPath),
+          path: appMainPath,
+          source: fs.readFileSync(appMainPath, "utf-8"),
+        }],
+        dataControlsTargets: [{
+          fileName: path.basename(dataControlsPath),
+          path: dataControlsPath,
+          source: fs.readFileSync(dataControlsPath, "utf-8"),
+        }],
+      };
     }
+    const directory = path.join(SRC_DIR, platformName, "_asar", "webview", "assets");
+    if (!fs.existsSync(directory)) {
+      throw new Error(`archive asset directory is missing for ${platformName}`);
+    }
+    return {
+      platform: platformName,
+      candidates: fs.readdirSync(directory)
+        .filter((fileName) => fileName.endsWith(".js"))
+        .map((fileName) => {
+          const filePath = path.join(directory, fileName);
+          return { fileName, filePath, source: fs.readFileSync(filePath, "utf-8") };
+        }),
+    };
+  });
+  const execution = executeArchivePlatforms({ platformInputs, isCheck });
+  const outcomes = execution.platformPlans.map(({ platform: name, status }) => ({
+    platform: name,
+    status,
+  }));
+  for (const platformPlan of execution.platformPlans) {
+    const preview = platformPlan.writes[0];
+    console.log(
+      `  [${platformPlan.platform}] ${isCheck ? "check" : preview.result.status}: ${JSON.stringify(preview.result.counts)}`,
+    );
   }
   console.log(formatArchiveSummary(outcomes));
 }
@@ -1217,5 +1454,6 @@ module.exports = {
   patchDataControlsSource,
   patchArchiveContracts,
   planArchivePlatform,
+  executeArchivePlatforms,
   formatArchiveSummary,
 };
