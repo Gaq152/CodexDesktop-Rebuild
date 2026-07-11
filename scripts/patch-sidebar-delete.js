@@ -14,7 +14,11 @@
 const fs = require("fs");
 const path = require("path");
 const acorn = require("acorn");
-const { locateBundles, relPath, SRC_DIR } = require("./patch-util");
+const { relPath, SRC_DIR } = require("./patch-util");
+const {
+  planRequiredRoles,
+  commitValidatedPlan,
+} = require("./mac-contract-locator");
 
 function walk(node, visitor) {
   if (!node || typeof node !== "object") return;
@@ -1386,12 +1390,252 @@ function findExactSidebarAsset(platform, pattern, label) {
   return path.join(directory, matches[0]);
 }
 
+function normalizeSidebarCandidate(candidate) {
+  return {
+    path: candidate.filePath ?? candidate.path ?? candidate.fileName,
+    fileName:
+      candidate.fileName ?? path.basename(candidate.filePath ?? candidate.path ?? ""),
+    source: candidate.source,
+  };
+}
+
+function isSidebarWebviewAsset(candidate) {
+  const normalizedPath = candidate.path.replaceAll("\\", "/");
+  const inAssets =
+    normalizedPath.startsWith("webview/assets/") ||
+    normalizedPath.includes("/webview/assets/");
+  return inAssets && candidate.fileName.endsWith(".js");
+}
+
+function topLevelSidebarFunctions(ast) {
+  return ast.body.flatMap((statement) => {
+    if (statement.type === "FunctionDeclaration") return [statement];
+    if (
+      (statement.type === "ExportNamedDeclaration" ||
+        statement.type === "ExportDefaultDeclaration") &&
+      statement.declaration?.type === "FunctionDeclaration"
+    ) {
+      return [statement.declaration];
+    }
+    return [];
+  });
+}
+
+function threadActionsOwnershipEvidence(code) {
+  let ast;
+  try {
+    ast = parseRequired(code, "sidebar thread-actions ownership");
+  } catch {
+    return [];
+  }
+  let archiveMessageFamilies = 0;
+  walk(ast, (node) => {
+    if (node.type !== "Property" || propertyName(node) !== "archiveThread") return;
+    const id = objectProperty(node.value, "id");
+    if (literalValue(id?.value) === "sidebarElectron.archiveThread") {
+      archiveMessageFamilies += 1;
+    }
+  });
+  const actionFamilies = topLevelSidebarFunctions(ast).filter((fn) => {
+    const directReturns = fn.body.body.filter((node) => node.type === "ReturnStatement");
+    if (directReturns.length === 0) return false;
+    const returnedObject = returnedObjectExpression(directReturns.at(-1).argument);
+    const archiveBinding = objectProperty(returnedObject, "archiveThread")?.value;
+    if (archiveBinding?.type !== "Identifier") {
+      return false;
+    }
+    const archiveAction = directFunctionBinding(fn, archiveBinding.name);
+    if (!archiveAction) return false;
+    let archiveCalls = 0;
+    walkOwnExecutableBody(archiveAction.body, (node) => {
+      if (
+        node.type === "CallExpression" &&
+        literalValue(node.arguments[0]) === "archive-conversation"
+      ) {
+        archiveCalls += 1;
+      }
+    });
+    return archiveCalls > 0;
+  });
+  return archiveMessageFamilies > 0 && actionFamilies.length > 0
+    ? ["associated archive message, bridge call, and returned action family"]
+    : [];
+}
+
+function probeSidebarThreadActions(candidate) {
+  if (
+    !candidate.source.includes("sidebarElectron.archiveThread") ||
+    !candidate.source.includes("archive-conversation")
+  ) {
+    return { state: "irrelevant", evidence: [] };
+  }
+  const evidence = threadActionsOwnershipEvidence(candidate.source);
+  if (evidence.length === 0) return { state: "irrelevant", evidence: [] };
+  try {
+    return {
+      state: "exact",
+      evidence: ["strict sidebar thread-actions helper satisfied"],
+      result: patchThreadActionsSource(candidate.source),
+    };
+  } catch (error) {
+    return evidence.length > 0
+      ? { state: "owned-malformed", evidence, error }
+      : { state: "irrelevant", evidence: [] };
+  }
+}
+
+function sidebarUiOwnershipEvidence(code) {
+  let ast;
+  try {
+    ast = parseRequired(code, "sidebar UI ownership");
+  } catch {
+    return [];
+  }
+  const functions = topLevelSidebarFunctions(ast);
+  const hoverFunctions = functions.filter((fn) => {
+    if (fn.body.body.some((statement) => statement.type === "FunctionDeclaration")) {
+      return false;
+    }
+    const source = sourceFor(code, fn);
+    return source.includes("thread-primary-action") && source.includes(".archiveThread");
+  });
+  const associatedPairs = [];
+  for (const hover of hoverFunctions) {
+    for (const row of functions) {
+      if (row.body.body.some((statement) => statement.type === "FunctionDeclaration")) {
+        continue;
+      }
+      const source = sourceFor(code, row);
+      if (!source.includes("archive-thread")) {
+        continue;
+      }
+      let rendersHover = false;
+      let hasArchiveActionBinding = false;
+      walk(row, (node) => {
+        if (
+          sequenceMemberAlias(node, "jsx") &&
+          node.arguments[0]?.type === "Identifier" &&
+          node.arguments[0].name === hover.id?.name
+        ) {
+          rendersHover = true;
+        }
+        if (node.type === "VariableDeclarator" && node.id.type === "ObjectPattern") {
+          const names = node.id.properties.map(propertyName);
+          if (names.includes("archiveThread")) hasArchiveActionBinding = true;
+        }
+      });
+      if (rendersHover && hasArchiveActionBinding) {
+        associatedPairs.push({ hover, row });
+      }
+    }
+  }
+  return associatedPairs.length > 0
+    ? ["associated primary action, archive menu, hover-count render family"]
+    : [];
+}
+
+function probeSidebarUi(candidate) {
+  if (
+    !candidate.source.includes("thread-primary-action") ||
+    !candidate.source.includes("archive-thread")
+  ) {
+    return { state: "irrelevant", evidence: [] };
+  }
+  const evidence = sidebarUiOwnershipEvidence(candidate.source);
+  if (evidence.length === 0) return { state: "irrelevant", evidence: [] };
+  try {
+    return {
+      state: "exact",
+      evidence: ["strict sidebar UI helper satisfied"],
+      result: patchSidebarSource(candidate.source),
+    };
+  } catch (error) {
+    return evidence.length > 0
+      ? { state: "owned-malformed", evidence, error }
+      : { state: "irrelevant", evidence: [] };
+  }
+}
+
+function buildSidebarPlan({ platform, threadActions, sidebar, result }) {
+  return planRequiredRoles({
+    platform,
+    roles: [
+      {
+        role: "sidebar-thread-actions",
+        candidates: [normalizeSidebarCandidate(threadActions)],
+        probe: () => ({
+          state: "exact",
+          evidence: ["Windows exact filename and strict thread-actions helper"],
+          result: result.threadActions,
+        }),
+      },
+      {
+        role: "sidebar-ui",
+        candidates: [normalizeSidebarCandidate(sidebar)],
+        probe: () => ({
+          state: "exact",
+          evidence: ["Windows exact filename and strict sidebar UI helper"],
+          result: result.sidebar,
+        }),
+      },
+    ],
+  });
+}
+
+function sidebarMatchFromRole(selected) {
+  return {
+    fileName: selected.candidate.fileName,
+    filePath: selected.candidate.path,
+    path: selected.candidate.path,
+    source: selected.candidate.source,
+  };
+}
+
+function previewSidebarPlan(plan) {
+  const threadRole = plan.roles.find(
+    (selected) => selected.role === "sidebar-thread-actions",
+  );
+  const sidebarRole = plan.roles.find((selected) => selected.role === "sidebar-ui");
+  const threadActions = sidebarMatchFromRole(threadRole);
+  const sidebar = sidebarMatchFromRole(sidebarRole);
+  return {
+    threadActions,
+    sidebar,
+    matches: { threadActions: [threadActions], sidebar: [sidebar] },
+    result: patchSidebarContracts({
+      threadActionsSource: threadActions.source,
+      sidebarSource: sidebar.source,
+    }),
+  };
+}
+
+function planMacSidebarPlatform({ platform, candidates }) {
+  const scoped = candidates
+    .map(normalizeSidebarCandidate)
+    .filter(isSidebarWebviewAsset);
+  const plan = planRequiredRoles({
+    platform,
+    roles: [
+      {
+        role: "sidebar-thread-actions",
+        candidates: scoped,
+        probe: probeSidebarThreadActions,
+      },
+      { role: "sidebar-ui", candidates: scoped, probe: probeSidebarUi },
+    ],
+  });
+  return { status: "ready", plan, writes: [previewSidebarPlan(plan)] };
+}
+
 function planSidebarPlatform({
   platform,
   threadActionTargets,
   sidebarTargets,
-  warn = console.warn,
+  candidates,
 }) {
+  if (platform !== "win") {
+    return planMacSidebarPlatform({ platform, candidates: candidates ?? [] });
+  }
   if (threadActionTargets.length !== 1) {
     throw new Error(
       `sidebar thread-actions expected exactly 1 bundle for ${platform}, found ${threadActionTargets.length}`,
@@ -1404,25 +1648,58 @@ function planSidebarPlatform({
   }
   const threadActions = threadActionTargets[0];
   const sidebar = sidebarTargets[0];
-  const threadActionsInspection = inspectThreadActionsLayer(threadActions.source);
-  const sidebarInspection = inspectSidebarLayer(sidebar.source);
-  const threadActionsAbsent = threadActionsInspection.state === "absent";
-  const sidebarAbsent = sidebarInspection.state === "absent";
-  if (platform.startsWith("mac-") && threadActionsAbsent && sidebarAbsent) {
-    warn(`[skip] sidebar-delete: unsupported target layout on ${platform}`);
-    return { status: "skipped", writes: [] };
-  }
-  if (platform.startsWith("mac-") && threadActionsAbsent !== sidebarAbsent) {
-    throw new Error(`sidebar target set is an incomplete half-contract for ${platform}`);
-  }
   const result = patchSidebarContracts({
     threadActionsSource: threadActions.source,
     sidebarSource: sidebar.source,
   });
+  const plan = buildSidebarPlan({ platform, threadActions, sidebar, result });
   return {
     status: "ready",
+    plan,
     writes: [{ threadActions, sidebar, result }],
   };
+}
+
+function selectedSidebarWrite(selected) {
+  return {
+    role: selected.role,
+    path: selected.candidate.path,
+    fileName: selected.candidate.fileName,
+    source: selected.candidate.source,
+    result: selected.result,
+  };
+}
+
+function commitSidebarPlatforms({
+  platformPlans,
+  isCheck = false,
+  writeFile = fs.writeFileSync,
+}) {
+  return platformPlans.flatMap(({ plan }) =>
+    commitValidatedPlan({
+      plan,
+      writer: (selected) => {
+        const write = selectedSidebarWrite(selected);
+        if (!isCheck && write.result.code !== write.source) {
+          writeFile(write.path, write.result.code, "utf-8");
+        }
+        return write;
+      },
+    }),
+  );
+}
+
+function executeSidebarPlatforms({
+  platformInputs,
+  isCheck = false,
+  writeFile = fs.writeFileSync,
+}) {
+  const platformPlans = platformInputs.map((input) => ({
+    platform: input.platform,
+    ...planSidebarPlatform(input),
+  }));
+  const writes = commitSidebarPlatforms({ platformPlans, isCheck, writeFile });
+  return { platformPlans, writes };
 }
 
 function formatSidebarSummary(outcomes) {
@@ -1441,47 +1718,56 @@ function main() {
         fs.existsSync(path.join(SRC_DIR, name, "_asar")),
       );
   if (platforms.length === 0) throw new Error("sidebar-delete expected at least one platform");
-  const outcomes = [];
-  const plans = platforms.flatMap((platformName) => {
-    const threadActionsPath = findExactSidebarAsset(
-      platformName,
-      /^thread-actions-.*\.js$/,
-      "sidebar thread-actions",
-    );
-    const sidebarPath = findExactSidebarAsset(
-      platformName,
-      /^sidebar-flat-sections-.*\.js$/,
-      "sidebar-flat-sections",
-    );
-    const threadActionsSource = fs.readFileSync(threadActionsPath, "utf-8");
-    const sidebarSource = fs.readFileSync(sidebarPath, "utf-8");
-    const platformPlan = planSidebarPlatform({
-      platform: platformName,
-      threadActionTargets: [{ fileName: path.basename(threadActionsPath), path: threadActionsPath, source: threadActionsSource }],
-      sidebarTargets: [{ fileName: path.basename(sidebarPath), path: sidebarPath, source: sidebarSource }],
-    });
-    outcomes.push({ platform: platformName, status: platformPlan.status });
-    return platformPlan.writes.map(({ threadActions, sidebar, result }) => ({
-      platform: platformName,
-      threadActionsPath: threadActions.path,
-      sidebarPath: sidebar.path,
-      threadActionsSource: threadActions.source,
-      sidebarSource: sidebar.source,
-      result,
-    }));
-  });
-  for (const plan of plans) {
-    console.log(`  [${plan.platform}] ${isCheck ? "check" : plan.result.status}: thread=${JSON.stringify(plan.result.threadActions.counts)} sidebar=${JSON.stringify(plan.result.sidebar.counts)}`);
-  }
-  if (!isCheck) {
-    for (const plan of plans) {
-      if (plan.result.threadActions.code !== plan.threadActionsSource) {
-        fs.writeFileSync(plan.threadActionsPath, plan.result.threadActions.code, "utf-8");
-      }
-      if (plan.result.sidebar.code !== plan.sidebarSource) {
-        fs.writeFileSync(plan.sidebarPath, plan.result.sidebar.code, "utf-8");
-      }
+  const platformInputs = platforms.map((platformName) => {
+    if (platformName === "win") {
+      const threadActionsPath = findExactSidebarAsset(
+        platformName,
+        /^thread-actions-.*\.js$/,
+        "sidebar thread-actions",
+      );
+      const sidebarPath = findExactSidebarAsset(
+        platformName,
+        /^sidebar-flat-sections-.*\.js$/,
+        "sidebar-flat-sections",
+      );
+      return {
+        platform: platformName,
+        threadActionTargets: [{
+          fileName: path.basename(threadActionsPath),
+          path: threadActionsPath,
+          source: fs.readFileSync(threadActionsPath, "utf-8"),
+        }],
+        sidebarTargets: [{
+          fileName: path.basename(sidebarPath),
+          path: sidebarPath,
+          source: fs.readFileSync(sidebarPath, "utf-8"),
+        }],
+      };
     }
+    const directory = path.join(SRC_DIR, platformName, "_asar", "webview", "assets");
+    if (!fs.existsSync(directory)) {
+      throw new Error(`sidebar asset directory is missing for ${platformName}`);
+    }
+    return {
+      platform: platformName,
+      candidates: fs.readdirSync(directory)
+        .filter((fileName) => fileName.endsWith(".js"))
+        .map((fileName) => {
+          const filePath = path.join(directory, fileName);
+          return { fileName, filePath, source: fs.readFileSync(filePath, "utf-8") };
+        }),
+    };
+  });
+  const execution = executeSidebarPlatforms({ platformInputs, isCheck });
+  const outcomes = execution.platformPlans.map(({ platform: name, status }) => ({
+    platform: name,
+    status,
+  }));
+  for (const platformPlan of execution.platformPlans) {
+    const preview = platformPlan.writes[0];
+    console.log(
+      `  [${platformPlan.platform}] ${isCheck ? "check" : preview.result.status}: thread=${JSON.stringify(preview.result.threadActions.counts)} sidebar=${JSON.stringify(preview.result.sidebar.counts)}`,
+    );
   }
   console.log(formatSidebarSummary(outcomes));
 }
@@ -1495,5 +1781,6 @@ module.exports = {
   patchSidebarSource,
   patchSidebarContracts,
   planSidebarPlatform,
+  executeSidebarPlatforms,
   formatSidebarSummary,
 };

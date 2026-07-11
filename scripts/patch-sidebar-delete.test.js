@@ -7,6 +7,7 @@ const {
   patchSidebarSource,
   patchSidebarContracts,
   planSidebarPlatform,
+  executeSidebarPlatforms,
   formatSidebarSummary,
 } = require("./patch-sidebar-delete");
 
@@ -148,38 +149,303 @@ test("rejects a delete action whose route and returned binding are inert", () =>
   );
 });
 
-test("platform matrix skips only an absent macOS sidebar thread-actions layer", () => {
+function validMacSidebarCandidates(prefix) {
+  return [
+    {
+      fileName: `thread-shell-${prefix}.js`,
+      filePath: `webview/assets/thread-shell-${prefix}.js`,
+      source:
+        "const tokens=[`sidebarElectron.archiveThread`,`archive-conversation`,`copyConversationMarkdown`]",
+    },
+    {
+      fileName: `thread-app-shell-chrome~${prefix}.js`,
+      filePath: `webview/assets/thread-app-shell-chrome~${prefix}.js`,
+      source: LATEST_THREAD_ACTIONS,
+    },
+    {
+      fileName: `remote-conversation-page-${prefix}.js`,
+      filePath: `webview/assets/remote-conversation-page-${prefix}.js`,
+      source: LATEST_SIDEBAR,
+    },
+    {
+      fileName: `ui-token-shell-${prefix}.js`,
+      filePath: `webview/assets/ui-token-shell-${prefix}.js`,
+      source:
+        "const ids=[`thread-primary-action`,`archive-thread`,`additionalHoverActionCount`]",
+    },
+    {
+      fileName: `outside-root-${prefix}.js`,
+      filePath: `.vite/build/outside-root-${prefix}.js`,
+      source: `${LATEST_THREAD_ACTIONS};${LATEST_SIDEBAR}`,
+    },
+  ];
+}
+
+function validWindowsSidebarInput() {
+  return {
+    platform: "win",
+    threadActionTargets: [{
+      fileName: "thread-actions-Windows.js",
+      filePath: "webview/assets/thread-actions-Windows.js",
+      source: LATEST_THREAD_ACTIONS,
+    }],
+    sidebarTargets: [{
+      fileName: "sidebar-flat-sections-Windows.js",
+      filePath: "webview/assets/sidebar-flat-sections-Windows.js",
+      source: LATEST_SIDEBAR,
+    }],
+  };
+}
+
+test("macOS matrix locates associated consolidated sidebar roles", () => {
+  for (const platform of ["mac-arm64", "mac-x64"]) {
+    const result = planSidebarPlatform({
+      platform,
+      candidates: validMacSidebarCandidates(platform),
+    });
+    assert.equal(result.status, "ready");
+    assert.deepEqual(
+      result.writes[0].matches.threadActions.map(({ fileName }) => fileName),
+      [`thread-app-shell-chrome~${platform}.js`],
+    );
+    assert.deepEqual(
+      result.writes[0].matches.sidebar.map(({ fileName }) => fileName),
+      [`remote-conversation-page-${platform}.js`],
+    );
+    assert.equal(result.writes[0].result.status, "patched");
+  }
+});
+
+test("macOS sidebar structural roles accept already-patched contracts", () => {
+  const candidates = validMacSidebarCandidates("already").map((candidate) => {
+    if (candidate.fileName.startsWith("thread-app-shell")) {
+      return { ...candidate, source: patchThreadActionsSource(candidate.source).code };
+    }
+    if (candidate.fileName.startsWith("remote-conversation")) {
+      return { ...candidate, source: patchSidebarSource(candidate.source).code };
+    }
+    return candidate;
+  });
+  const result = planSidebarPlatform({ platform: "mac-arm64", candidates });
+  assert.equal(result.writes[0].result.status, "already");
+});
+
+test("macOS sidebar ownership ignores nested dead structural families", () => {
+  const deadThreadFamily = {
+    fileName: "dead-thread-family.js",
+    filePath: "webview/assets/dead-thread-family.js",
+    source: [
+      "let messages={archiveThread:{id:`sidebarElectron.archiveThread`}}",
+      "function outer(){function dead(){let archive=e=>bridge(`archive-conversation`,e);return{archiveThread:archive,copyConversationMarkdown:()=>{}}}}",
+    ].join(";"),
+  };
+  const deadUiFamily = {
+    fileName: "dead-sidebar-family.js",
+    filePath: "webview/assets/dead-sidebar-family.js",
+    source: `function outer(){${LATEST_SIDEBAR}}`,
+  };
+  const result = planSidebarPlatform({
+    platform: "mac-arm64",
+    candidates: [
+      ...validMacSidebarCandidates("dead-families"),
+      deadThreadFamily,
+      deadUiFamily,
+    ],
+  });
+  assert.deepEqual(
+    result.writes[0].matches.threadActions.map(({ fileName }) => fileName),
+    ["thread-app-shell-chrome~dead-families.js"],
+  );
+  assert.deepEqual(
+    result.writes[0].matches.sidebar.map(({ fileName }) => fileName),
+    ["remote-conversation-page-dead-families.js"],
+  );
+});
+
+test("macOS missing sidebar roles fail closed instead of skipping", () => {
+  assert.throws(
+    () =>
+      planSidebarPlatform({
+        platform: "mac-x64",
+        candidates: [{
+          fileName: "tokens-only.js",
+          filePath: "webview/assets/tokens-only.js",
+          source:
+            "const tokens=[`sidebarElectron.archiveThread`,`copyConversationMarkdown`,`archive-conversation`,`thread-primary-action`,`archive-thread`,`additionalHoverActionCount`]",
+        }],
+      }),
+    /mac-x64|sidebar-thread-actions|sidebar-ui|exact candidates: 0|found 0/i,
+  );
+});
+
+test("macOS live thread ownership survives a missing returned copy action", () => {
+  const malformedThread = {
+    fileName: "live-thread-missing-copy.js",
+    filePath: "webview/assets/live-thread-missing-copy.js",
+    source: LATEST_THREAD_ACTIONS.replace(
+      ",copyConversationMarkdown:l",
+      "",
+    ),
+  };
+  assert.throws(
+    () =>
+      planSidebarPlatform({
+        platform: "mac-arm64",
+        candidates: [
+          ...validMacSidebarCandidates("valid-thread"),
+          malformedThread,
+        ],
+      }),
+    /sidebar-thread-actions|live-thread-missing-copy|owned-malformed|copyConversationMarkdown|action.*found 0/i,
+  );
+});
+
+test("macOS live UI ownership survives a missing hover-count field", () => {
+  const malformedSidebar = {
+    fileName: "live-sidebar-missing-hover-count.js",
+    filePath: "webview/assets/live-sidebar-missing-hover-count.js",
+    source: LATEST_SIDEBAR.replace(
+      "additionalHoverActionCount:Me?1:0,",
+      "",
+    ),
+  };
+  assert.throws(
+    () =>
+      planSidebarPlatform({
+        platform: "mac-x64",
+        candidates: [
+          ...validMacSidebarCandidates("valid-sidebar"),
+          malformedSidebar,
+        ],
+      }),
+    /sidebar-ui|live-sidebar-missing-hover-count|owned-malformed|row.*found 0|hover.*count/i,
+  );
+});
+
+test("macOS sidebar roles fail closed for malformed and duplicate structural owners", async (t) => {
+  const malformedThread = LATEST_THREAD_ACTIONS.replace(
+    "let a=e=>{};",
+    "v(`archive-conversation`,{});let a=e=>{};",
+  );
+  const malformedSidebar = LATEST_SIDEBAR.replace(
+    "[S,C]=(0,Pc.useState)(!1)",
+    "[S,C]=null",
+  );
+  const cases = [
+    [
+      "owned malformed thread-actions",
+      (platform) => [
+        ...validMacSidebarCandidates(platform),
+        {
+          fileName: `malformed-thread-${platform}.js`,
+          filePath: `webview/assets/malformed-thread-${platform}.js`,
+          source: malformedThread,
+        },
+      ],
+      /sidebar-thread-actions|malformed-thread|owned-malformed|archive|structure/i,
+    ],
+    [
+      "owned malformed sidebar UI",
+      (platform) => [
+        ...validMacSidebarCandidates(platform),
+        {
+          fileName: `malformed-sidebar-${platform}.js`,
+          filePath: `webview/assets/malformed-sidebar-${platform}.js`,
+          source: malformedSidebar,
+        },
+      ],
+      /sidebar-ui|malformed-sidebar|owned-malformed|row|state|structure/i,
+    ],
+    [
+      "duplicate thread-actions",
+      (platform) => [
+        ...validMacSidebarCandidates(platform),
+        {
+          fileName: `duplicate-thread-${platform}.js`,
+          filePath: `webview/assets/duplicate-thread-${platform}.js`,
+          source: LATEST_THREAD_ACTIONS,
+        },
+      ],
+      /sidebar-thread-actions|exact candidates: 2|duplicate-thread/i,
+    ],
+    [
+      "duplicate sidebar UI",
+      (platform) => [
+        ...validMacSidebarCandidates(platform),
+        {
+          fileName: `duplicate-sidebar-${platform}.js`,
+          filePath: `webview/assets/duplicate-sidebar-${platform}.js`,
+          source: LATEST_SIDEBAR,
+        },
+      ],
+      /sidebar-ui|exact candidates: 2|duplicate-sidebar/i,
+    ],
+  ];
+  for (const platform of ["mac-arm64", "mac-x64"]) {
+    for (const [name, makeCandidates, expected] of cases) {
+      await t.test(`${platform}: ${name}`, () => {
+        assert.throws(
+          () => planSidebarPlatform({ platform, candidates: makeCandidates(platform) }),
+          expected,
+        );
+      });
+    }
+  }
+});
+
+test("sidebar orchestrator plans all platforms before actual writer calls", async (t) => {
+  await t.test("later invalid platform leaves every target untouched", () => {
+    const writes = [];
+    const invalidX64 = [
+      ...validMacSidebarCandidates("x64"),
+      {
+        fileName: "duplicate-sidebar-x64.js",
+        filePath: "webview/assets/duplicate-sidebar-x64.js",
+        source: LATEST_SIDEBAR,
+      },
+    ];
+    assert.throws(
+      () =>
+        executeSidebarPlatforms({
+          platformInputs: [
+            validWindowsSidebarInput(),
+            { platform: "mac-arm64", candidates: validMacSidebarCandidates("arm64") },
+            { platform: "mac-x64", candidates: invalidX64 },
+          ],
+          writeFile: (...args) => writes.push(args),
+        }),
+      /mac-x64|sidebar-ui|exact candidates: 2/i,
+    );
+    assert.equal(writes.length, 0);
+  });
+
+  await t.test("successful platforms commit only through the actual writer", () => {
+    const writes = [];
+    const result = executeSidebarPlatforms({
+      platformInputs: [
+        { platform: "mac-arm64", candidates: validMacSidebarCandidates("arm64") },
+        { platform: "mac-x64", candidates: validMacSidebarCandidates("x64") },
+        validWindowsSidebarInput(),
+      ],
+      writeFile: (...args) => writes.push(args),
+    });
+    assert.equal(result.platformPlans.length, 3);
+    assert.equal(writes.length, 6);
+  });
+});
+
+test("Windows sidebar planning keeps exact paths and target counts", () => {
   const targets = {
     threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const actions={}" }],
     sidebarTargets: [{ fileName: "sidebar-flat-sections-mac.js", source: "const sections={}" }],
   };
-  for (const platform of ["mac-arm64", "mac-x64"]) {
-    const warnings = [];
-    const result = planSidebarPlatform({
-      platform,
-      ...targets,
-      warn: (message) => warnings.push(message),
-    });
-    assert.deepEqual(result, { status: "skipped", writes: [] });
-    assert.deepEqual(warnings, [
-      `[skip] sidebar-delete: unsupported target layout on ${platform}`,
-    ]);
-  }
   assert.throws(
     () => planSidebarPlatform({ platform: "win", ...targets }),
     /messages.*found 0/i,
   );
   assert.throws(
     () => planSidebarPlatform({
-      platform: "mac-arm64",
-      threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const archiveThread=1" }],
-      sidebarTargets: targets.sidebarTargets,
-    }),
-    /thread-actions|messages|action|incomplete/i,
-  );
-  assert.throws(
-    () => planSidebarPlatform({
-      platform: "mac-x64",
+      platform: "win",
       threadActionTargets: [
         { fileName: "thread-actions-a.js", source: LATEST_THREAD_ACTIONS },
         { fileName: "thread-actions-b.js", source: LATEST_THREAD_ACTIONS },
@@ -188,63 +454,18 @@ test("platform matrix skips only an absent macOS sidebar thread-actions layer", 
     }),
     /thread-actions.*expected exactly 1.*found 2/i,
   );
+  const valid = planSidebarPlatform(validWindowsSidebarInput());
+  assert.equal(valid.status, "ready");
+  assert.equal(valid.writes[0].result.status, "patched");
 });
 
-test("macOS sidebar skip strictly rejects malformed sidebar evidence", () => {
-  assert.throws(
-    () => planSidebarPlatform({
-      platform: "mac-arm64",
-      threadActionTargets: [{
-        fileName: "thread-actions-mac.js",
-        source: "const messages={wrong:{id:`sidebarElectron.archiveThread`}}",
-      }],
-      sidebarTargets: [{
-        fileName: "sidebar-flat-sections-mac.js",
-        source: "const sections={}",
-      }],
-    }),
-    /thread-actions|messages|action|malformed|incomplete/i,
-  );
-  assert.throws(
-    () => planSidebarPlatform({
-      platform: "mac-x64",
-      threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const actions={}" }],
-      sidebarTargets: [{
-        fileName: "sidebar-flat-sections-mac.js",
-        source:
-          "/* CodexSidebarDeleteHover *//* CodexSidebarDeleteRow */" +
-          "const confirm=`thread-delete-confirm-action`,item={id:`delete-thread`};",
-      }],
-    }),
-    /sidebar|hover|row|malformed|incomplete/i,
-  );
-  assert.throws(
-    () => planSidebarPlatform({
-      platform: "mac-x64",
-      threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const actions={}" }],
-      sidebarTargets: [{
-        fileName: "sidebar-flat-sections-mac.js",
-        source: "const item={id:`archive-thread`},row={additionalHoverActionCount:0}",
-      }],
-    }),
-    /sidebar|hover|row|malformed|incomplete/i,
-  );
-  assert.throws(
-    () => planSidebarPlatform({
-      platform: "mac-arm64",
-      threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const actions={}" }],
-      sidebarTargets: [{ fileName: "sidebar-flat-sections-mac.js", source: LATEST_SIDEBAR }],
-    }),
-    /half|incomplete|thread-actions|sidebar/i,
-  );
-});
-
-test("sidebar summary names skipped platforms without claiming parity", () => {
+test("sidebar summary reports both macOS architectures ready", () => {
   const summary = formatSidebarSummary([
-    { platform: "mac-arm64", status: "skipped" },
+    { platform: "mac-arm64", status: "ready" },
+    { platform: "mac-x64", status: "ready" },
     { platform: "win", status: "ready" },
   ]);
-  assert.match(summary, /skipped=\[mac-arm64\]/);
-  assert.match(summary, /ready=\[win\]/);
+  assert.match(summary, /skipped=\[\]/);
+  assert.match(summary, /ready=\[mac-arm64,mac-x64,win\]/);
   assert.doesNotMatch(summary, /\bok\b|contracts satisfied/i);
 });
