@@ -21,6 +21,10 @@ const fs = require("fs");
 const path = require("path");
 const { parse } = require("acorn");
 const { SRC_DIR, relPath } = require("./patch-util");
+const {
+  planRequiredRoles,
+  commitValidatedPlan,
+} = require("./mac-contract-locator");
 
 function walk(node, visitor) {
   if (!node || typeof node !== "object") return;
@@ -1485,7 +1489,232 @@ function classifyPluginTarget(fileName, source) {
   return null;
 }
 
-function planPluginPlatform({ platform, candidates, warn = console.warn }) {
+function normalizePluginCandidate(candidate) {
+  return {
+    path: candidate.filePath ?? candidate.path ?? candidate.fileName,
+    fileName: candidate.fileName ?? path.basename(candidate.filePath ?? candidate.path ?? ""),
+    source: candidate.source,
+  };
+}
+
+function mainOwnershipEvidence(source) {
+  let document;
+  try {
+    document = parsePluginDocument(source, "plugin main ownership");
+  } catch {
+    return [];
+  }
+  const { ast, comments } = document;
+  const model = buildPluginLexicalModel(ast);
+  const completeDesktopBindings = new Set();
+  walk(ast, (node) => {
+    if (
+      node.type !== "VariableDeclarator" ||
+      node.id.type !== "Identifier" ||
+      node.init?.type !== "ObjectExpression"
+    ) {
+      return;
+    }
+    const names = node.init.properties.map((property) => pluginPropertyName(property));
+    if (
+      FEATURE_KEYS.every(
+        (key) => names.filter((candidate) => candidate === key).length === 1,
+      )
+    ) {
+      const binding = model.bindingForDeclaration(node.id);
+      if (binding) completeDesktopBindings.add(binding);
+    }
+  });
+
+  let hasLiveCompleteDesktopFamily = false;
+  walk(ast, (node) => {
+    if (
+      node.type !== "CallExpression" ||
+      node.callee?.type !== "MemberExpression" ||
+      node.callee.object?.type !== "Identifier" ||
+      node.callee.object.name !== "Object" ||
+      pluginPropertyName(node.callee) !== "keys" ||
+      node.arguments.length !== 1 ||
+      node.arguments[0].type !== "Identifier"
+    ) {
+      return;
+    }
+    if (completeDesktopBindings.has(model.resolve(node.arguments[0]))) {
+      hasLiveCompleteDesktopFamily = true;
+    }
+  });
+
+  const evidence = [];
+  if (hasLiveCompleteDesktopFamily) {
+    evidence.push("complete live desktop feature defaults family");
+  }
+  try {
+    const filter = collectMainFilter(source, ast, comments, model);
+    if (filter.patches.length + filter.already === 1) {
+      evidence.push("complete bundled plugin reconcile data-flow family");
+    }
+  } catch {
+    // A malformed fragment is not ownership evidence by itself. Another
+    // complete structural family may still establish ownership below.
+  }
+  return evidence;
+}
+
+function probePluginMain(candidate) {
+  const evidence = mainOwnershipEvidence(candidate.source);
+  if (evidence.length === 0) return { state: "irrelevant", evidence: [] };
+  try {
+    const result = patchPluginMainSource(candidate.source);
+    return {
+      state: "exact",
+      evidence: [...evidence, "full main strict helper satisfied"],
+      result,
+    };
+  } catch (error) {
+    return { state: "owned-malformed", evidence, error };
+  }
+}
+
+function webviewOwnershipEvidence(source) {
+  let document;
+  try {
+    document = parsePluginDocument(source, "plugin webview ownership");
+  } catch {
+    return [];
+  }
+  let topology;
+  try {
+    topology = collectWebviewHookTopology(document.ast);
+  } catch {
+    return [];
+  }
+  const evidence = [];
+  try {
+    const availability = collectAvailability(source, document.ast, topology);
+    if (
+      availability.patches.length + availability.already ===
+      WEBVIEW_AVAILABILITY_TARGETS
+    ) {
+      evidence.push("complete exported plugin availability return family");
+    }
+  } catch {
+    // A complete Statsig family can independently prove ownership.
+  }
+  try {
+    const statsig = collectStatsig(
+      source,
+      document.ast,
+      document.comments,
+      topology,
+    );
+    if (statsig.patches.length + statsig.already === WEBVIEW_STATSIG_TARGETS) {
+      evidence.push("complete exported plugin Statsig return family");
+    }
+  } catch {
+    // A complete availability family can independently prove ownership.
+  }
+  return evidence;
+}
+
+function probePluginWebview(candidate) {
+  const evidence = webviewOwnershipEvidence(candidate.source);
+  if (evidence.length === 0) return { state: "irrelevant", evidence: [] };
+  try {
+    return {
+      state: "exact",
+      evidence: [...evidence, "full webview strict helper satisfied"],
+      result: patchPluginWebviewSource(candidate.source),
+    };
+  } catch (error) {
+    return { state: "owned-malformed", evidence, error };
+  }
+}
+
+function buildPluginPlan({ platform, mainCandidate, mainResult, webviewCandidate, webviewResult }) {
+  return planRequiredRoles({
+    platform,
+    roles: [
+      {
+        role: "plugin-main",
+        candidates: [normalizePluginCandidate(mainCandidate)],
+        probe: () => ({
+          state: "exact",
+          evidence: ["Windows exact filename and strict main helper"],
+          result: mainResult,
+        }),
+      },
+      {
+        role: "plugin-webview",
+        candidates: [normalizePluginCandidate(webviewCandidate)],
+        probe: () => ({
+          state: "exact",
+          evidence: ["Windows exact filename and strict webview helper"],
+          result: webviewResult,
+        }),
+      },
+    ],
+  });
+}
+
+function pluginMatchFromRole(selected) {
+  return {
+    fileName: selected.candidate.fileName,
+    filePath: selected.candidate.path,
+    source: selected.candidate.source,
+  };
+}
+
+function previewPluginPlan(plan) {
+  const main = plan.roles.find((selected) => selected.role === "plugin-main");
+  const webview = plan.roles.find((selected) => selected.role === "plugin-webview");
+  const matches = {
+    main: [pluginMatchFromRole(main)],
+    webview: [pluginMatchFromRole(webview)],
+  };
+  const result = {
+    status:
+      main.result.status === "already" && webview.result.status === "already"
+        ? "already"
+        : "patched",
+    main: main.result,
+    webview: webview.result,
+  };
+  return { matches, result };
+}
+
+function planMacPluginPlatform({ platform, candidates }) {
+  const normalized = candidates.map(normalizePluginCandidate);
+  const pathInRoot = (candidate, root) => {
+    const normalizedPath = candidate.path.replaceAll("\\", "/");
+    return (
+      normalizedPath === root ||
+      normalizedPath.startsWith(`${root}/`) ||
+      normalizedPath.includes(`/${root}/`)
+    );
+  };
+  const plan = planRequiredRoles({
+    platform,
+    roles: [
+      {
+        role: "plugin-main",
+        candidates: normalized.filter((candidate) =>
+          pathInRoot(candidate, ".vite/build"),
+        ),
+        probe: probePluginMain,
+      },
+      {
+        role: "plugin-webview",
+        candidates: normalized.filter((candidate) =>
+          pathInRoot(candidate, "webview/assets"),
+        ),
+        probe: probePluginWebview,
+      },
+    ],
+  });
+  return { status: "ready", plan, writes: [previewPluginPlan(plan)] };
+}
+
+function planPluginPlatform({ platform, candidates }) {
   if (platform === "win") {
     const matches = { main: [], webview: [] };
     for (const candidate of candidates) {
@@ -1499,50 +1728,62 @@ function planPluginPlatform({ platform, candidates, warn = console.warn }) {
         );
       }
     }
-    return {
-      status: "ready",
-      writes: [{
-        matches,
-        result: patchPluginContracts({
-          mainSource: matches.main[0].source,
-          webviewSource: matches.webview[0].source,
-        }),
-      }],
-    };
+    const result = patchPluginContracts({
+      mainSource: matches.main[0].source,
+      webviewSource: matches.webview[0].source,
+    });
+    const plan = buildPluginPlan({
+      platform,
+      mainCandidate: matches.main[0],
+      mainResult: result.main,
+      webviewCandidate: matches.webview[0],
+      webviewResult: result.webview,
+    });
+    return { status: "ready", plan, writes: [{ matches, result }] };
   }
+  return planMacPluginPlatform({ platform, candidates });
+}
 
-  const named = {
-    main: candidates.filter((candidate) => /^main-.*\.js$/.test(candidate.fileName)),
-    webview: candidates.filter((candidate) =>
-      /^use-is-plugins-enabled-.*\.js$/.test(candidate.fileName),
-    ),
-  };
-  if (named.main.length !== 1) {
-    throw new Error(
-      `plugin main expected exactly 1 target for ${platform}, found ${named.main.length}`,
-    );
-  }
-  const main = patchPluginMainSource(named.main[0].source);
-  if (platform.startsWith("mac-") && named.webview.length === 0) {
-    warn(`[skip] plugin-auth: unsupported target layout on ${platform}`);
-    return { status: "skipped", writes: [] };
-  }
-  if (named.webview.length !== 1) {
-    throw new Error(
-      `plugin webview expected exactly 1 target for ${platform}, found ${named.webview.length}`,
-    );
-  }
-  const webview = patchPluginWebviewSource(named.webview[0].source);
-  const matches = { main: named.main, webview: named.webview };
-  const result = {
-    status: main.status === "already" && webview.status === "already" ? "already" : "patched",
-    main,
-    webview,
-  };
+function selectedPluginWrite(selected) {
   return {
-    status: "ready",
-    writes: [{ matches, result }],
+    role: selected.role,
+    path: selected.candidate.path,
+    fileName: selected.candidate.fileName,
+    source: selected.candidate.source,
+    result: selected.result,
   };
+}
+
+function commitPluginPlatforms({
+  platformPlans,
+  isCheck = false,
+  writeFile = fs.writeFileSync,
+}) {
+  return platformPlans.flatMap(({ plan }) =>
+    commitValidatedPlan({
+      plan,
+      writer: (selected) => {
+        const write = selectedPluginWrite(selected);
+        if (!isCheck && write.result.code !== write.source) {
+          writeFile(write.path, write.result.code, "utf-8");
+        }
+        return write;
+      },
+    }),
+  );
+}
+
+function executePluginPlatforms({
+  platformInputs,
+  isCheck = false,
+  writeFile = fs.writeFileSync,
+}) {
+  const platformPlans = platformInputs.map(({ platform, candidates }) => ({
+    platform,
+    ...planPluginPlatform({ platform, candidates }),
+  }));
+  const writes = commitPluginPlatforms({ platformPlans, isCheck, writeFile });
+  return { platformPlans, writes };
 }
 
 function formatPluginSummary(outcomes) {
@@ -1634,9 +1875,8 @@ function main() {
       );
   if (platforms.length === 0) throw new Error("plugin patch expected at least one platform");
 
-  const plans = [];
-  const outcomes = [];
-  for (const platformName of platforms) {
+  const execution = executePluginPlatforms({
+    platformInputs: platforms.map((platformName) => {
     const roots = [
       path.join(SRC_DIR, platformName, "_asar", ".vite", "build"),
       path.join(SRC_DIR, platformName, "_asar", "webview", "assets"),
@@ -1651,29 +1891,21 @@ function main() {
         candidates.push({ fileName, filePath, source });
       }
     }
-    const platformPlan = planPluginPlatform({ platform: platformName, candidates });
-    outcomes.push({ platform: platformName, status: platformPlan.status });
-    for (const write of platformPlan.writes) {
-      plans.push({ platform: platformName, ...write });
-    }
-  }
+      return { platform: platformName, candidates };
+    }),
+    isCheck,
+  });
+  const outcomes = execution.platformPlans.map(({ platform: platformName, status }) => ({
+    platform: platformName,
+    status,
+  }));
 
-  for (const plan of plans) {
-    console.log(`\n-- [${plan.platform}] plugin main: ${relPath(plan.matches.main[0].filePath)}`);
-    console.log(`   [${isCheck ? "check" : plan.result.main.status}] ${JSON.stringify(plan.result.main.counts)}`);
-    console.log(`-- [${plan.platform}] plugin webview: ${relPath(plan.matches.webview[0].filePath)}`);
-    console.log(`   [${isCheck ? "check" : plan.result.webview.status}] ${JSON.stringify(plan.result.webview.counts)}`);
-  }
-  if (!isCheck) {
-    for (const plan of plans) {
-      const mainTarget = plan.matches.main[0];
-      const webviewTarget = plan.matches.webview[0];
-      if (plan.result.main.code !== mainTarget.source) {
-        fs.writeFileSync(mainTarget.filePath, plan.result.main.code, "utf-8");
-      }
-      if (plan.result.webview.code !== webviewTarget.source) {
-        fs.writeFileSync(webviewTarget.filePath, plan.result.webview.code, "utf-8");
-      }
+  for (const platformPlan of execution.platformPlans) {
+    for (const plan of platformPlan.writes) {
+      console.log(`\n-- [${platformPlan.platform}] plugin main: ${relPath(plan.matches.main[0].filePath)}`);
+      console.log(`   [${isCheck ? "check" : plan.result.main.status}] ${JSON.stringify(plan.result.main.counts)}`);
+      console.log(`-- [${platformPlan.platform}] plugin webview: ${relPath(plan.matches.webview[0].filePath)}`);
+      console.log(`   [${isCheck ? "check" : plan.result.webview.status}] ${JSON.stringify(plan.result.webview.counts)}`);
     }
   }
   console.log(formatPluginSummary(outcomes));
@@ -1687,5 +1919,6 @@ module.exports = {
   patchPluginContracts,
   classifyPluginTarget,
   planPluginPlatform,
+  executePluginPlatforms,
   formatPluginSummary,
 };

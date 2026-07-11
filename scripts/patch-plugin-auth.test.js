@@ -8,6 +8,7 @@ const {
   patchPluginContracts,
   classifyPluginTarget,
   planPluginPlatform,
+  executePluginPlatforms,
   formatPluginSummary,
 } = require("./patch-plugin-auth");
 
@@ -259,68 +260,304 @@ test("Windows plugin planning ignores a webview main bootstrap decoy", () => {
   assert.deepEqual(result.writes[0].matches.webview, [webview]);
 });
 
-test("platform matrix skips only an absent macOS plugin webview layer with zero writes", () => {
-  const main = { fileName: "main-mac.js", source: LATEST_MAIN_FIXTURE };
+function validMacPluginCandidates(prefix) {
+  return [
+    {
+      fileName: `main-${prefix}.js`,
+      filePath: `.vite/build/main-${prefix}.js`,
+      source: LATEST_MAIN_FIXTURE,
+    },
+    {
+      fileName: `main-${prefix}-bootstrap.js`,
+      filePath: `webview/assets/main-${prefix}-bootstrap.js`,
+      source: "import{bootstrap}from`./bootstrap.js`;bootstrap();",
+    },
+    {
+      fileName: `chatgpt~gwqc41kz-${prefix}.js`,
+      filePath: `webview/assets/chatgpt~gwqc41kz-${prefix}.js`,
+      source: LATEST_WEBVIEW_FIXTURE,
+    },
+    {
+      fileName: `statsig-token-decoy-${prefix}.js`,
+      filePath: `webview/assets/statsig-token-decoy-${prefix}.js`,
+      source:
+        "const tokens=[`chatgpt`,`authMethod`,`browser_use`,`computer_use`,`410262010`,`Statsig`];",
+    },
+  ];
+}
+
+test("macOS matrix locates structural main and consolidated webview roles", () => {
   for (const platform of ["mac-arm64", "mac-x64"]) {
-    const warnings = [];
     const result = planPluginPlatform({
       platform,
-      candidates: [main],
-      warn: (message) => warnings.push(message),
+      candidates: validMacPluginCandidates(platform),
     });
-    assert.deepEqual(result, { status: "skipped", writes: [] });
-    assert.deepEqual(warnings, [
-      `[skip] plugin-auth: unsupported target layout on ${platform}`,
-    ]);
+    assert.equal(result.status, "ready");
+    assert.deepEqual(
+      result.writes[0].matches.main.map(({ fileName }) => fileName),
+      [`main-${platform}.js`],
+    );
+    assert.deepEqual(
+      result.writes[0].matches.webview.map(({ fileName }) => fileName),
+      [`chatgpt~gwqc41kz-${platform}.js`],
+    );
+    assert.deepEqual(result.writes[0].result.main.counts, {
+      defaults: { patchable: 10, already: 0, total: 10 },
+      filter: { patchable: 1, already: 0, total: 1 },
+      peer: { patchable: 1, already: 0, total: 1 },
+    });
+    assert.deepEqual(result.writes[0].result.webview.counts, {
+      auth: { patchable: 1, already: 0, total: 1 },
+      availability: { patchable: 5, already: 0, total: 5 },
+      statsig: { patchable: 3, already: 0, total: 3 },
+    });
   }
-  assert.throws(
-    () => planPluginPlatform({ platform: "win", candidates: [main] }),
-    /webview.*expected exactly 1.*found 0/i,
+});
+
+test("macOS structural roles accept already-patched main and webview contracts", () => {
+  const candidates = validMacPluginCandidates("already").map((candidate) => {
+    if (candidate.filePath.startsWith(".vite/build/")) {
+      return { ...candidate, source: patchPluginMainSource(candidate.source).code };
+    }
+    if (candidate.fileName.startsWith("chatgpt~")) {
+      return { ...candidate, source: patchPluginWebviewSource(candidate.source).code };
+    }
+    return candidate;
+  });
+  const result = planPluginPlatform({ platform: "mac-arm64", candidates });
+  assert.equal(result.writes[0].result.main.status, "already");
+  assert.equal(result.writes[0].result.webview.status, "already");
+});
+
+test("macOS plugin roles are isolated to their resource roots", () => {
+  const candidates = [
+    ...validMacPluginCandidates("scoped"),
+    {
+      fileName: "webview-main-shaped.js",
+      filePath: "webview/assets/webview-main-shaped.js",
+      source: LATEST_MAIN_FIXTURE,
+    },
+    {
+      fileName: "build-webview-shaped.js",
+      filePath: ".vite/build/build-webview-shaped.js",
+      source: LATEST_WEBVIEW_FIXTURE,
+    },
+  ];
+
+  const result = planPluginPlatform({ platform: "mac-arm64", candidates });
+  assert.deepEqual(
+    result.writes[0].matches.main.map(({ fileName }) => fileName),
+    ["main-scoped.js"],
   );
-  assert.throws(
-    () => planPluginPlatform({
-      platform: "mac-arm64",
-      candidates: [
-        main,
-        { fileName: "use-is-plugins-enabled-incomplete.js", source: "const authMethod=`chatgpt`" },
-      ],
-    }),
-    /webview|incomplete|expected exactly 1/i,
-  );
-  assert.throws(
-    () => planPluginPlatform({
-      platform: "mac-x64",
-      candidates: [
-        main,
-        { fileName: "use-is-plugins-enabled-a.js", source: LATEST_WEBVIEW_FIXTURE },
-        { fileName: "use-is-plugins-enabled-b.js", source: LATEST_WEBVIEW_FIXTURE },
-      ],
-    }),
-    /webview.*expected exactly 1.*found 2/i,
+  assert.deepEqual(
+    result.writes[0].matches.webview.map(({ fileName }) => fileName),
+    ["chatgpt~gwqc41kz-scoped.js"],
   );
 });
 
-test("macOS plugin skip strictly validates a filename-recognized main candidate", () => {
+test("macOS main ownership ignores detached partial-family token collections", () => {
+  const partialDecoy = {
+    fileName: "partial-main-decoy.js",
+    filePath: ".vite/build/partial-main-decoy.js",
+    source: [
+      "const partial={browserPane:!1,inAppBrowserUse:!1,computerUse:!1}",
+      "const detached={\"features.js_repl\":!1}",
+      "const unrelated={shouldIncludeBrowserUsePeerAuthorization:()=>!1}",
+    ].join(";"),
+  };
+  const result = planPluginPlatform({
+    platform: "mac-arm64",
+    candidates: [...validMacPluginCandidates("partial"), partialDecoy],
+  });
+  assert.deepEqual(
+    result.writes[0].matches.main.map(({ fileName }) => fileName),
+    ["main-partial.js"],
+  );
+});
+
+test("macOS webview ownership ignores detached auth and unexported availability", () => {
+  const detachedDecoy = {
+    fileName: "detached-webview-decoy.js",
+    filePath: "webview/assets/detached-webview-decoy.js",
+    source: [
+      "const detached=session.authMethod===`chatgpt`",
+      "function hidden(){let gate=v(`410262010`),config={featureName:`browser_use`};return{allowed:gate,available:gate,isLoading:!1}}",
+      "export const unrelated=1",
+    ].join(";"),
+  };
+  const result = planPluginPlatform({
+    platform: "mac-x64",
+    candidates: [...validMacPluginCandidates("detached"), detachedDecoy],
+  });
+  assert.deepEqual(
+    result.writes[0].matches.webview.map(({ fileName }) => fileName),
+    ["chatgpt~gwqc41kz-detached.js"],
+  );
+});
+
+test("macOS complete desktop defaults without filter and peer are owned malformed", () => {
+  const malformedDefaults = {
+    fileName: "owned-main-missing-contracts.js",
+    filePath: ".vite/build/owned-main-missing-contracts.js",
+    source: [
+      "let He={browserPane:!1,inAppBrowserUse:!1,inAppBrowserUseAllowed:!1,externalBrowserUse:!1,externalBrowserUseAllowed:!1,computerUse:!1,computerUseNodeRepl:!1,control:!1,multiWindow:!1}",
+      "let featureKeys=Object.keys(He)",
+      "let fr={\"features.js_repl\":!1}",
+    ].join(";"),
+  };
   assert.throws(
-    () => planPluginPlatform({
-      platform: "mac-arm64",
-      candidates: [
+    () =>
+      planPluginPlatform({
+        platform: "mac-arm64",
+        candidates: [...validMacPluginCandidates("valid-main"), malformedDefaults],
+      }),
+    /plugin-main|owned-main-missing-contracts|owned-malformed|filter|peer/i,
+  );
+});
+
+test("macOS complete exported availability and Statsig family without auth is owned malformed", () => {
+  const malformedWebview = {
+    fileName: "owned-webview-missing-auth.js",
+    filePath: "webview/assets/owned-webview-missing-auth.js",
+    source: LATEST_WEBVIEW_FIXTURE.replace(
+      "function I(e){let t=(0,z.c)(21),{enabled:n}=e,r=(0,B.useContext)(x)?.authMethod===`chatgpt`;return{enabled:n&&r}}",
+      "function I(e){let{enabled:n}=e;return{enabled:n}}",
+    ),
+  };
+  assert.throws(
+    () =>
+      planPluginPlatform({
+        platform: "mac-x64",
+        candidates: [...validMacPluginCandidates("valid-webview"), malformedWebview],
+      }),
+    /plugin-webview|owned-webview-missing-auth|owned-malformed|auth/i,
+  );
+});
+
+test("macOS malformed and duplicate structural roles fail closed", async (t) => {
+  const cases = [
+    [
+      "owned malformed webview",
+      (platform) =>
+        validMacPluginCandidates(platform).map((candidate) =>
+          candidate.fileName.startsWith("chatgpt~")
+            ? {
+                ...candidate,
+                fileName: `chatgpt~malformed-${platform}.js`,
+                filePath: `webview/assets/chatgpt~malformed-${platform}.js`,
+                source: candidate.source.replace("a=v(`410065390`)", "a=!1"),
+              }
+            : candidate,
+        ),
+      /plugin-webview|malformed|owned-malformed|statsig/i,
+    ],
+    [
+      "owned malformed main",
+      (platform) =>
+        validMacPluginCandidates(platform).map((candidate) =>
+          candidate.filePath.startsWith(".vite/build/")
+            ? {
+                ...candidate,
+                fileName: `main-malformed-${platform}.js`,
+                filePath: `.vite/build/main-malformed-${platform}.js`,
+                source: candidate.source.replace("multiWindow:!1", "multiWindow:unknown"),
+              }
+            : candidate,
+        ),
+      /plugin-main|main-malformed|owned-malformed|defaults/i,
+    ],
+    [
+      "duplicate main",
+      (platform) => [
+        ...validMacPluginCandidates(platform),
         {
-          fileName: "main-weak.js",
-          source: "const externalBrowserUseAllowed=!1,computerUse=!1",
+          fileName: `other-main-${platform}.js`,
+          filePath: `.vite/build/other-main-${platform}.js`,
+          source: LATEST_MAIN_FIXTURE,
         },
       ],
-    }),
-    /plugin main|defaults|filter|peer|expected/i,
-  );
+      /plugin-main|main-.*\.js|exact candidates: 2/i,
+    ],
+    [
+      "duplicate webview",
+      (platform) => [
+        ...validMacPluginCandidates(platform),
+        {
+          fileName: `other-consolidated-${platform}.js`,
+          filePath: `webview/assets/other-consolidated-${platform}.js`,
+          source: LATEST_WEBVIEW_FIXTURE,
+        },
+      ],
+      /plugin-webview|chatgpt~|other-consolidated|exact candidates: 2/i,
+    ],
+  ];
+  for (const platform of ["mac-arm64", "mac-x64"]) {
+    for (const [name, makeCandidates, expected] of cases) {
+      await t.test(`${platform}: ${name}`, () => {
+        assert.throws(
+          () => planPluginPlatform({ platform, candidates: makeCandidates(platform) }),
+          expected,
+        );
+      });
+    }
+  }
 });
 
-test("plugin summary names skipped platforms without claiming parity", () => {
+test("plugin orchestrator plans all platforms before commit writes", async (t) => {
+  await t.test("later platform failure produces zero writes", () => {
+    const writes = [];
+    const invalidX64 = [
+      ...validMacPluginCandidates("x64"),
+      {
+        fileName: "duplicate-webview.js",
+        filePath: "webview/assets/duplicate-webview.js",
+        source: LATEST_WEBVIEW_FIXTURE,
+      },
+    ];
+    assert.throws(
+      () =>
+        executePluginPlatforms({
+          platformInputs: [
+            { platform: "mac-arm64", candidates: validMacPluginCandidates("arm64") },
+            { platform: "mac-x64", candidates: invalidX64 },
+          ],
+          writeFile: (...args) => writes.push(args),
+        }),
+      /mac-x64|plugin-webview|exact candidates: 2/i,
+    );
+    assert.equal(writes.length, 0);
+  });
+
+  await t.test("successful writes run through the unified commit phase", () => {
+    const writes = [];
+    const result = executePluginPlatforms({
+      platformInputs: [
+        { platform: "mac-arm64", candidates: validMacPluginCandidates("arm64") },
+        { platform: "mac-x64", candidates: validMacPluginCandidates("x64") },
+      ],
+      writeFile: (...args) => writes.push(args),
+    });
+    assert.equal(result.platformPlans.length, 2);
+    assert.equal(writes.length, 4);
+    assert.deepEqual(
+      writes.map(([filePath]) => filePath),
+      [
+        ".vite/build/main-arm64.js",
+        "webview/assets/chatgpt~gwqc41kz-arm64.js",
+        ".vite/build/main-x64.js",
+        "webview/assets/chatgpt~gwqc41kz-x64.js",
+      ],
+    );
+  });
+});
+
+test("plugin summary reports both macOS architectures ready", () => {
   const summary = formatPluginSummary([
-    { platform: "mac-arm64", status: "skipped" },
+    { platform: "mac-arm64", status: "ready" },
+    { platform: "mac-x64", status: "ready" },
     { platform: "win", status: "ready" },
   ]);
-  assert.match(summary, /skipped=\[mac-arm64\]/);
-  assert.match(summary, /ready=\[win\]/);
+  assert.match(summary, /skipped=\[\]/);
+  assert.match(summary, /ready=\[mac-arm64,mac-x64,win\]/);
   assert.doesNotMatch(summary, /\bok\b|contracts satisfied/i);
 });
