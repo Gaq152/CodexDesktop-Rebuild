@@ -1304,6 +1304,77 @@ function patchSidebarContracts({ threadActionsSource, sidebarSource }) {
   };
 }
 
+function inspectThreadActionsLayer(code) {
+  const hasPatchEvidence =
+    countOccurrences(code, "id:`sidebarElectron.deleteThread`") > 0 ||
+    countOccurrences(code, "/* CodexSidebarDeleteAction */") > 0 ||
+    countOccurrences(code, "deleteThread:CodexSidebarDeleteAction") > 0;
+  if (hasPatchEvidence) {
+    patchThreadActionsSource(code);
+    return { state: "recognized" };
+  }
+  const ast = parseRequired(code, "sidebar thread-actions");
+  const archiveMessages = [];
+  const actionFunctions = [];
+  let recognizedEvidence = false;
+  walk(ast, (node) => {
+    if (
+      (node.type === "Identifier" && node.name === "archiveThread") ||
+      literalValue(node) === "archive-conversation"
+    ) recognizedEvidence = true;
+    if (node.type === "Property" && propertyName(node) === "archiveThread") {
+      const idProperty = node.value?.type === "ObjectExpression"
+        ? node.value.properties.find((property) => propertyName(property) === "id")
+        : null;
+      if (literalValue(idProperty?.value) === "sidebarElectron.archiveThread") archiveMessages.push(node);
+    }
+    if (node.type === "FunctionDeclaration") {
+      const source = sourceFor(code, node);
+      if (source.includes("archive-conversation") && source.includes("copyConversationMarkdown")) {
+        actionFunctions.push(node);
+      }
+    }
+  });
+  if (archiveMessages.length === 0 && actionFunctions.length === 0 && !recognizedEvidence) {
+    return { state: "absent" };
+  }
+  patchThreadActionsSource(code);
+  return { state: "recognized" };
+}
+
+function inspectSidebarLayer(code) {
+  const hasPatchEvidence =
+    countOccurrences(code, "/* CodexSidebarDeleteHover */") > 0 ||
+    countOccurrences(code, "/* CodexSidebarDeleteRow */") > 0;
+  if (hasPatchEvidence) {
+    patchSidebarSource(code);
+    return { state: "recognized" };
+  }
+  const ast = parseRequired(code, "sidebar UI");
+  const hoverFunctions = [];
+  const rowFunctions = [];
+  let recognizedEvidence = false;
+  walk(ast, (node) => {
+    if (
+      literalValue(node) === "archive-thread" ||
+      (node.type === "Property" && propertyName(node) === "additionalHoverActionCount")
+    ) recognizedEvidence = true;
+    if (node.type !== "FunctionDeclaration") return;
+    const source = sourceFor(code, node);
+    if (source.includes("thread-primary-action") && source.includes(".archiveThread")) {
+      hoverFunctions.push(node);
+    }
+    if (source.includes("archive-thread") && source.includes("additionalHoverActionCount")) {
+      rowFunctions.push(node);
+    }
+  });
+  if (hoverFunctions.length === 0 && rowFunctions.length === 0 && !recognizedEvidence) {
+    return { state: "absent" };
+  }
+  patchSidebarSource(code);
+  return { state: "recognized" };
+}
+
 function findExactSidebarAsset(platform, pattern, label) {
   const directory = path.join(SRC_DIR, platform, "_asar", "webview", "assets");
   if (!fs.existsSync(directory)) throw new Error(`${label} directory is missing for ${platform}`);
@@ -1332,13 +1403,16 @@ function planSidebarPlatform({
   }
   const threadActions = threadActionTargets[0];
   const sidebar = sidebarTargets[0];
-  const hasThreadActionsLayer =
-    /archiveThread|sidebarElectron\.archiveThread|archive-conversation|CodexSidebarDeleteAction/.test(
-      threadActions.source,
-    );
-  if (platform.startsWith("mac-") && !hasThreadActionsLayer) {
+  const threadActionsInspection = inspectThreadActionsLayer(threadActions.source);
+  const sidebarInspection = inspectSidebarLayer(sidebar.source);
+  const threadActionsAbsent = threadActionsInspection.state === "absent";
+  const sidebarAbsent = sidebarInspection.state === "absent";
+  if (platform.startsWith("mac-") && threadActionsAbsent && sidebarAbsent) {
     warn(`[skip] sidebar-delete: unsupported target layout on ${platform}`);
     return { status: "skipped", writes: [] };
+  }
+  if (platform.startsWith("mac-") && threadActionsAbsent !== sidebarAbsent) {
+    throw new Error(`sidebar target set is an incomplete half-contract for ${platform}`);
   }
   const result = patchSidebarContracts({
     threadActionsSource: threadActions.source,
@@ -1348,6 +1422,12 @@ function planSidebarPlatform({
     status: "ready",
     writes: [{ threadActions, sidebar, result }],
   };
+}
+
+function formatSidebarSummary(outcomes) {
+  const ready = outcomes.filter((outcome) => outcome.status === "ready").map((outcome) => outcome.platform);
+  const skipped = outcomes.filter((outcome) => outcome.status === "skipped").map((outcome) => outcome.platform);
+  return `[summary] sidebar-delete: ready=[${ready.join(",")}] skipped=[${skipped.join(",")}]`;
 }
 
 function main() {
@@ -1360,6 +1440,7 @@ function main() {
         fs.existsSync(path.join(SRC_DIR, name, "_asar")),
       );
   if (platforms.length === 0) throw new Error("sidebar-delete expected at least one platform");
+  const outcomes = [];
   const plans = platforms.flatMap((platformName) => {
     const threadActionsPath = findExactSidebarAsset(
       platformName,
@@ -1378,6 +1459,7 @@ function main() {
       threadActionTargets: [{ fileName: path.basename(threadActionsPath), path: threadActionsPath, source: threadActionsSource }],
       sidebarTargets: [{ fileName: path.basename(sidebarPath), path: sidebarPath, source: sidebarSource }],
     });
+    outcomes.push({ platform: platformName, status: platformPlan.status });
     return platformPlan.writes.map(({ threadActions, sidebar, result }) => ({
       platform: platformName,
       threadActionsPath: threadActions.path,
@@ -1400,7 +1482,7 @@ function main() {
       }
     }
   }
-  console.log(`  [done] sidebar-delete contracts satisfied for ${plans.length} platform(s)`);
+  console.log(formatSidebarSummary(outcomes));
 }
 
 if (require.main === module) main();
@@ -1412,4 +1494,5 @@ module.exports = {
   patchSidebarSource,
   patchSidebarContracts,
   planSidebarPlatform,
+  formatSidebarSummary,
 };

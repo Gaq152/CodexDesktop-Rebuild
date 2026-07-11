@@ -701,8 +701,31 @@ function inspectArchiveAppMainSource(source) {
   return null;
 }
 
-function patchAppMainSource(source) {
+function analyzeArchiveAppMainLayer(source) {
   const inspection = inspectArchiveAppMainSource(source);
+  const routeRe = /(["`])archive-conversation\1:(\w+)\(async\((\w+),\{conversationId:(\w+),cleanupWorktree:(\w+),source:(\w+)\}\)=>\{\s*await \3\.archiveConversation\(\4,\{cleanupWorktree:\5,source:\6\}\)\s*\}\)/g;
+  const patchableRoutes = [...source.matchAll(routeRe)];
+  const ast = parseArchiveSource(source, "archive app-main");
+  let archiveConversationEvidence = 0;
+  walkArchive(ast, (node) => {
+    if (archiveLiteral(node) === "archive-conversation") archiveConversationEvidence += 1;
+  });
+  if (archiveConversationEvidence !== patchableRoutes.length) {
+    throw new Error("archive route evidence is detached or structurally malformed");
+  }
+  if (patchableRoutes.length > 1) {
+    throw new Error(`archive route expected exactly 1 target, found ${patchableRoutes.length}`);
+  }
+  return {
+    state: inspection || patchableRoutes.length === 1 ? "recognized" : "absent",
+    inspection,
+    patchableRoutes,
+  };
+}
+
+function patchAppMainSource(source) {
+  const analysis = analyzeArchiveAppMainLayer(source);
+  const { inspection } = analysis;
   if (inspection && inspection.mode !== "native") {
     return {
       code: source,
@@ -715,8 +738,7 @@ function patchAppMainSource(source) {
     };
   }
 
-  const routeRe = /(["`])archive-conversation\1:(\w+)\(async\((\w+),\{conversationId:(\w+),cleanupWorktree:(\w+),source:(\w+)\}\)=>\{\s*await \3\.archiveConversation\(\4,\{cleanupWorktree:\5,source:\6\}\)\s*\}\)/g;
-  const matches = [...source.matchAll(routeRe)];
+  const matches = analysis.patchableRoutes;
   if (matches.length !== 1) {
     throw new Error(`archive route expected exactly 1 target, found ${matches.length}`);
   }
@@ -1091,13 +1113,16 @@ function planArchivePlatform({
   }
   const appMain = appMainTargets[0];
   const dataControls = dataControlsTargets[0];
-  const hasArchiveRouteLayer =
-    /archive-conversation|delete-archived-conversation|delete-conversation|thread\/delete/.test(
-      appMain.source,
-    );
-  if (platform.startsWith("mac-") && !hasArchiveRouteLayer) {
+  const appMainAnalysis = analyzeArchiveAppMainLayer(appMain.source);
+  const dataControlsInspection = inspectArchiveDataControlsSource(dataControls.source);
+  const appMainAbsent = appMainAnalysis.state === "absent";
+  const dataControlsAbsent = dataControlsInspection == null;
+  if (platform.startsWith("mac-") && appMainAbsent && dataControlsAbsent) {
     warn(`[skip] archive-delete: unsupported target layout on ${platform}`);
     return { status: "skipped", writes: [] };
+  }
+  if (platform.startsWith("mac-") && appMainAbsent !== dataControlsAbsent) {
+    throw new Error(`archive target set is an incomplete half-contract for ${platform}`);
   }
   const result = patchArchiveContracts({
     appMainSource: appMain.source,
@@ -1107,6 +1132,12 @@ function planArchivePlatform({
     status: "ready",
     writes: [{ appMain, dataControls, result }],
   };
+}
+
+function formatArchiveSummary(outcomes) {
+  const ready = outcomes.filter((outcome) => outcome.status === "ready").map((outcome) => outcome.platform);
+  const skipped = outcomes.filter((outcome) => outcome.status === "skipped").map((outcome) => outcome.platform);
+  return `[summary] archive-delete: ready=[${ready.join(",")}] skipped=[${skipped.join(",")}]`;
 }
 
 // ─── Main ───────────────────────────────────────────────────────
@@ -1123,6 +1154,7 @@ function main() {
         fs.existsSync(path.join(SRC_DIR, name, "_asar")),
       );
   if (platforms.length === 0) throw new Error("archive-delete expected at least one platform");
+  const outcomes = [];
   const plans = platforms.flatMap((platformName) => {
     const appMainPath = findExactAsset(platformName, /^app-main-.*\.js$/, "archive app-main");
     const dataControlsPath = findExactAsset(
@@ -1137,6 +1169,7 @@ function main() {
       appMainTargets: [{ fileName: path.basename(appMainPath), path: appMainPath, source: appMainSource }],
       dataControlsTargets: [{ fileName: path.basename(dataControlsPath), path: dataControlsPath, source: dataControlsSource }],
     });
+    outcomes.push({ platform: platformName, status: platformPlan.status });
     return platformPlan.writes.map(({ appMain, dataControls, result }) => ({
       platform: platformName,
       appMainPath: appMain.path,
@@ -1159,7 +1192,7 @@ function main() {
       }
     }
   }
-  console.log(`  [done] archive-delete contracts satisfied for ${plans.length} platform(s)`);
+  console.log(formatArchiveSummary(outcomes));
 }
 
 if (require.main === module) main();
@@ -1171,4 +1204,5 @@ module.exports = {
   patchDataControlsSource,
   patchArchiveContracts,
   planArchivePlatform,
+  formatArchiveSummary,
 };

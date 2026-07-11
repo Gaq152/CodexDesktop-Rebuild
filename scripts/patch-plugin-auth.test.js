@@ -8,6 +8,7 @@ const {
   patchPluginContracts,
   classifyPluginTarget,
   planPluginPlatform,
+  formatPluginSummary,
 } = require("./patch-plugin-auth");
 
 const LATEST_WEBVIEW_FIXTURE = [
@@ -270,4 +271,29 @@ test("platform matrix skips only an absent macOS plugin webview layer with zero 
     }),
     /webview.*expected exactly 1.*found 2/i,
   );
+});
+
+test("macOS plugin skip strictly validates a filename-recognized main candidate", () => {
+  assert.throws(
+    () => planPluginPlatform({
+      platform: "mac-arm64",
+      candidates: [
+        {
+          fileName: "main-weak.js",
+          source: "const externalBrowserUseAllowed=!1,computerUse=!1",
+        },
+      ],
+    }),
+    /plugin main|defaults|filter|peer|expected/i,
+  );
+});
+
+test("plugin summary names skipped platforms without claiming parity", () => {
+  const summary = formatPluginSummary([
+    { platform: "mac-arm64", status: "skipped" },
+    { platform: "win", status: "ready" },
+  ]);
+  assert.match(summary, /skipped=\[mac-arm64\]/);
+  assert.match(summary, /ready=\[win\]/);
+  assert.doesNotMatch(summary, /\bok\b|contracts satisfied/i);
 });

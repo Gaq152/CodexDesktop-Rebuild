@@ -7,6 +7,7 @@ const {
   patchSidebarSource,
   patchSidebarContracts,
   planSidebarPlatform,
+  formatSidebarSummary,
 } = require("./patch-sidebar-delete");
 
 const LATEST_THREAD_ACTIONS = [
@@ -150,7 +151,7 @@ test("rejects a delete action whose route and returned binding are inert", () =>
 test("platform matrix skips only an absent macOS sidebar thread-actions layer", () => {
   const targets = {
     threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const actions={}" }],
-    sidebarTargets: [{ fileName: "sidebar-flat-sections-mac.js", source: LATEST_SIDEBAR }],
+    sidebarTargets: [{ fileName: "sidebar-flat-sections-mac.js", source: "const sections={}" }],
   };
   for (const platform of ["mac-arm64", "mac-x64"]) {
     const warnings = [];
@@ -187,4 +188,49 @@ test("platform matrix skips only an absent macOS sidebar thread-actions layer", 
     }),
     /thread-actions.*expected exactly 1.*found 2/i,
   );
+});
+
+test("macOS sidebar skip strictly rejects malformed sidebar evidence", () => {
+  assert.throws(
+    () => planSidebarPlatform({
+      platform: "mac-x64",
+      threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const actions={}" }],
+      sidebarTargets: [{
+        fileName: "sidebar-flat-sections-mac.js",
+        source:
+          "/* CodexSidebarDeleteHover *//* CodexSidebarDeleteRow */" +
+          "const confirm=`thread-delete-confirm-action`,item={id:`delete-thread`};",
+      }],
+    }),
+    /sidebar|hover|row|malformed|incomplete/i,
+  );
+  assert.throws(
+    () => planSidebarPlatform({
+      platform: "mac-x64",
+      threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const actions={}" }],
+      sidebarTargets: [{
+        fileName: "sidebar-flat-sections-mac.js",
+        source: "const item={id:`archive-thread`},row={additionalHoverActionCount:0}",
+      }],
+    }),
+    /sidebar|hover|row|malformed|incomplete/i,
+  );
+  assert.throws(
+    () => planSidebarPlatform({
+      platform: "mac-arm64",
+      threadActionTargets: [{ fileName: "thread-actions-mac.js", source: "const actions={}" }],
+      sidebarTargets: [{ fileName: "sidebar-flat-sections-mac.js", source: LATEST_SIDEBAR }],
+    }),
+    /half|incomplete|thread-actions|sidebar/i,
+  );
+});
+
+test("sidebar summary names skipped platforms without claiming parity", () => {
+  const summary = formatSidebarSummary([
+    { platform: "mac-arm64", status: "skipped" },
+    { platform: "win", status: "ready" },
+  ]);
+  assert.match(summary, /skipped=\[mac-arm64\]/);
+  assert.match(summary, /ready=\[win\]/);
+  assert.doesNotMatch(summary, /\bok\b|contracts satisfied/i);
 });

@@ -6,6 +6,7 @@ const {
   patchFastModeSource,
   planFastModeTargets,
   planFastModePlatform,
+  formatFastModeSummary,
 } = require("./patch-fast-mode");
 
 const LATEST_FAST_MODE_FIXTURE =
@@ -126,7 +127,7 @@ test("ignores token-only decoy bundles and plans both semantic fast_mode targets
         source: "function B(){return `fast_mode chatgpt`}",
       },
       {
-        fileName: "read-service-tier-for-request-D2fynmwS.js",
+        fileName: "request-token-decoy-D2fynmwS.js",
         source: "function C(){return `fast_mode chatgpt`}",
       },
       {
@@ -203,4 +204,34 @@ test("platform matrix skips only an absent macOS fast-mode settings layer", () =
     }),
     /settings.*expected exactly 1.*found 2/i,
   );
+});
+
+test("macOS fast-mode skip rejects every filename-recognized request half-contract", () => {
+  assert.throws(
+    () => planFastModePlatform({
+      platform: "mac-arm64",
+      candidates: [
+        {
+          fileName: "read-service-tier-for-request-valid.js",
+          source: LATEST_FAST_REQUEST_FIXTURE,
+        },
+        {
+          fileName: "read-service-tier-for-request-half.js",
+          source: "function request(){return `fast_mode`}",
+        },
+      ],
+    }),
+    /request|incomplete|expected exactly 1|found 2/i,
+  );
+});
+
+test("fast-mode summary names skipped platforms without claiming parity", () => {
+  const summary = formatFastModeSummary([
+    { platform: "mac-arm64", status: "skipped" },
+    { platform: "mac-x64", status: "skipped" },
+    { platform: "win", status: "ready" },
+  ]);
+  assert.match(summary, /skipped=\[mac-arm64,mac-x64\]/);
+  assert.match(summary, /ready=\[win\]/);
+  assert.doesNotMatch(summary, /\bok\b|contracts satisfied/i);
 });

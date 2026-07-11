@@ -407,13 +407,24 @@ function planFastModeTargets(candidates, platform = "platform") {
 }
 
 function planFastModePlatform({ platform, candidates, warn = console.warn }) {
-  const settingsCandidates = candidates.filter((candidate) =>
-    FAST_MODE_FILE_PATTERNS.get("fast_mode_settings_auth_gate").test(
-      candidate.fileName ?? path.basename(candidate.path ?? ""),
-    ),
+  const matches = collectFastModeTargetMatches(candidates);
+  const namedCandidates = new Map(
+    FAST_MODE_CONTRACT_IDS.map((targetId) => [
+      targetId,
+      candidates.filter((candidate) =>
+        FAST_MODE_FILE_PATTERNS.get(targetId).test(
+          candidate.fileName ?? path.basename(candidate.path ?? ""),
+        ),
+      ),
+    ]),
   );
+  for (const targetId of FAST_MODE_CONTRACT_IDS) {
+    if (namedCandidates.get(targetId).length !== matches.get(targetId).length) {
+      throw new Error(`fast_mode ${targetId} target set is incomplete for ${platform}`);
+    }
+  }
+  const settingsCandidates = namedCandidates.get("fast_mode_settings_auth_gate");
   if (platform.startsWith("mac-") && settingsCandidates.length === 0) {
-    const matches = collectFastModeTargetMatches(candidates);
     const requestMatches = matches.get("fast_mode_request_auth_gate");
     if (requestMatches.length !== 1) {
       throw new Error(
@@ -425,6 +436,12 @@ function planFastModePlatform({ platform, candidates, warn = console.warn }) {
   }
   const plans = planFastModeTargets(candidates, platform);
   return { status: "ready", writes: plans };
+}
+
+function formatFastModeSummary(outcomes) {
+  const ready = outcomes.filter((outcome) => outcome.status === "ready").map((outcome) => outcome.platform);
+  const skipped = outcomes.filter((outcome) => outcome.status === "skipped").map((outcome) => outcome.platform);
+  return `[summary] fast-mode: ready=[${ready.join(",")}] skipped=[${skipped.join(",")}]`;
 }
 
 function main() {
@@ -454,6 +471,7 @@ function main() {
     }
   }
 
+  const outcomes = [];
   const plans = platforms.flatMap((platformName) => {
     const platformCandidates = candidates.filter(
       (candidate) => candidate.platform === platformName,
@@ -463,6 +481,7 @@ function main() {
       platform: platformName,
       candidates: platformCandidates,
     });
+    outcomes.push({ platform: platformName, status: platformPlan.status });
     const platformPlans = platformPlan.writes;
     for (const plan of platformPlans) {
       console.log(
@@ -484,9 +503,7 @@ function main() {
       }
     }
   }
-  const patched = plans.reduce((sum, plan) => sum + plan.result.counts.patchable, 0);
-  const already = plans.reduce((sum, plan) => sum + plan.result.counts.already, 0);
-  console.log(`  [ok] fast_mode patchable=${patched} already=${already} expected=${plans.length}`);
+  console.log(formatFastModeSummary(outcomes));
 }
 
 if (require.main === module) {
@@ -499,4 +516,5 @@ module.exports = {
   patchFastModeSource,
   planFastModeTargets,
   planFastModePlatform,
+  formatFastModeSummary,
 };

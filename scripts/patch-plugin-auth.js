@@ -1492,39 +1492,38 @@ function planPluginPlatform({ platform, candidates, warn = console.warn }) {
       /^use-is-plugins-enabled-.*\.js$/.test(candidate.fileName),
     ),
   };
-  const matches = { main: [], webview: [] };
-  for (const candidate of candidates) {
-    const kind = classifyPluginTarget(candidate.fileName, candidate.source);
-    if (kind) matches[kind].push(candidate);
-  }
-  if (named.main.length !== matches.main.length) {
-    throw new Error(`plugin main target set is incomplete for ${platform}`);
-  }
-  if (matches.main.length !== 1) {
+  if (named.main.length !== 1) {
     throw new Error(
-      `plugin main expected exactly 1 target for ${platform}, found ${matches.main.length}`,
+      `plugin main expected exactly 1 target for ${platform}, found ${named.main.length}`,
     );
   }
+  const main = patchPluginMainSource(named.main[0].source);
   if (platform.startsWith("mac-") && named.webview.length === 0) {
     warn(`[skip] plugin-auth: unsupported target layout on ${platform}`);
     return { status: "skipped", writes: [] };
   }
-  if (named.webview.length !== matches.webview.length) {
-    throw new Error(`plugin webview target set is incomplete for ${platform}`);
-  }
-  if (matches.webview.length !== 1) {
+  if (named.webview.length !== 1) {
     throw new Error(
-      `plugin webview expected exactly 1 target for ${platform}, found ${matches.webview.length}`,
+      `plugin webview expected exactly 1 target for ${platform}, found ${named.webview.length}`,
     );
   }
-  const result = patchPluginContracts({
-    mainSource: matches.main[0].source,
-    webviewSource: matches.webview[0].source,
-  });
+  const webview = patchPluginWebviewSource(named.webview[0].source);
+  const matches = { main: named.main, webview: named.webview };
+  const result = {
+    status: main.status === "already" && webview.status === "already" ? "already" : "patched",
+    main,
+    webview,
+  };
   return {
     status: "ready",
     writes: [{ matches, result }],
   };
+}
+
+function formatPluginSummary(outcomes) {
+  const ready = outcomes.filter((outcome) => outcome.status === "ready").map((outcome) => outcome.platform);
+  const skipped = outcomes.filter((outcome) => outcome.status === "skipped").map((outcome) => outcome.platform);
+  return `[summary] plugin-auth: ready=[${ready.join(",")}] skipped=[${skipped.join(",")}]`;
 }
 
 // ── Target location ──
@@ -1611,6 +1610,7 @@ function main() {
   if (platforms.length === 0) throw new Error("plugin patch expected at least one platform");
 
   const plans = [];
+  const outcomes = [];
   for (const platformName of platforms) {
     const roots = [
       path.join(SRC_DIR, platformName, "_asar", ".vite", "build"),
@@ -1627,6 +1627,7 @@ function main() {
       }
     }
     const platformPlan = planPluginPlatform({ platform: platformName, candidates });
+    outcomes.push({ platform: platformName, status: platformPlan.status });
     for (const write of platformPlan.writes) {
       plans.push({ platform: platformName, ...write });
     }
@@ -1650,7 +1651,7 @@ function main() {
       }
     }
   }
-  console.log(`  [ok] plugin contracts satisfied for ${plans.length} platform(s)`);
+  console.log(formatPluginSummary(outcomes));
 }
 
 if (require.main === module) main();
@@ -1661,4 +1662,5 @@ module.exports = {
   patchPluginContracts,
   classifyPluginTarget,
   planPluginPlatform,
+  formatPluginSummary,
 };

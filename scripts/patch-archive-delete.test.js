@@ -7,6 +7,7 @@ const {
   patchDataControlsSource,
   patchArchiveContracts,
   planArchivePlatform,
+  formatArchiveSummary,
 } = require("./patch-archive-delete");
 
 function withLiveRouter(routeEntries) {
@@ -274,4 +275,39 @@ test("platform matrix skips only an absent macOS archive route layer", () => {
     }),
     /app-main.*expected exactly 1.*found 2/i,
   );
+});
+
+test("macOS archive skip strictly rejects malformed data-controls evidence", () => {
+  assert.throws(
+    () => planArchivePlatform({
+      platform: "mac-arm64",
+      appMainTargets: [{ fileName: "app-main-mac.js", source: "const routes={}" }],
+      dataControlsTargets: [{
+        fileName: "data-controls-mac.js",
+        source: "const route=`delete-archived-conversation`",
+      }],
+    }),
+    /archive-delete UI|data-controls|malformed|incomplete/i,
+  );
+  assert.throws(
+    () => planArchivePlatform({
+      platform: "mac-x64",
+      appMainTargets: [{ fileName: "app-main-mac.js", source: "const routes={}" }],
+      dataControlsTargets: [{
+        fileName: "data-controls-mac.js",
+        source: LATEST_NATIVE_DATA_CONTROLS,
+      }],
+    }),
+    /half|incomplete|route|mode mismatch/i,
+  );
+});
+
+test("archive summary names skipped platforms without claiming parity", () => {
+  const summary = formatArchiveSummary([
+    { platform: "mac-x64", status: "skipped" },
+    { platform: "win", status: "ready" },
+  ]);
+  assert.match(summary, /skipped=\[mac-x64\]/);
+  assert.match(summary, /ready=\[win\]/);
+  assert.doesNotMatch(summary, /\bok\b|contracts satisfied/i);
 });
