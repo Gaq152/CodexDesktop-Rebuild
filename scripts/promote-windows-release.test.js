@@ -17,6 +17,52 @@ function readWorkflow() {
   return fs.readFileSync(workflowPath, "utf8").replace(/\r\n/g, "\n");
 }
 
+function collectRunCommands(workflow) {
+  const lines = workflow.split("\n");
+  const commands = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(/^(\s*)run:\s*(.*)$/);
+    if (!match) continue;
+    if (match[2] !== "|") {
+      commands.push(match[2]);
+      continue;
+    }
+    const indent = match[1].length;
+    const block = [];
+    for (index += 1; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (line.trim() && line.match(/^\s*/)[0].length <= indent) {
+        index -= 1;
+        break;
+      }
+      block.push(line);
+    }
+    commands.push(block.join("\n"));
+  }
+  return commands;
+}
+
+test("promotion workflow validates dispatch inputs before every external action", () => {
+  const workflow = readWorkflow();
+  const firstStep = workflow.match(
+    /    steps:\n      - name: Validate promotion inputs\n(?<body>[\s\S]*?)(?=\n      - name:)/,
+  )?.groups.body;
+  assert.ok(firstStep, "input validation should be the first workflow step");
+  assert.match(firstStep, /RELEASE_VERSION: \$\{\{ inputs\.release_version \}\}/);
+  assert.match(firstStep, /SOURCE_RUN_ID: \$\{\{ inputs\.source_run_id \}\}/);
+  assert.match(firstStep, /set -euo pipefail/);
+  assert.ok(firstStep.includes('[[ ! "$RELEASE_VERSION" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]'));
+  assert.ok(firstStep.includes('[[ ! "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]'));
+
+  for (const command of collectRunCommands(workflow)) {
+    assert.doesNotMatch(
+      command,
+      /\$\{\{ inputs\.(?:release_version|source_run_id) \}\}/,
+      "run commands must receive dispatch inputs through env",
+    );
+  }
+});
+
 test("promotion workflow downloads only the exact Windows artifacts from the selected run", () => {
   const workflow = readWorkflow();
 
@@ -59,7 +105,7 @@ test("promotion workflow validates installer portable and full package versions"
   assert.match(workflow, /\[ -z "\$actual" \] \|\| \[ "\$actual" != "\$EXPECTED_VERSION" \]/);
   assert.match(
     workflow,
-    /validate-windows-release-feed\.js --root artifacts\/update-feed --version "\$\{\{ inputs\.release_version \}\}"/,
+    /validate-windows-release-feed\.js --root artifacts\/update-feed --version "\$RELEASE_VERSION"/,
   );
 });
 
