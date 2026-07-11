@@ -14,8 +14,15 @@ function withLiveRouter(routeEntries) {
 
 const LATEST_NATIVE_APP_MAIN =
   withLiveRouter(
-    '"delete-archived-conversation":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t))',
+    '"archive-conversation":K7(async(e,{conversationId:t,cleanupWorktree:n,source:r})=>{await e.archiveConversation(t,{cleanupWorktree:n,source:r})}),' +
+      '"delete-archived-conversation":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t))',
   );
+const ACTIVE_ROUTE =
+  '"delete-conversation":K7(async(e,{conversationId:t})=>{await e.sendRequest("thread/delete",{threadId:t})})';
+const LATEST_COMBINED_APP_MAIN = withLiveRouter(
+  '"delete-archived-conversation":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t)),' +
+    ACTIVE_ROUTE,
+);
 const LATEST_NATIVE_DATA_CONTROLS =
   "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};async function D(e,t){await e(`delete-archived-conversation`,{conversationId:t});await e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)}export{D as DataControlsSettings}";
 const LEGACY_DATA_CONTROLS =
@@ -31,7 +38,7 @@ const DEAD_DECLARATION_DATA_CONTROLS =
 const UNUSED_TOP_LEVEL_DATA_CONTROLS =
   "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};function Unused(e,t){e(`delete-archived-conversation`,{conversationId:t});e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)}function Live(){return null}export{Live as DataControlsSettings}";
 
-test("recognizes the latest native archive-delete path without injecting a redundant route", () => {
+test("keeps native archive deletion and injects an independent active delete route", () => {
   assert.equal(
     typeof patchArchiveContracts,
     "function",
@@ -42,20 +49,21 @@ test("recognizes the latest native archive-delete path without injecting a redun
     appMainSource: LATEST_NATIVE_APP_MAIN,
     dataControlsSource: LATEST_NATIVE_DATA_CONTROLS,
   });
-  assert.equal(first.status, "native");
+  assert.equal(first.status, "patched");
   assert.deepEqual(first.counts, {
-    route: { patchable: 0, already: 0, native: 1, total: 1 },
+    route: { patchable: 1, already: 0, native: 1, total: 2 },
     button: { patchable: 0, already: 0, native: 1, total: 1 },
   });
-  assert.equal(first.appMain.code, LATEST_NATIVE_APP_MAIN);
+  assert.match(first.appMain.code, /"delete-archived-conversation"/);
+  assert.match(first.appMain.code, /"delete-conversation"/);
+  assert.match(first.appMain.code, /sendRequest\("thread\/delete",\{threadId:t\}\)/);
   assert.equal(first.dataControls.code, LATEST_NATIVE_DATA_CONTROLS);
-  assert.doesNotMatch(first.appMain.code, /[\"`]delete-conversation[\"`]/);
 
   const second = patchArchiveContracts({
     appMainSource: first.appMain.code,
     dataControlsSource: first.dataControls.code,
   });
-  assert.equal(second.status, "native");
+  assert.equal(second.status, "already");
   assert.equal(second.appMain.code, first.appMain.code);
   assert.equal(second.dataControls.code, first.dataControls.code);
 });
@@ -147,19 +155,19 @@ test("rejects malformed native, zero, and ambiguous archive route anchors", () =
   );
 });
 
-test("rejects simultaneous structural native and legacy archive routes", () => {
-  const nativeRoute =
-    '"delete-archived-conversation":q7((e,{conversationId:t})=>e.deleteArchivedConversation(t))';
-  const legacyRoute =
-    '"delete-conversation":K7(async(e,{conversationId:t})=>{await e.sendRequest("thread/delete",{threadId:t})})';
-  assert.throws(
-    () =>
-      patchArchiveContracts({
-        appMainSource: withLiveRouter(`${nativeRoute},${legacyRoute}`),
-        dataControlsSource: LATEST_NATIVE_DATA_CONTROLS,
-      }),
-    /mixed|mutually exclusive|native.*legacy|archive/i,
-  );
+test("accepts exactly one live native route and one live active route", () => {
+  const result = patchArchiveContracts({
+    appMainSource: LATEST_COMBINED_APP_MAIN,
+    dataControlsSource: LATEST_NATIVE_DATA_CONTROLS,
+  });
+  assert.equal(result.status, "already");
+  assert.deepEqual(result.counts.route, {
+    patchable: 0,
+    already: 1,
+    native: 1,
+    total: 2,
+  });
+  assert.equal(result.appMain.code, LATEST_COMBINED_APP_MAIN);
 });
 
 test("rejects detached native archive UI tokens", () => {

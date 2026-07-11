@@ -117,6 +117,12 @@ const MARKERS = [
     ),
   },
   {
+    id: "active-delete-route",
+    contract: "archive-delete",
+    file: "webview/assets/app-main-fixture.js",
+    text: '"delete-conversation":K7(async(manager,{conversationId:id})=>{await manager.sendRequest(`thread/delete`,{threadId:id})})',
+  },
+  {
     id: "delete-protocol",
     contract: "archive-delete",
     file: "webview/assets/data-controls-fixture.js",
@@ -323,11 +329,18 @@ function installStructuralFeatureFixtures(fixture) {
     pluginWebview,
   );
 
-  const nativeAppMain = fixture.includedMarkers.has("delete-route")
-    ? withLiveArchiveRouter(
-        '"delete-archived-conversation":q7((manager,{conversationId:id})=>manager.deleteArchivedConversation(id))',
-      )
-    : withLiveArchiveRouter("");
+  const archiveRoutes = [];
+  if (fixture.includedMarkers.has("delete-route")) {
+    archiveRoutes.push(
+      '"delete-archived-conversation":q7((manager,{conversationId:id})=>manager.deleteArchivedConversation(id))',
+    );
+  }
+  if (fixture.includedMarkers.has("active-delete-route")) {
+    archiveRoutes.push(
+      '"delete-conversation":K7(async(manager,{conversationId:id})=>{await manager.sendRequest(`thread/delete`,{threadId:id})})',
+    );
+  }
+  const nativeAppMain = withLiveArchiveRouter(archiveRoutes.join(","));
   const nativeDataControls = fixture.includedMarkers.has("delete-protocol")
     ? "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};async function remove(send,id){send(`delete-archived-conversation`,{conversationId:id});send(`delete-archived-conversation`,{conversationId:id});return classify(send,`thread/delete`)}export{remove as DataControlsSettings}"
     : "let value=1;";
@@ -1054,7 +1067,7 @@ test("archive-delete rejects a data-controls-only route and error-code decoy", (
   );
 });
 
-test("archive-delete rejects simultaneous native and legacy route modes", (t) => {
+test("archive-delete requires coexisting native and active routes", (t) => {
   const fixture = createFixture(t);
   const nativeRoute =
     '"delete-archived-conversation":q7((manager,{conversationId:id})=>manager.deleteArchivedConversation(id))';
@@ -1065,10 +1078,11 @@ test("archive-delete rejects simultaneous native and legacy route modes", (t) =>
     withLiveArchiveRouter(`${nativeRoute},${legacyRoute}`),
   );
 
-  assert.throws(
-    () => verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION),
-    (error) => error.message.includes("archive-delete"),
-  );
+  const result = verifyPatchedApp(fixture.root, "win", EXPECTED_VERSION);
+  assert.deepEqual(result.contracts["archive-delete"], [
+    "src/win/_asar/webview/assets/app-main-fixture.js",
+    "src/win/_asar/webview/assets/data-controls-fixture.js",
+  ]);
 });
 
 test("archive-delete rejects mismatched legacy manager and thread bindings", (t) => {

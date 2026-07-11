@@ -644,7 +644,7 @@ function inspectThreadActionsPostcondition(code) {
   walkOwnExecutableBody(declaration.init.body, (node) => {
     if (
       node.type === "CallExpression" &&
-      literalValue(node.arguments[0]) === "delete-archived-conversation" &&
+      literalValue(node.arguments[0]) === "delete-conversation" &&
       node.arguments[1]?.type === "ObjectExpression"
     ) routeCalls.push(node);
   });
@@ -699,6 +699,33 @@ function inspectThreadActionsPostcondition(code) {
   return { status: "already" };
 }
 
+function migrateArchivedSidebarDeleteRoute(code) {
+  const { ast } = parseSidebarDocument(code, "sidebar thread-actions migration");
+  const calls = [];
+  walk(ast, (node) => {
+    if (
+      node.type !== "VariableDeclarator" ||
+      node.id.type !== "Identifier" ||
+      node.id.name !== "CodexSidebarDeleteAction" ||
+      node.init?.type !== "ArrowFunctionExpression"
+    ) return;
+    walkOwnExecutableBody(node.init.body, (inner) => {
+      if (
+        inner.type === "CallExpression" &&
+        literalValue(inner.arguments[0]) === "delete-archived-conversation" &&
+        inner.arguments[1]?.type === "ObjectExpression" &&
+        objectProperty(inner.arguments[1], "conversationId") &&
+        objectProperty(inner.arguments[1], "hostId")
+      ) calls.push(inner);
+    });
+  });
+  if (calls.length !== 1 || code.includes("`delete-conversation`")) return null;
+  const route = calls[0].arguments[0];
+  return applySourceReplacements(code, [
+    { start: route.start, end: route.end, text: "`delete-conversation`" },
+  ]);
+}
+
 function patchThreadActionsSource(code) {
   const messageMarker = "id:`sidebarElectron.deleteThread`";
   const actionMarker = "/* CodexSidebarDeleteAction */";
@@ -706,7 +733,21 @@ function patchThreadActionsSource(code) {
   const actionCount = countOccurrences(code, actionMarker);
   const bindingCount = countOccurrences(code, "deleteThread:CodexSidebarDeleteAction");
   if (messageCount > 0 || actionCount > 0 || bindingCount > 0) {
-    inspectThreadActionsPostcondition(code);
+    try {
+      inspectThreadActionsPostcondition(code);
+    } catch (error) {
+      const migrated = migrateArchivedSidebarDeleteRoute(code);
+      if (migrated == null) throw error;
+      inspectThreadActionsPostcondition(migrated);
+      return {
+        code: migrated,
+        status: "patched",
+        counts: {
+          messages: sidebarCount(0, 1, "sidebar messages"),
+          action: sidebarCount(1, 0, "sidebar action"),
+        },
+      };
+    }
     return {
       code,
       status: "already",
@@ -770,7 +811,7 @@ function patchThreadActionsSource(code) {
     ",deleteThreadError:{id:`sidebarElectron.deleteThreadError`,defaultMessage:`删除任务失败`,description:`Error message when permanently deleting a local task`}";
   const action =
     `${actionMarker}let CodexSidebarDeleteAction=e=>{let{conversationId:n,hostId:i,onDeleteStart:a,onDeleteSuccess:o,onDeleteError:s}=e;` +
-    `a?.(),${sendFunction}(\`delete-archived-conversation\`,{conversationId:n,hostId:i}).then(()=>o?.()).catch(()=>s?.())};`;
+    `a?.(),${sendFunction}(\`delete-conversation\`,{conversationId:n,hostId:i}).then(()=>o?.()).catch(()=>s?.())};`;
   const next = applySourceReplacements(code, [
       { start: archiveMessages[0].end, end: archiveMessages[0].end, text: messages },
       { start: resultObjects[0].start + 1, end: resultObjects[0].start + 1, text: "deleteThread:CodexSidebarDeleteAction," },

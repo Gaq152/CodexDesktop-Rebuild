@@ -21,7 +21,7 @@ const LATEST_SIDEBAR = [
 const PENDING_TASK_DECOY =
   "function Sd(e){let i=()=>[{id:`archive-thread`,message:Sr.archiveThread,onSelect:()=>{}}],p=l&&B;return(0,Ad.jsx)(Ua,{additionalHoverActionCount:p?1:0,renderActions:q?Ed:e=>{let{archive:n,requestArchive:r}=e;return(0,Ad.jsx)(Dd,{archive:n,requestArchive:r})}})}";
 
-test("patches task-worded thread actions with the native delete route idempotently", () => {
+test("patches task-worded thread actions with the active delete route idempotently", () => {
   assert.equal(typeof patchThreadActionsSource, "function");
   const first = patchThreadActionsSource(LATEST_THREAD_ACTIONS);
   assert.equal(first.status, "patched");
@@ -31,7 +31,8 @@ test("patches task-worded thread actions with the native delete route idempotent
   });
   assert.match(first.code, /sidebarElectron\.deleteThread/);
   assert.match(first.code, /deleteThread:CodexSidebarDeleteAction/);
-  assert.match(first.code, /delete-archived-conversation/);
+  assert.match(first.code, /delete-conversation/);
+  assert.doesNotMatch(first.code, /delete-archived-conversation/);
   const second = patchThreadActionsSource(first.code);
   assert.equal(second.status, "already");
   assert.equal(second.code, first.code);
@@ -42,6 +43,19 @@ test("patches task-worded thread actions with the native delete route idempotent
       ),
     /sidebar thread-actions marker postcondition is malformed|sidebar action.*expected exactly 1.*found 2/i,
   );
+});
+
+test("migrates the previously injected archived route to the active route", () => {
+  const current = patchThreadActionsSource(LATEST_THREAD_ACTIONS).code;
+  const oldInjection = current.replace(
+    "`delete-conversation`",
+    "`delete-archived-conversation`",
+  );
+  const migrated = patchThreadActionsSource(oldInjection);
+  assert.equal(migrated.status, "patched");
+  assert.match(migrated.code, /delete-conversation/);
+  assert.doesNotMatch(migrated.code, /delete-archived-conversation/);
+  assert.equal(patchThreadActionsSource(migrated.code).status, "already");
 });
 
 test("adds delete and inline-confirmation actions to the latest sidebar aliases idempotently", () => {

@@ -304,6 +304,15 @@ function archiveCount(patchable, already, native, label) {
   return { patchable, already, native, total };
 }
 
+function combinedArchiveRouteCount(patchable, already) {
+  const native = 1;
+  const total = patchable + already + native;
+  if (patchable + already !== 1) {
+    throw new Error(`active archive route expected exactly 1 target, found ${patchable + already}`);
+  }
+  return { patchable, already, native, total };
+}
+
 function walkArchive(node, visitor) {
   if (!node || typeof node !== "object") return;
   if (node.type) visitor(node);
@@ -674,7 +683,12 @@ function inspectArchiveAppMainSource(source) {
     }
   }
   if (native.length > 0 && legacy.length > 0) {
-    throw new Error("archive native and legacy route modes are mutually exclusive");
+    if (native.length !== 1 || legacy.length !== 1) {
+      throw new Error(
+        `combined archive routes expected exactly 1/1 target, found ${native.length}/${legacy.length}`,
+      );
+    }
+    return { mode: "combined", status: "already" };
   }
   if (native.length > 0) {
     if (native.length !== 1) throw new Error(`native archive route expected exactly 1 target, found ${native.length}`);
@@ -689,14 +703,14 @@ function inspectArchiveAppMainSource(source) {
 
 function patchAppMainSource(source) {
   const inspection = inspectArchiveAppMainSource(source);
-  if (inspection) {
+  if (inspection && inspection.mode !== "native") {
     return {
       code: source,
       status: inspection.status,
       mode: inspection.mode,
       counts:
-        inspection.mode === "native"
-          ? archiveCount(0, 0, 1, "archive route")
+        inspection.mode === "combined"
+          ? combinedArchiveRouteCount(0, 1)
           : archiveCount(0, 1, 0, "archive route"),
     };
   }
@@ -715,14 +729,18 @@ function patchAppMainSource(source) {
   const injection = `,${quote}delete-conversation${quote}:${wrapper}(async(${manager},{conversationId:${conversationId}})=>{await ${manager}.sendRequest(${quote}thread/delete${quote},{threadId:${conversationId}})})`;
   const code = source.slice(0, end) + injection + source.slice(end);
   const patchedInspection = inspectArchiveAppMainSource(code);
-  if (patchedInspection?.mode !== "legacy") {
-    throw new Error("legacy archive route postcondition was not established");
+  const expectedMode = inspection?.mode === "native" ? "combined" : "legacy";
+  if (patchedInspection?.mode !== expectedMode) {
+    throw new Error(`${expectedMode} archive route postcondition was not established`);
   }
   return {
     code,
     status: "patched",
-    mode: "legacy",
-    counts: archiveCount(1, 0, 0, "archive route"),
+    mode: expectedMode,
+    counts:
+      expectedMode === "combined"
+        ? combinedArchiveRouteCount(1, 0)
+        : archiveCount(1, 0, 0, "archive route"),
   };
 }
 
@@ -1028,17 +1046,15 @@ function patchArchiveContracts({ appMainSource, dataControlsSource }) {
   if (typeof dataControlsSource !== "string") throw new Error("archive data-controls source is required");
   const appMain = patchAppMainSource(appMainSource);
   const dataControls = patchDataControlsSource(dataControlsSource);
-  if (appMain.mode !== dataControls.mode) {
+  const compatible =
+    (appMain.mode === "combined" && dataControls.mode === "native") ||
+    (appMain.mode === "legacy" && dataControls.mode === "legacy");
+  if (!compatible) {
     throw new Error(
       `archive route/UI mode mismatch: app-main=${appMain.mode}, data-controls=${dataControls.mode}`,
     );
   }
-  const status =
-    appMain.status === "native" && dataControls.status === "native"
-      ? "native"
-      : appMain.status === "already" && dataControls.status === "already"
-        ? "already"
-        : "patched";
+  const status = appMain.status === "already" ? "already" : "patched";
   return {
     status,
     appMain,
