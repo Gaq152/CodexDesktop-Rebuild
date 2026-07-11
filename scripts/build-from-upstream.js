@@ -13,13 +13,18 @@
  */
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execFileSync, execSync } = require("child_process");
 const {
   getPinnedCodexVersion,
   resolveCodexRuntime,
   installCodexRuntime,
   verifyCodexBinary,
 } = require("./codex-vendor");
+const {
+  findCachedWindowsMsix,
+  getExpectedWindowsMsixVersion,
+  resolvePrimaryExecutableNameFromManifest,
+} = require("./windows-app-entry");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SRC_DIR = path.join(PROJECT_ROOT, "src");
@@ -144,15 +149,22 @@ function buildWin(platform) {
     process.exit(1);
   }
 
-  // Windows: use the MSIX extract cache
+  // Windows: extract the same cached MSIX used by the installer. The shared
+  // win-extract directory can be incomplete after interrupted syncs.
   const tempDir = path.join(require("os").tmpdir(), "codex-sync");
-  const extractDir = path.join(tempDir, "win-extract");
+  const msixPath = findCachedWindowsMsix([tempDir], getExpectedWindowsMsixVersion());
+  const extractDir = path.join(OUT_DIR, ".windows-msix");
+  clearDir(extractDir);
+  execFileSync("tar", ["-xf", msixPath, "-C", extractDir], { stdio: "inherit" });
   const appDir = path.join(extractDir, "app");
+  const manifestPath = path.join(extractDir, "AppxManifest.xml");
 
-  if (!fs.existsSync(appDir)) {
+  if (!fs.existsSync(appDir) || !fs.existsSync(manifestPath)) {
     console.error(`[x] MSIX extract not found. Run sync-upstream first.`);
     process.exit(1);
   }
+  const primaryExe = resolvePrimaryExecutableNameFromManifest(fs.readFileSync(manifestPath, "utf8"));
+  console.log(`   [entry] Appx primary executable: ${primaryExe}`);
 
   // Copy app/ to output
   const outAppDir = path.join(OUT_DIR, "win");
@@ -177,12 +189,11 @@ function buildWin(platform) {
   console.log(`   [integrity] new hash: ${newHash.slice(0, 16)}...`);
 
   if (oldHash !== newHash) {
-    // Find Codex.exe in app root
-    const exePath = path.join(outApp, "Codex.exe");
+    const exePath = path.join(outApp, primaryExe);
     if (fs.existsSync(exePath)) {
       patchExeHash(exePath, oldHash, newHash);
     } else {
-      console.log("   [!] Codex.exe not found for hash patching");
+      console.log(`   [!] ${primaryExe} not found for hash patching`);
     }
   }
 

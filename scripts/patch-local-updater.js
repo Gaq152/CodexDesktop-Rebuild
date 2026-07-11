@@ -40,21 +40,13 @@ function layerVersionMarker(layer, version = LOCAL_UPDATER_CONTRACT_VERSION) {
   return `/* CodexRebuildLocalUpdater:${layer}:v${version} */`;
 }
 
-function makeBootstrapPrefix(version = LOCAL_UPDATER_CONTRACT_VERSION) {
-  const versionLine = version == null ? "" : `${layerVersionMarker("backend", version)}\n`;
-  return `${START_MARKER}
-${versionLine}function CodexRebuildWindowsBootstrap(){
-  if(process.platform!==\`win32\`)return!1;
-  let electron,path,childProcess;
-  try{
-    electron=require(\`electron\`);
-    path=require(\`node:path\`);
-    childProcess=require(\`node:child_process\`);
-  }catch{
-    return!1;
-  }
-  let {app,autoUpdater,dialog,ipcMain,BrowserWindow}=electron;
-  let squirrelEvent=process.argv.find(arg=>arg===\`--squirrel-install\`||arg===\`--squirrel-updated\`||arg===\`--squirrel-uninstall\`||arg===\`--squirrel-obsolete\`);
+function makeSquirrelLifecycleBlock(
+  legacyV1 = false,
+  detachedV1 = false,
+  unboundedV1 = false,
+) {
+  if (legacyV1) {
+    return `  let squirrelEvent=process.argv.find(arg=>arg===\`--squirrel-install\`||arg===\`--squirrel-updated\`||arg===\`--squirrel-uninstall\`||arg===\`--squirrel-obsolete\`);
   let isSquirrelEvent=squirrelEvent===\`--squirrel-install\`||squirrelEvent===\`--squirrel-updated\`||squirrelEvent===\`--squirrel-uninstall\`||squirrelEvent===\`--squirrel-obsolete\`;
   if(isSquirrelEvent){
     try{
@@ -78,7 +70,135 @@ ${versionLine}function CodexRebuildWindowsBootstrap(){
     }catch{}
     setTimeout(()=>app.quit(),1000);
     return!0;
+  }`;
   }
+  if (detachedV1) {
+    return `  let squirrelEvent=process.argv.find(arg=>arg===\`--squirrel-install\`||arg===\`--squirrel-updated\`||arg===\`--squirrel-uninstall\`||arg===\`--squirrel-obsolete\`);
+  let isSquirrelEvent=squirrelEvent===\`--squirrel-install\`||squirrelEvent===\`--squirrel-updated\`||squirrelEvent===\`--squirrel-uninstall\`||squirrelEvent===\`--squirrel-obsolete\`;
+  if(isSquirrelEvent){
+    try{
+      let appFolder=path.resolve(process.execPath,\`..\`);
+      let rootFolder=path.resolve(appFolder,\`..\`);
+      let updateExe=path.resolve(path.join(rootFolder,\`Update.exe\`));
+      let exeName=path.basename(process.execPath);
+      let legacyExeName=\`Codex.exe\`;
+      if(squirrelEvent===\`--squirrel-install\`||squirrelEvent===\`--squirrel-updated\`){
+        try{
+          let fs=require(\`node:fs\`);
+          let currentManifests=fs.readdirSync(appFolder).filter(name=>/^\\d+(?:\\.\\d+)+\\.manifest$/i.test(name));
+          for(let name of fs.readdirSync(rootFolder)){
+            if(/^\\d+(?:\\.\\d+)+\\.manifest$/i.test(name)&&!currentManifests.some(currentManifest=>name.toLowerCase()===currentManifest.toLowerCase())){
+              fs.rmSync(path.join(rootFolder,name),{force:!0});
+            }
+          }
+          for(let currentManifest of currentManifests){
+            fs.copyFileSync(path.join(appFolder,currentManifest),path.join(rootFolder,currentManifest));
+          }
+        }catch{}
+        if(exeName.toLowerCase()!==legacyExeName.toLowerCase()){
+          childProcess.spawn(updateExe,[\`--removeShortcut\`,legacyExeName],{detached:!0,stdio:\`ignore\`}).unref();
+        }
+        childProcess.spawn(updateExe,[\`--createShortcut\`,exeName],{detached:!0,stdio:\`ignore\`}).unref();
+      }else if(squirrelEvent===\`--squirrel-uninstall\`){
+        childProcess.spawn(updateExe,[\`--removeShortcut\`,exeName],{detached:!0,stdio:\`ignore\`}).unref();
+        if(exeName.toLowerCase()!==legacyExeName.toLowerCase()){
+          childProcess.spawn(updateExe,[\`--removeShortcut\`,legacyExeName],{detached:!0,stdio:\`ignore\`}).unref();
+        }
+      }
+    }catch{}
+    setTimeout(()=>app.quit(),1000);
+    return!0;
+  }`;
+  }
+  const shortcutCommandRunner = unboundedV1
+    ? `      let runShortcutCommand=args=>new Promise((resolve,reject)=>{
+        let child=childProcess.spawn(updateExe,args,{windowsHide:!0,stdio:\`ignore\`});
+        child.once(\`error\`,reject);
+        child.once(\`exit\`,code=>code===0?resolve():reject(new Error(\`Update.exe exited with code \${code}\`)));
+      });`
+    : `      let runShortcutCommand=args=>new Promise((resolve,reject)=>{
+        let child=childProcess.spawn(updateExe,args,{windowsHide:!0,stdio:\`ignore\`});
+        let settled=!1;
+        let finish=error=>{
+          if(settled)return;
+          settled=!0;
+          clearTimeout(timer);
+          child.removeListener(\`error\`,onError);
+          child.removeListener(\`exit\`,onExit);
+          error?reject(error):resolve();
+        };
+        let onError=error=>finish(error);
+        let onExit=code=>code===0?finish():finish(new Error(\`Update.exe exited with code \${code}\`));
+        let timer=setTimeout(()=>{
+          try{child.kill()}catch{}
+          finish(new Error(\`Shortcut command timed out: \${args.join(\` \`)}\`));
+        },15000);
+        child.once(\`error\`,onError);
+        child.once(\`exit\`,onExit);
+      });`;
+  return `  let squirrelEvent=process.argv.find(arg=>arg===\`--squirrel-install\`||arg===\`--squirrel-updated\`||arg===\`--squirrel-uninstall\`||arg===\`--squirrel-obsolete\`);
+  let isSquirrelEvent=squirrelEvent===\`--squirrel-install\`||squirrelEvent===\`--squirrel-updated\`||squirrelEvent===\`--squirrel-uninstall\`||squirrelEvent===\`--squirrel-obsolete\`;
+  if(isSquirrelEvent){
+    try{
+      let appFolder=path.resolve(process.execPath,\`..\`);
+      let rootFolder=path.resolve(appFolder,\`..\`);
+      let updateExe=path.resolve(path.join(rootFolder,\`Update.exe\`));
+      let exeName=path.basename(process.execPath);
+      let legacyExeName=\`Codex.exe\`;
+      if(squirrelEvent===\`--squirrel-install\`||squirrelEvent===\`--squirrel-updated\`){
+        try{
+          let fs=require(\`node:fs\`);
+          let currentManifests=fs.readdirSync(appFolder).filter(name=>/^\\d+(?:\\.\\d+)+\\.manifest$/i.test(name));
+          for(let name of fs.readdirSync(rootFolder)){
+            if(/^\\d+(?:\\.\\d+)+\\.manifest$/i.test(name)&&!currentManifests.some(currentManifest=>name.toLowerCase()===currentManifest.toLowerCase())){
+              fs.rmSync(path.join(rootFolder,name),{force:!0});
+            }
+          }
+          for(let currentManifest of currentManifests){
+            fs.copyFileSync(path.join(appFolder,currentManifest),path.join(rootFolder,currentManifest));
+          }
+        }catch{}
+      }
+${shortcutCommandRunner}
+      (async()=>{
+        if(squirrelEvent===\`--squirrel-install\`||squirrelEvent===\`--squirrel-updated\`){
+          if(exeName.toLowerCase()!==legacyExeName.toLowerCase()){
+            await runShortcutCommand([\`--removeShortcut\`,legacyExeName]);
+          }
+          await runShortcutCommand([\`--createShortcut\`,exeName]);
+        }else if(squirrelEvent===\`--squirrel-uninstall\`){
+          await runShortcutCommand([\`--removeShortcut\`,exeName]);
+          if(exeName.toLowerCase()!==legacyExeName.toLowerCase()){
+            await runShortcutCommand([\`--removeShortcut\`,legacyExeName]);
+          }
+        }
+      })().catch(e=>{try{console.warn('[CodexRebuildUpdater] shortcut lifecycle failed',e&&e.message?e.message:e)}catch{}}).finally(()=>app.quit());
+    }catch(e){
+      try{console.warn('[CodexRebuildUpdater] shortcut lifecycle failed',e&&e.message?e.message:e)}catch{}
+      app.quit();
+    }
+    return!0;
+  }`;
+}
+
+function makeBootstrapPrefix(
+  version = LOCAL_UPDATER_CONTRACT_VERSION,
+  { legacyLifecycle = false, detachedLifecycle = false, unboundedLifecycle = false } = {},
+) {
+  const versionLine = version == null ? "" : `${layerVersionMarker("backend", version)}\n`;
+  return `${START_MARKER}
+${versionLine}function CodexRebuildWindowsBootstrap(){
+  if(process.platform!==\`win32\`)return!1;
+  let electron,path,childProcess;
+  try{
+    electron=require(\`electron\`);
+    path=require(\`node:path\`);
+    childProcess=require(\`node:child_process\`);
+  }catch{
+    return!1;
+  }
+  let {app,autoUpdater,dialog,ipcMain,BrowserWindow}=electron;
+${makeSquirrelLifecycleBlock(legacyLifecycle, detachedLifecycle, unboundedLifecycle)}
   app.whenReady().then(()=>CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWindow)).catch(e=>{try{console.warn('[CodexRebuildUpdater] setup failed',e&&e.message?e.message:e)}catch{}});
   return!1;
 }
@@ -1745,12 +1865,34 @@ function inspectUpdaterBackendSource(code, { allowLegacy = false } = {}) {
   if (allowLegacy) {
     candidates.push(
       {
+        dialect: "unbounded-v1",
+        version: 1,
+        prefix: makeBootstrapPrefix(1, { unboundedLifecycle: true }),
+        versionMarker: layerVersionMarker("backend", 1),
+      },
+      {
+        dialect: "detached-v1",
+        version: 1,
+        prefix: makeBootstrapPrefix(1, { detachedLifecycle: true }),
+        versionMarker: layerVersionMarker("backend", 1),
+      },
+      {
+        dialect: "legacy-v1",
+        version: 1,
+        prefix: makeBootstrapPrefix(1, { legacyLifecycle: true }),
+        versionMarker: layerVersionMarker("backend", 1),
+      },
+      {
         dialect: "v0",
         version: 0,
-        prefix: makeBootstrapPrefix(0),
+        prefix: makeBootstrapPrefix(0, { legacyLifecycle: true }),
         versionMarker: layerVersionMarker("backend", 0),
       },
-      { dialect: "versionless", version: null, prefix: makeBootstrapPrefix(null) },
+      {
+        dialect: "versionless",
+        version: null,
+        prefix: makeBootstrapPrefix(null, { legacyLifecycle: true }),
+      },
     );
   }
 

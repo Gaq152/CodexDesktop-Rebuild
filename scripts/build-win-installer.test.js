@@ -7,6 +7,7 @@ const vm = require("vm");
 const { createRequire } = require("module");
 const test = require("node:test");
 const ResEdit = require("resedit");
+const { findCachedWindowsMsix } = require("./windows-app-entry");
 
 const source = fs.readFileSync(path.join(__dirname, "build-win-installer.js"), "utf-8");
 const tempAssignmentIndex = source.indexOf("process.env.TEMP = shortTemp");
@@ -23,7 +24,7 @@ function loadInstallerInternals() {
   const filename = path.join(__dirname, "build-win-installer.js");
   const isolatedSource = source.replace(
     /main\(\)\.catch\(\(error\) => \{[\s\S]*?\n\}\);\s*$/,
-    "module.exports = { markSquirrelAware, resolveSquirrelReleaseOptions };\n",
+    "module.exports = { createLegacyExecutableAlias, markSquirrelAware, resolvePrimaryExecutableNameFromManifest, resolveSquirrelReleaseOptions };\n",
   );
   const module = { exports: {} };
   vm.runInNewContext(isolatedSource, {
@@ -36,6 +37,63 @@ function loadInstallerInternals() {
   }, { filename });
   return module.exports;
 }
+
+test("resolves the official primary executable from current and legacy Appx manifests", () => {
+  const { resolvePrimaryExecutableNameFromManifest } = loadInstallerInternals();
+  const current = `<?xml version="1.0"?><Package><Applications><Application
+    Id="App" Executable="app/ChatGPT.exe" EntryPoint="Windows.FullTrustApplication" />
+  </Applications></Package>`;
+  const legacy = `<?xml version="1.0"?><Package><Applications><Application
+    Id="App" Executable="app\\Codex.exe" EntryPoint="Windows.FullTrustApplication" />
+  </Applications></Package>`;
+
+  assert.equal(resolvePrimaryExecutableNameFromManifest(current), "ChatGPT.exe");
+  assert.equal(resolvePrimaryExecutableNameFromManifest(legacy), "Codex.exe");
+});
+
+test("rejects Appx primary executables outside the app directory", () => {
+  const { resolvePrimaryExecutableNameFromManifest } = loadInstallerInternals();
+  assert.throws(
+    () => resolvePrimaryExecutableNameFromManifest(
+      `<Package><Applications><Application Executable="tools/ChatGPT.exe" /></Applications></Package>`,
+    ),
+    /primary executable.*app/i,
+  );
+});
+
+test("selects the expected cached Windows MSIX regardless of mtime", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-msix-cache-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const older = path.join(root, "OpenAI.Codex_26.623.1.0_x64__test.msix");
+  const newer = path.join(root, "OpenAI.Codex_26.707.1.0_x64__test.msix");
+  fs.writeFileSync(older, "old");
+  fs.writeFileSync(newer, "new");
+  fs.utimesSync(older, new Date(2_000), new Date(2_000));
+  fs.utimesSync(newer, new Date(1_000), new Date(1_000));
+  assert.equal(findCachedWindowsMsix([root], "26.707.1.0"), newer);
+});
+
+test("fails closed when the expected Windows MSIX is absent or ambiguous", (t) => {
+  const first = fs.mkdtempSync(path.join(os.tmpdir(), "codex-msix-first-"));
+  const second = fs.mkdtempSync(path.join(os.tmpdir(), "codex-msix-second-"));
+  t.after(() => {
+    fs.rmSync(first, { recursive: true, force: true });
+    fs.rmSync(second, { recursive: true, force: true });
+  });
+  fs.writeFileSync(path.join(first, "OpenAI.Codex_26.623.1.0_x64__test.msix"), "old");
+  assert.throws(
+    () => findCachedWindowsMsix([first], "26.707.1.0"),
+    /expected Windows x64 MSIX.*26\.707\.1\.0.*not found/i,
+  );
+
+  const expectedName = "OpenAI.Codex_26.707.1.0_x64__test.msix";
+  fs.writeFileSync(path.join(first, expectedName), "first");
+  fs.writeFileSync(path.join(second, expectedName), "second");
+  assert.throws(
+    () => findCachedWindowsMsix([first, second], "26.707.1.0"),
+    /multiple Windows x64 MSIX.*26\.707\.1\.0/i,
+  );
+});
 
 test("resolveSquirrelReleaseOptions uses remote releases for delta builds", () => {
   const { resolveSquirrelReleaseOptions } = loadInstallerInternals();
@@ -180,4 +238,27 @@ test("markSquirrelAware fails when the packaged executable is missing", (t) => {
     () => markSquirrelAware(root, "Codex.exe"),
     /packaged executable.*Codex\.exe.*not found/i,
   );
+});
+
+test("legacy Codex alias launches the primary binary without becoming Squirrel-aware", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-legacy-alias-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const primaryPath = path.join(root, "ChatGPT.exe");
+  const legacyPath = path.join(root, "Codex.exe");
+  writePeWithoutVersionInfo(primaryPath);
+  fs.writeFileSync(legacyPath, "upstream trampoline");
+
+  const { createLegacyExecutableAlias, markSquirrelAware } = loadInstallerInternals();
+  createLegacyExecutableAlias(root, "ChatGPT.exe", "Codex.exe");
+  assert.deepEqual(fs.readFileSync(legacyPath), fs.readFileSync(primaryPath));
+
+  markSquirrelAware(root, "ChatGPT.exe");
+  const readSquirrelAware = (file) => {
+    const executable = ResEdit.NtExecutable.from(fs.readFileSync(file), { ignoreCert: true });
+    const resources = ResEdit.NtExecutableResource.from(executable);
+    const [version] = ResEdit.Resource.VersionInfo.fromEntries(resources.entries);
+    return version?.getStringValues({ lang: 1033, codepage: 1200 }).SquirrelAwareVersion;
+  };
+  assert.equal(readSquirrelAware(primaryPath), "1");
+  assert.equal(readSquirrelAware(legacyPath), undefined);
 });

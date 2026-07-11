@@ -5,6 +5,7 @@ const os = require("os");
 const path = require("path");
 const test = require("node:test");
 const vm = require("vm");
+const { EventEmitter } = require("events");
 
 function withRealQuotedKeys(source) {
   return source
@@ -91,6 +92,20 @@ function snapshotLocalUpdaterTargets(asarRoot, relativePaths) {
   const bootstrap = makeBootstrapPrefix();
 
   assert.ok(bootstrap.includes("let {app,autoUpdater,dialog,ipcMain,BrowserWindow}=electron;"));
+  assert.ok(bootstrap.includes("let legacyExeName=`Codex.exe`;"));
+  assert.ok(bootstrap.includes("currentManifests.some(currentManifest=>name.toLowerCase()===currentManifest.toLowerCase())"));
+  assert.ok(bootstrap.includes("[`--removeShortcut`,legacyExeName]"));
+  assert.ok(bootstrap.includes("[`--createShortcut`,exeName]"));
+  assert.ok(bootstrap.includes("if(exeName.toLowerCase()!==legacyExeName.toLowerCase())"));
+  assert.ok(bootstrap.includes("await runShortcutCommand([`--removeShortcut`,legacyExeName])"));
+  assert.ok(bootstrap.includes("await runShortcutCommand([`--createShortcut`,exeName])"));
+  assert.ok(bootstrap.includes(".catch(e=>{try{console.warn('[CodexRebuildUpdater] shortcut lifecycle failed'"));
+  assert.ok(bootstrap.includes(".finally(()=>app.quit())"));
+  assert.ok(bootstrap.includes("Shortcut command timed out"));
+  assert.ok(bootstrap.includes("child.kill()"));
+  assert.ok(!bootstrap.includes("detached:!0"));
+  assert.ok(!bootstrap.includes(".unref()"));
+  assert.ok(!bootstrap.includes("setTimeout(()=>app.quit(),1000)"));
   assert.ok(
     bootstrap.includes(
       "CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWindow)",
@@ -395,6 +410,164 @@ test("rejects stale or mismatched canonical updater block versions", () => {
     () => planLocalUpdaterSources(patched),
     /backend|bootstrap|canonical|version|postcondition/i,
   );
+});
+
+test("migrates the exact v1 updater backend to the current shortcut lifecycle", () => {
+  const original = "require(`./src-BZqs_tzA.js`);";
+  const legacy = `${makeBootstrapPrefix(1, { legacyLifecycle: true })}${original}\n}\n/* CodexRebuildLocalUpdater:file-end */\n`;
+  assert.ok(legacy.includes("for(let name of fs.readdirSync(appFolder))"));
+  assert.ok(!legacy.includes("legacyExeName"));
+
+  const migrated = patchBootstrapCode(legacy);
+  assert.equal(migrated.status, "patched");
+  assert.ok(migrated.code.includes("let legacyExeName=`Codex.exe`;"));
+  assert.ok(migrated.code.includes(original));
+  assert.equal(patchBootstrapCode(migrated.code).status, "already");
+});
+
+test("migrates the detached ChatGPT shortcut v1 backend to the serial lifecycle", () => {
+  const original = "require(`./src-BZqs_tzA.js`);";
+  const detached = `${makeBootstrapPrefix(1, { detachedLifecycle: true })}${original}\n}\n/* CodexRebuildLocalUpdater:file-end */\n`;
+  assert.ok(detached.includes("detached:!0"));
+  assert.ok(detached.includes("[`--removeShortcut`,legacyExeName]"));
+
+  const migrated = patchBootstrapCode(detached);
+  assert.equal(migrated.status, "patched");
+  assert.ok(!migrated.code.includes("detached:!0"));
+  assert.ok(migrated.code.includes("await runShortcutCommand"));
+  assert.equal(patchBootstrapCode(migrated.code).status, "already");
+});
+
+test("migrates the unbounded serial v1 backend to the bounded lifecycle", () => {
+  const original = "require(`./src-BZqs_tzA.js`);";
+  const unbounded = `${makeBootstrapPrefix(1, { unboundedLifecycle: true })}${original}\n}\n/* CodexRebuildLocalUpdater:file-end */\n`;
+  assert.ok(unbounded.includes("await runShortcutCommand"));
+  assert.ok(!unbounded.includes("Shortcut command timed out"));
+
+  const migrated = patchBootstrapCode(unbounded);
+  assert.equal(migrated.status, "patched");
+  assert.ok(migrated.code.includes("Shortcut command timed out"));
+});
+
+test("migrates historical v0 and versionless backends with their detached lifecycle", () => {
+  const original = "require(`./src-BZqs_tzA.js`);";
+  for (const version of [0, null]) {
+    const legacy = `${makeBootstrapPrefix(version, { legacyLifecycle: true })}${original}\n}\n/* CodexRebuildLocalUpdater:file-end */\n`;
+    assert.ok(legacy.includes("detached:!0"));
+    const migrated = patchBootstrapCode(legacy);
+    assert.equal(migrated.status, "patched");
+    assert.ok(migrated.code.includes("await runShortcutCommand"));
+  }
+});
+
+test("runs Squirrel shortcut migration sequentially before quitting", async () => {
+  const children = [];
+  const calls = [];
+  let quitCount = 0;
+  const app = {
+    quit() { quitCount += 1; },
+    whenReady() { throw new Error("Squirrel lifecycle must return before app readiness"); },
+  };
+  const childProcess = {
+    spawn(_file, args, options) {
+      calls.push({ args, options });
+      const child = new EventEmitter();
+      children.push(child);
+      return child;
+    },
+  };
+  const electron = { app, autoUpdater: {}, dialog: {}, ipcMain: {}, BrowserWindow: {} };
+  const source = `${makeBootstrapPrefix()}void 0;\n}\n`;
+  vm.runInNewContext(source, {
+    clearTimeout,
+    console,
+    process: {
+      platform: "win32",
+      argv: ["ChatGPT.exe", "--squirrel-updated"],
+      execPath: "C:\\Codex\\app-26.707.31428\\ChatGPT.exe",
+    },
+    require(id) {
+      if (id === "electron") return electron;
+      if (id === "node:path") return path.win32;
+      if (id === "node:child_process") return childProcess;
+      if (id === "node:fs") {
+        return {
+          readdirSync() { return []; },
+          rmSync() {},
+          copyFileSync() {},
+        };
+      }
+      throw new Error(`Unexpected require: ${id}`);
+    },
+    setTimeout,
+  });
+
+  assert.deepEqual(calls.map((call) => call.args), [["--removeShortcut", "Codex.exe"]]);
+  assert.equal(calls[0].options.detached, undefined);
+  assert.equal(quitCount, 0);
+
+  children[0].emit("exit", 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls.map((call) => call.args), [
+    ["--removeShortcut", "Codex.exe"],
+    ["--createShortcut", "ChatGPT.exe"],
+  ]);
+  assert.equal(quitCount, 0);
+
+  children[1].emit("exit", 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(quitCount, 1);
+});
+
+test("bounds a stuck Squirrel shortcut command and still quits", async () => {
+  let timeoutCallback;
+  let killed = 0;
+  let quitCount = 0;
+  const warnings = [];
+  const child = new EventEmitter();
+  child.kill = () => { killed += 1; };
+  const source = `${makeBootstrapPrefix()}void 0;\n}\n`;
+  vm.runInNewContext(source, {
+    clearTimeout() {},
+    console: { warn(...args) { warnings.push(args.join(" ")); } },
+    process: {
+      platform: "win32",
+      argv: ["ChatGPT.exe", "--squirrel-updated"],
+      execPath: "C:\\Codex\\app-26.707.31428\\ChatGPT.exe",
+    },
+    require(id) {
+      if (id === "electron") {
+        return {
+          app: {
+            quit() { quitCount += 1; },
+            whenReady() { throw new Error("unexpected readiness"); },
+          },
+          autoUpdater: {},
+          dialog: {},
+          ipcMain: {},
+          BrowserWindow: {},
+        };
+      }
+      if (id === "node:path") return path.win32;
+      if (id === "node:child_process") return { spawn() { return child; } };
+      if (id === "node:fs") {
+        return { readdirSync() { return []; }, rmSync() {}, copyFileSync() {} };
+      }
+      throw new Error(`Unexpected require: ${id}`);
+    },
+    setTimeout(callback) {
+      timeoutCallback = callback;
+      return 1;
+    },
+  });
+
+  assert.equal(typeof timeoutCallback, "function");
+  assert.equal(quitCount, 0);
+  timeoutCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(killed, 1);
+  assert.equal(quitCount, 1);
+  assert.ok(warnings.some((warning) => warning.includes("Shortcut command timed out")));
 });
 
 test("rejects a preload bridge detached from executable Program-scope exposure", () => {

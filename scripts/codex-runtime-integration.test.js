@@ -47,3 +47,12 @@ test("bump-version.js prefers the extracted Windows ASAR package", () => {
   assert.notEqual(windowsAsarPackage, -1);
   assert.ok(platformFallback === -1 || windowsAsarPackage < platformFallback);
 });
+
+test("portable Windows build patches the Appx manifest primary executable", () => {
+  const source = readScript("build-from-upstream.js");
+  assert.match(source, /require\(["']\.\/windows-app-entry["']\)/);
+  assert.match(source, /resolvePrimaryExecutableNameFromManifest/);
+  assert.match(source, /findCachedWindowsMsix/);
+  assert.doesNotMatch(source, /path\.join\(tempDir,\s*["']win-extract["']\)/);
+  assert.doesNotMatch(source, /path\.join\(outApp,\s*["']Codex\.exe["']\)/);
+});

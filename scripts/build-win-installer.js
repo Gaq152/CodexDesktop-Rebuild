@@ -11,6 +11,12 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
+const {
+  assertWindowsMsixVersion,
+  findCachedWindowsMsix,
+  getExpectedWindowsMsixVersion,
+  resolvePrimaryExecutableNameFromManifest,
+} = require("./windows-app-entry");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const INITIAL_TMPDIR = os.tmpdir();
@@ -101,24 +107,6 @@ function normalizeEscapedScopeDirs(rootDir) {
   return renamed;
 }
 
-function findCachedMsix() {
-  const cacheDirs = [...new Set([INITIAL_TMPDIR, os.tmpdir()].map((dir) => path.join(dir, "codex-sync")))];
-  const candidates = [];
-
-  for (const cacheDir of cacheDirs) {
-    if (!fs.existsSync(cacheDir)) continue;
-    for (const entry of fs.readdirSync(cacheDir, { withFileTypes: true })) {
-      if (!entry.isFile() || !/^OpenAI\.Codex_.*_x64__.*\.msix$/i.test(entry.name)) continue;
-      const fullPath = path.join(cacheDir, entry.name);
-      candidates.push({ fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs });
-    }
-  }
-
-  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-  return candidates[0]?.fullPath || null;
-}
-
 function computeAsarHeaderHash(asarPath) {
   const crypto = require("crypto");
   const buf = fs.readFileSync(asarPath);
@@ -132,18 +120,22 @@ function patchExeHash(exePath, oldHash, newHash) {
   const oldBuf = Buffer.from(oldHash, "ascii");
   const idx = buf.indexOf(oldBuf);
   if (idx < 0) {
-    console.log("   [!] old ASAR integrity hash not found in Codex.exe");
+    console.log(`   [!] old ASAR integrity hash not found in ${path.basename(exePath)}`);
     return;
   }
 
   Buffer.from(newHash, "ascii").copy(buf, idx);
   fs.writeFileSync(exePath, buf);
-  console.log(`   [integrity] Codex.exe hash patched at offset ${idx}`);
+  console.log(`   [integrity] ${path.basename(exePath)} hash patched at offset ${idx}`);
 }
 
 function stageUpstreamApp(shortWorkspace) {
-  const msixPath = process.env.CODEX_REBUILD_WIN_MSIX || findCachedMsix();
-  if (!msixPath || !fs.existsSync(msixPath)) {
+  const cacheDirs = [INITIAL_TMPDIR, os.tmpdir()].map((dir) => path.join(dir, "codex-sync"));
+  const expectedVersion = getExpectedWindowsMsixVersion();
+  const msixPath = process.env.CODEX_REBUILD_WIN_MSIX
+    ? assertWindowsMsixVersion(process.env.CODEX_REBUILD_WIN_MSIX, expectedVersion)
+    : findCachedWindowsMsix(cacheDirs, expectedVersion);
+  if (!fs.existsSync(msixPath)) {
     throw new Error(
       "Windows MSIX cache not found. Run `node scripts/sync-upstream.js --force --skip-mac` first.",
     );
@@ -154,8 +146,13 @@ function stageUpstreamApp(shortWorkspace) {
   console.log(`-- extracting upstream MSIX: ${path.basename(msixPath)}`);
   run("tar", ["-xf", msixPath, "-C", extractDir]);
 
+  const manifestPath = path.join(extractDir, "AppxManifest.xml");
+  if (!fs.existsSync(manifestPath)) {
+    throw new Error(`AppxManifest.xml was not found in extracted MSIX: ${extractDir}`);
+  }
+  const primaryExe = resolvePrimaryExecutableNameFromManifest(fs.readFileSync(manifestPath, "utf-8"));
   const appDirectory = path.join(extractDir, "app");
-  const exePath = path.join(appDirectory, "Codex.exe");
+  const exePath = path.join(appDirectory, primaryExe);
   const chromeDll = path.join(appDirectory, "chrome.dll");
   const resourcesDir = path.join(appDirectory, "resources");
   if (!fs.existsSync(exePath) || !fs.existsSync(chromeDll) || !fs.existsSync(resourcesDir)) {
@@ -170,17 +167,18 @@ function stageUpstreamApp(shortWorkspace) {
     );
   }
 
-  return appDirectory;
+  console.log(`   [entry] Appx primary executable: ${primaryExe}`);
+  return { appDirectory, primaryExe };
 }
 
-function applyPatchedResources(appDirectory) {
+function applyPatchedResources(appDirectory, primaryExe) {
   const resourcesDir = path.join(appDirectory, "resources");
   const sourceWinDir = path.join(PROJECT_ROOT, "src", "win");
   const sourceAsar = path.join(sourceWinDir, "app.asar");
   const sourceUnpacked = path.join(sourceWinDir, "app.asar.unpacked");
   const destAsar = path.join(resourcesDir, "app.asar");
   const destUnpacked = path.join(resourcesDir, "app.asar.unpacked");
-  const exePath = path.join(appDirectory, "Codex.exe");
+  const exePath = path.join(appDirectory, primaryExe);
 
   if (!fs.existsSync(sourceAsar) || !fs.existsSync(sourceUnpacked)) {
     throw new Error("Patched Windows app.asar/app.asar.unpacked not found.");
@@ -248,7 +246,18 @@ function stripExternalAssemblyManifestDependencies(appDirectory, exeName) {
   if (!changed) return;
   resources.outputResource(exe);
   fs.writeFileSync(exePath, Buffer.from(exe.generate()));
-  console.log("   [ok] stripped root-stub-breaking manifest dependency from Codex.exe");
+  console.log(`   [ok] stripped root-stub-breaking manifest dependency from ${exeName}`);
+}
+
+function createLegacyExecutableAlias(appDirectory, primaryExe, legacyExe = "Codex.exe") {
+  if (primaryExe.toLowerCase() === legacyExe.toLowerCase()) return false;
+  const primaryPath = path.join(appDirectory, primaryExe);
+  if (!fs.existsSync(primaryPath)) {
+    throw new Error(`Primary executable ${primaryPath} was not found; cannot create legacy alias.`);
+  }
+  fs.copyFileSync(primaryPath, path.join(appDirectory, legacyExe));
+  console.log(`   [ok] legacy ${legacyExe} compatibility alias -> ${primaryExe}`);
+  return true;
 }
 
 function isCoveredByDefaultNuspec(entryName, exeName) {
@@ -313,7 +322,7 @@ function markSquirrelAware(appDirectory, exeName) {
 
   resources.outputResource(executable);
   fs.writeFileSync(exePath, Buffer.from(executable.generate()));
-  console.log("   [ok] marked Codex.exe as Squirrel-aware");
+  console.log(`   [ok] marked ${exeName} as Squirrel-aware`);
 }
 
 function resolveSquirrelReleaseOptions(env) {
@@ -359,11 +368,12 @@ async function main() {
 
   const { createWindowsInstaller } = require("electron-winstaller");
 
-  const appDirectory = stageUpstreamApp(shortWorkspace);
-  applyPatchedResources(appDirectory);
-  stripExternalAssemblyManifestDependencies(appDirectory, "Codex.exe");
-  markSquirrelAware(appDirectory, "Codex.exe");
-  const additionalFiles = collectAdditionalFiles(appDirectory, "Codex.exe");
+  const { appDirectory, primaryExe } = stageUpstreamApp(shortWorkspace);
+  applyPatchedResources(appDirectory, primaryExe);
+  stripExternalAssemblyManifestDependencies(appDirectory, primaryExe);
+  createLegacyExecutableAlias(appDirectory, primaryExe);
+  markSquirrelAware(appDirectory, primaryExe);
+  const additionalFiles = collectAdditionalFiles(appDirectory, primaryExe);
   console.log(`-- additional root runtime entries: ${additionalFiles.length}`);
   const installerVersion = process.env.CODEX_REBUILD_INSTALLER_VERSION || getPatchedAppVersion();
   console.log(`-- installer version: ${installerVersion}`);
@@ -378,7 +388,7 @@ async function main() {
     owners: "OpenAI, Cometix Space",
     description: "Codex Desktop App",
     version: installerVersion,
-    exe: "Codex.exe",
+    exe: primaryExe,
     additionalFiles,
     setupExe: "CodexSetup.exe",
     noMsi: true,
