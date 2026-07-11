@@ -57,11 +57,15 @@ jobs:
   build-mac:
     needs: check
     if: needs.check.outputs.mac_changed == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64]
+        include:
+          - arch: x64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-26
     steps:
       - name: Checkout
         uses: actions/checkout@v6
