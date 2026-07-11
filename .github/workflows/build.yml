@@ -91,7 +91,11 @@ jobs:
           "CODEX_REBUILD_INSTALLER_VERSION=${{ inputs.installer_version }}" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - run: node scripts/patch-all.js win
       - run: npm run build:win-x64
-      - run: npm run build:win-installer
+      - name: Build Windows installer with diagnostics
+        timeout-minutes: 30
+        env:
+          DEBUG: electron-windows-installer:*
+        run: npm run build:win-installer
       - name: Resolve Windows artifact versions
         id: windows_artifacts
         run: node scripts/resolve-release-artifacts.js --root out --rename-windows-setup --github-output
