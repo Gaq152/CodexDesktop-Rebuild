@@ -712,7 +712,12 @@ function analyzeArchiveAppMainLayer(source) {
   const ast = parseArchiveSource(source, "archive app-main");
   let archiveConversationEvidence = 0;
   walkArchive(ast, (node) => {
-    if (archiveLiteral(node) === "archive-conversation") archiveConversationEvidence += 1;
+    if (
+      node.type === "Property" &&
+      archivePropertyName(node) === "archive-conversation"
+    ) {
+      archiveConversationEvidence += 1;
+    }
   });
   if (archiveConversationEvidence !== patchableRoutes.length) {
     throw new Error("archive route evidence is detached or structurally malformed");
@@ -1116,6 +1121,21 @@ function isArchiveWebviewAsset(candidate) {
   return inAssets && candidate.fileName.endsWith(".js");
 }
 
+function mayContainArchiveRouteContract(source) {
+  return (
+    source.includes("archive-conversation") ||
+    source.includes("delete-archived-conversation") ||
+    source.includes("delete-conversation")
+  );
+}
+
+function mayContainArchiveDataControlsContract(source) {
+  return (
+    source.includes("delete-archived-conversation") ||
+    (source.includes("delete-conversation") && source.includes("codexConfirmDelete"))
+  );
+}
+
 function archiveRouteOwnershipEvidence(source) {
   let ast;
   try {
@@ -1284,10 +1304,18 @@ function planMacArchivePlatform({ platform, candidates }) {
   const plan = planRequiredRoles({
     platform,
     roles: [
-      { role: "archive-route", candidates: scoped, probe: probeArchiveRoute },
+      {
+        role: "archive-route",
+        candidates: scoped.filter((candidate) =>
+          mayContainArchiveRouteContract(candidate.source),
+        ),
+        probe: probeArchiveRoute,
+      },
       {
         role: "archive-data-controls",
-        candidates: scoped,
+        candidates: scoped.filter((candidate) =>
+          mayContainArchiveDataControlsContract(candidate.source),
+        ),
         probe: probeArchiveDataControls,
       },
     ],
@@ -1456,4 +1484,6 @@ module.exports = {
   planArchivePlatform,
   executeArchivePlatforms,
   formatArchiveSummary,
+  mayContainArchiveRouteContract,
+  mayContainArchiveDataControlsContract,
 };

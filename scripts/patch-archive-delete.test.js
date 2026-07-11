@@ -9,6 +9,8 @@ const {
   planArchivePlatform,
   executeArchivePlatforms,
   formatArchiveSummary,
+  mayContainArchiveRouteContract,
+  mayContainArchiveDataControlsContract,
 } = require("./patch-archive-delete");
 
 function withLiveRouter(routeEntries) {
@@ -46,6 +48,15 @@ const DEAD_DECLARATION_DATA_CONTROLS =
   "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};function Controls(){function neverCalled(e,t){e(`delete-archived-conversation`,{conversationId:t});e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)}return null}";
 const UNUSED_TOP_LEVEL_DATA_CONTROLS =
   "let messages={delete:{id:`settings.dataControls.archivedChats.delete`}};function Unused(e,t){e(`delete-archived-conversation`,{conversationId:t});e(`delete-archived-conversation`,{conversationId:t});return classify(e,`thread/delete`)}function Live(){return null}export{Live as DataControlsSettings}";
+
+const LATEST_MAC_NATIVE_APP_MAIN = [
+  "var routes;(()=>{routes={",
+  '"archive-conversation":P9(async(e,{conversationId:t,cleanupWorktree:n,source:r})=>{await e.archiveConversation(t,{cleanupWorktree:n,source:r})}),',
+  '"delete-archived-conversation":F9((e,{conversationId:t})=>e.deleteArchivedConversation(t))',
+  "}})();",
+  "bridge.setMessageHandler((key,payload)=>routes[key](manager,payload));",
+  "handoff(`archive-conversation`,{conversationId:id});",
+].join("");
 
 test("keeps native archive deletion and injects an independent active delete route", () => {
   assert.equal(
@@ -277,6 +288,36 @@ test("Windows archive planning bypasses macOS absence analysis for a valid combi
   assert.equal(result.status, "ready");
   assert.equal(result.writes[0].result.status, "already");
   assert.equal(result.writes[0].result.appMain.code, WINDOWS_COMBINED_APP_MAIN);
+});
+
+test("accepts the latest macOS route table when live business code also archives", () => {
+  const result = planArchivePlatform({
+    platform: "mac-arm64",
+    candidates: [
+      {
+        fileName: "app-initial~app-main~page-latest.js",
+        filePath: "webview/assets/app-initial~app-main~page-latest.js",
+        source: LATEST_MAC_NATIVE_APP_MAIN,
+      },
+      {
+        fileName: "data-controls-latest.js",
+        filePath: "webview/assets/data-controls-latest.js",
+        source: LATEST_NATIVE_DATA_CONTROLS,
+      },
+    ],
+  });
+  assert.equal(result.writes[0].result.status, "patched");
+  assert.match(result.writes[0].result.appMain.code, /["`]delete-conversation["`]/);
+});
+
+test("cheap archive contract prefilters exclude token-free bundles", () => {
+  assert.equal(typeof mayContainArchiveRouteContract, "function");
+  assert.equal(typeof mayContainArchiveDataControlsContract, "function");
+  assert.equal(mayContainArchiveRouteContract("const unrelated = 1"), false);
+  assert.equal(mayContainArchiveRouteContract(LATEST_MAC_NATIVE_APP_MAIN), true);
+  assert.equal(mayContainArchiveDataControlsContract("const unrelated = 1"), false);
+  assert.equal(mayContainArchiveDataControlsContract(LATEST_NATIVE_DATA_CONTROLS), true);
+  assert.equal(mayContainArchiveDataControlsContract(LEGACY_DATA_CONTROLS), true);
 });
 
 function validMacArchiveCandidates(prefix) {
