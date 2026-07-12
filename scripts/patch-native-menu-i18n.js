@@ -24,6 +24,7 @@ const ROLE_LABEL_TRANSLATIONS = [
   ["paste", "粘贴"],
   ["delete", "删除"],
   ["selectAll", "全选"],
+  ["quit", "退出"],
 ];
 const DIRECT_LITERAL_TRANSLATIONS = [
   ["Start Performance Trace", "开始性能跟踪"],
@@ -32,6 +33,18 @@ const DIRECT_LITERAL_TRANSLATIONS = [
   ["Saving Trace…", "正在保存跟踪..."],
   ["Waiting for Trace Details…", "等待跟踪详情..."],
   ["Uploading Trace…", "正在上传跟踪..."],
+  ["System Status", "系统状态"],
+];
+const TRAY_MESSAGE_TRANSLATIONS = [
+  ["trayMenu.openApp", "Open {appName}", "打开 {appName}"],
+  ["trayMenu.newChat", "New Task", "新建任务"],
+  ["trayMenu.pinnedThreads", "Pinned", "置顶"],
+  ["trayMenu.runningThreads", "Running", "运行中"],
+  ["trayMenu.recentThreads", "Recent", "最近"],
+  ["trayMenu.unreadThreads", "Unread", "未读"],
+  ["trayMenu.usage", "Usage", "使用情况"],
+  ["trayMenu.more", "More", "更多"],
+  ["trayMenu.projectlessThreads", "Tasks", "任务"],
 ];
 
 const MENU_LABEL_TRANSLATIONS = [
@@ -47,6 +60,12 @@ const MENU_LABEL_TRANSLATIONS = [
   ["Paste", "粘贴"],
   ["Delete", "删除"],
   ["Select All", "全选"],
+  ["&Search with Google", "使用 Google 搜索"],
+  ["Cu&t", "剪切"],
+  ["&Copy", "复制"],
+  ["&Paste", "粘贴"],
+  ["Select &All", "全选"],
+  ["I&nspect Element", "检查元素"],
   ["Copy conversation path", "复制对话路径"],
   ["Copy deeplink", "复制深度链接"],
   ["Copy session id", "复制会话 ID"],
@@ -57,6 +76,15 @@ const MENU_LABEL_TRANSLATIONS = [
   ["Force Reload Browser Page", "强制重新加载浏览器页面"],
   ["New Window", "新建窗口"],
   ["Open command menu", "打开命令菜单"],
+  ["New Task", "新建任务"],
+  ["New Projectless Task", "新建无项目任务"],
+  ["Search Tasks…", "搜索任务..."],
+  ["Rename task", "重命名任务"],
+  ["Archive task", "归档任务"],
+  ["Pin/unpin task", "固定/取消固定任务"],
+  ["Show pet", "显示助手"],
+  ["Previous Task", "上一个任务"],
+  ["Next Task", "下一个任务"],
   ["Search Chats…", "搜索对话..."],
   ["Search Files…", "搜索文件..."],
   ["Rename chat", "重命名对话"],
@@ -99,6 +127,16 @@ const MENU_LABEL_TRANSLATIONS = [
   ["Go to Chat 7", "转到对话 7"],
   ["Go to Chat 8", "转到对话 8"],
   ["Go to Chat 9", "转到对话 9"],
+  ["Go to Task 1", "转到任务 1"],
+  ["Go to Task 2", "转到任务 2"],
+  ["Go to Task 3", "转到任务 3"],
+  ["Go to Task 4", "转到任务 4"],
+  ["Go to Task 5", "转到任务 5"],
+  ["Go to Task 6", "转到任务 6"],
+  ["Go to Task 7", "转到任务 7"],
+  ["Go to Task 8", "转到任务 8"],
+  ["Go to Task 9", "转到任务 9"],
+  ["Exit", "退出"],
   ["Log Out", "退出登录"],
   ["Log out", "退出登录"],
   ["Feedback", "发送反馈"],
@@ -108,7 +146,9 @@ const MENU_LABEL_TRANSLATIONS = [
   ["Actual Size", "实际大小"],
   ["Toggle Full Screen", "切换全屏"],
   ["Codex Documentation", "Codex 文档"],
+  ["Documentation", "文档"],
   ["What's new", "更新内容"],
+  ["What's New", "更新内容"],
   ["Automations", "自动化"],
   ["Local Environments", "本地环境"],
   ["Worktrees", "工作树"],
@@ -197,9 +237,38 @@ function patchRoleCommandLabels(code, replacements) {
   return code;
 }
 
+function patchTrayMessageDefaults(code, replacements) {
+  const identifierPattern = "(?<![A-Za-z0-9_$])[A-Za-z_$][\\w$]*";
+  for (const [messageId, from, to] of TRAY_MESSAGE_TRANSLATIONS) {
+    const idPattern = jsStringLiteralVariants(messageId).map(escapeRegex).join("|");
+    const defaultPattern = jsStringLiteralVariants(from).map(escapeRegex).join("|");
+    const patterns = [
+      new RegExp(
+        `(${identifierPattern}\\s*=\\s*(?:${idPattern})\\s*,\\s*` +
+          `${identifierPattern}\\s*=\\s*)(?:${defaultPattern})`,
+        "g",
+      ),
+      new RegExp(
+        `(\\bmessageId\\s*:\\s*(?:${idPattern})\\s*,\\s*` +
+          `\\bdefaultMessage\\s*:\\s*)(?:${defaultPattern})`,
+        "g",
+      ),
+    ];
+    for (const pattern of patterns) {
+      code = code.replace(pattern, (match, prefix) => {
+        replacements.push({ key: "trayMessage", from, to, messageId });
+        return `${prefix}${templateLiteral(to)}`;
+      });
+    }
+  }
+  return code;
+}
+
 function patchSource(source) {
   let code = source;
   const replacements = [];
+
+  code = patchTrayMessageDefaults(code, replacements);
 
   for (const [from, to] of MENU_LABEL_TRANSLATIONS) {
     for (const literal of jsStringLiteralVariants(from)) {

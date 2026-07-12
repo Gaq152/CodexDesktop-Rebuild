@@ -24,6 +24,55 @@ const LATEST_SIDEBAR = [
 const PENDING_TASK_DECOY =
   "function Sd(e){let i=()=>[{id:`archive-thread`,message:Sr.archiveThread,onSelect:()=>{}}],p=l&&B;return(0,Ad.jsx)(Ua,{additionalHoverActionCount:p?1:0,renderActions:q?Ed:e=>{let{archive:n,requestArchive:r}=e;return(0,Ad.jsx)(Dd,{archive:n,requestArchive:r})}})}";
 
+function actionSource(code, id, handler) {
+  const start = code.indexOf(`{id:\`${id}\``);
+  assert.notEqual(start, -1, `missing ${id}`);
+  const suffix = `onClick:CodexDeleteAction.${handler}}`;
+  const end = code.indexOf(suffix, start);
+  assert.notEqual(end, -1, `missing ${id} handler`);
+  return code.slice(start, end + suffix.length);
+}
+
+function withLegacyTextDeleteAction(code) {
+  const current = actionSource(code, "thread-delete-action", "onRequest");
+  const iconStart = current.indexOf(",icon:");
+  const buttonStart = current.indexOf(",buttonClassName:");
+  assert.ok(iconStart > 0 && buttonStart > iconStart, "current action must contain an icon");
+  const ariaStart = current.indexOf("ariaLabel:") + "ariaLabel:".length;
+  const ariaEnd = current.indexOf(",icon:", ariaStart);
+  const ariaSource = current.slice(ariaStart, ariaEnd);
+  const legacy = `${current.slice(0, iconStart)},label:${ariaSource}${current.slice(buttonStart)}`;
+  return code.replace(current, legacy);
+}
+
+function withLegacyTrashIconColor(code) {
+  const current = actionSource(code, "thread-delete-action", "onRequest");
+  const modern = "xmlns:`http://www.w3.org/2000/svg`,className:`text-token-error-foreground`";
+  const legacy = "xmlns:`http://www.w3.org/2000/svg`";
+  if (!current.includes(modern)) {
+    assert.ok(current.includes(legacy), "normal delete SVG must contain a known color contract");
+    return code;
+  }
+  return code.replace(current, current.replace(modern, legacy));
+}
+
+function withLegacyComponentMouseLeave(code) {
+  const dataAttributes =
+    /dataAttributes:\{(?:\.\.\.\([A-Za-z_$][\w$]*\.dataAttributes\?\?\{\}\),)?onMouseLeave:\(\)=>CodexSetDeleteConfirm\(!1\)\}/;
+  if (!dataAttributes.test(code)) {
+    assert.match(
+      code,
+      /\(0,Fc\.jsx\)\(Ma,\{[^;]*onMouseLeave:\(\)=>CodexSetDeleteConfirm\(!1\)/,
+      "sidebar row must contain either current dataAttributes or the legacy component prop",
+    );
+    return code;
+  }
+  return code.replace(
+    dataAttributes,
+    "onMouseLeave:()=>CodexSetDeleteConfirm(!1)",
+  );
+}
+
 test("patches task-worded thread actions with the active delete route idempotently", () => {
   assert.equal(typeof patchThreadActionsSource, "function");
   const first = patchThreadActionsSource(LATEST_THREAD_ACTIONS);
@@ -74,6 +123,25 @@ test("adds delete and inline-confirmation actions to the latest sidebar aliases 
   assert.match(first.code, /id:`delete-thread`/);
   assert.match(first.code, /deleteAction:\{confirming:CodexDeleteConfirm/);
   assert.match(first.code, /additionalHoverActionCount:\(Me\?1:0\)\+1/);
+  const deleteAction = actionSource(first.code, "thread-delete-action", "onRequest");
+  assert.match(deleteAction, /ariaLabel:i\.formatMessage\(Sr\.deleteThread\)/);
+  assert.match(deleteAction, /icon:\(0,Fc\.jsx\)\(`svg`,/);
+  assert.match(deleteAction, /fill:`currentColor`/);
+  assert.match(deleteAction, /className:`text-token-error-foreground`/);
+  assert.match(deleteAction, /d:`M10\.6299 1\.33496/);
+  assert.doesNotMatch(deleteAction, /\blabel:/);
+  const confirmAction = actionSource(first.code, "thread-delete-confirm-action", "onConfirm");
+  assert.match(confirmAction, /ariaLabel:i\.formatMessage\(Sr\.deleteThreadConfirmAction\)/);
+  assert.match(confirmAction, /label:i\.formatMessage\(Sr\.deleteThreadConfirmAction\)/);
+  assert.doesNotMatch(confirmAction, /\bicon:/);
+  assert.match(
+    first.code,
+    /\(0,Fc\.jsx\)\(Ma,\{[^;]*dataAttributes:\{onMouseLeave:\(\)=>CodexSetDeleteConfirm\(!1\)\}\}\)/,
+  );
+  assert.doesNotMatch(
+    first.code,
+    /renderActions:Ne,onMouseLeave:\(\)=>CodexSetDeleteConfirm\(!1\)/,
+  );
   const second = patchSidebarSource(first.code);
   assert.equal(second.status, "already");
   assert.equal(second.code, first.code);
@@ -83,6 +151,87 @@ test("adds delete and inline-confirmation actions to the latest sidebar aliases 
         `${first.code};/* CodexSidebarDeleteHover */`,
       ),
     /sidebar hover\/row marker postcondition is malformed|sidebar hover.*expected exactly 1.*found 2/i,
+  );
+});
+
+test("migrates the previous text delete action to the icon contract idempotently", () => {
+  const current = patchSidebarSource(LATEST_SIDEBAR).code;
+  const legacy = withLegacyTextDeleteAction(current);
+  assert.match(actionSource(legacy, "thread-delete-action", "onRequest"), /\blabel:/);
+
+  const migrated = patchSidebarSource(legacy);
+  assert.equal(migrated.status, "patched");
+  const deleteAction = actionSource(migrated.code, "thread-delete-action", "onRequest");
+  assert.match(deleteAction, /\bicon:/);
+  assert.doesNotMatch(deleteAction, /\blabel:/);
+  const second = patchSidebarSource(migrated.code);
+  assert.equal(second.status, "already");
+  assert.equal(second.code, migrated.code);
+});
+
+test("migrates the previous uncolored icon and inert component mouseleave contract", () => {
+  const current = patchSidebarSource(LATEST_SIDEBAR).code;
+  const legacy = withLegacyComponentMouseLeave(withLegacyTrashIconColor(current));
+
+  const migrated = patchSidebarSource(legacy);
+  assert.equal(migrated.status, "patched");
+  assert.match(
+    actionSource(migrated.code, "thread-delete-action", "onRequest"),
+    /className:`text-token-error-foreground`/,
+  );
+  assert.match(
+    migrated.code,
+    /\(0,Fc\.jsx\)\(Ma,\{[^;]*dataAttributes:\{onMouseLeave:\(\)=>CodexSetDeleteConfirm\(!1\)\}\}\)/,
+  );
+  const second = patchSidebarSource(migrated.code);
+  assert.equal(second.status, "already");
+  assert.equal(second.code, migrated.code);
+});
+
+test("preserves spread data attributes while attaching the real row mouseleave", () => {
+  const withSpread = LATEST_SIDEBAR.replace(
+    "additionalHoverActionCount:Me?1:0,renderActions:Ne",
+    "additionalHoverActionCount:Me?1:0,...Z,renderActions:Ne",
+  );
+  assert.notEqual(withSpread, LATEST_SIDEBAR);
+  const patched = patchSidebarSource(withSpread);
+  assert.match(
+    patched.code,
+    /\.\.\.Z,renderActions:Ne,dataAttributes:\{\.\.\.\(Z\.dataAttributes\?\?\{\}\),onMouseLeave:\(\)=>CodexSetDeleteConfirm\(!1\)\}/,
+  );
+  assert.equal(patchSidebarSource(patched.code).status, "already");
+});
+
+test("rejects a mouseleave reset hidden inside an uncalled nested function", () => {
+  const current = patchSidebarSource(LATEST_SIDEBAR).code;
+  const inert = current.replace(
+    "onMouseLeave:()=>CodexSetDeleteConfirm(!1)",
+    "onMouseLeave:()=>{function dead(){CodexSetDeleteConfirm(!1)}}",
+  );
+  assert.notEqual(inert, current);
+  assert.throws(
+    () => patchSidebarSource(inert),
+    /mouseleave reset must be attached through dataAttributes/i,
+  );
+});
+
+test("rejects duplicate or mixed normal delete action contracts", () => {
+  const current = patchSidebarSource(LATEST_SIDEBAR).code;
+  const deleteAction = actionSource(current, "thread-delete-action", "onRequest");
+  const duplicate = current.replace(deleteAction, `${deleteAction},${deleteAction}`);
+  assert.throws(
+    () => patchSidebarSource(duplicate),
+    /sidebar icon migration expected exactly 1 normal delete action, found 2/i,
+  );
+
+  const mixed = current.replace(
+    ",icon:(0,Fc.jsx)(`svg`,",
+    ",label:i.formatMessage(Sr.deleteThread),icon:(0,Fc.jsx)(`svg`,",
+  );
+  assert.notEqual(mixed, current);
+  assert.throws(
+    () => patchSidebarSource(mixed),
+    /sidebar icon migration found a malformed text\/icon action state/i,
   );
 });
 

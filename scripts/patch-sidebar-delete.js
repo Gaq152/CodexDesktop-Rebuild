@@ -20,6 +20,11 @@ const {
   commitValidatedPlan,
 } = require("./mac-contract-locator");
 
+// Copied from the current upstream trash icon component. Keeping the exact
+// 20x20 currentColor SVG here avoids coupling this patch to hashed asset names.
+const OFFICIAL_TRASH_ICON_PATH =
+  "M10.6299 1.33496C12.0335 1.33496 13.2695 2.25996 13.666 3.60645L13.8809 4.33496H17L17.1338 4.34863C17.4369 4.41057 17.665 4.67858 17.665 5C17.665 5.32142 17.4369 5.58943 17.1338 5.65137L17 5.66504H16.6543L15.8574 14.9912C15.7177 16.629 14.3478 17.8877 12.7041 17.8877H7.2959C5.75502 17.8877 4.45439 16.7815 4.18262 15.2939L4.14258 14.9912L3.34668 5.66504H3C2.63273 5.66504 2.33496 5.36727 2.33496 5C2.33496 4.63273 2.63273 4.33496 3 4.33496H6.11914L6.33398 3.60645L6.41797 3.3584C6.88565 2.14747 8.05427 1.33496 9.37012 1.33496H10.6299ZM5.46777 14.8779L5.49121 15.0537C5.64881 15.9161 6.40256 16.5576 7.2959 16.5576H12.7041C13.6571 16.5576 14.4512 15.8275 14.5322 14.8779L15.3193 5.66504H4.68164L5.46777 14.8779ZM7.66797 12.8271V8.66016C7.66797 8.29299 7.96588 7.99528 8.33301 7.99512C8.70028 7.99512 8.99805 8.29289 8.99805 8.66016V12.8271C8.99779 13.1942 8.70012 13.4912 8.33301 13.4912C7.96604 13.491 7.66823 13.1941 7.66797 12.8271ZM11.002 12.8271V8.66016C11.002 8.29289 11.2997 7.99512 11.667 7.99512C12.0341 7.9953 12.332 8.293 12.332 8.66016V12.8271C12.3318 13.1941 12.0339 13.491 11.667 13.4912C11.2999 13.4912 11.0022 13.1942 11.002 12.8271ZM9.37012 2.66504C8.60726 2.66504 7.92938 3.13589 7.6582 3.83789L7.60938 3.98145L7.50586 4.33496H12.4941L12.3906 3.98145C12.1607 3.20084 11.4437 2.66504 10.6299 2.66504H9.37012Z";
+
 function walk(node, visitor) {
   if (!node || typeof node !== "object") return;
   if (node.type) visitor(node);
@@ -427,6 +432,15 @@ function sourceFor(code, node) {
   return code.slice(node.start, node.end);
 }
 
+function trashIconSource(jsxAlias) {
+  const jsx = `(0,${jsxAlias}.jsx)`;
+  return (
+    `${jsx}(\`svg\`,{width:20,height:20,viewBox:\`0 0 20 20\`,fill:\`currentColor\`,` +
+    `xmlns:\`http://www.w3.org/2000/svg\`,className:\`text-token-error-foreground\`,` +
+    `children:${jsx}(\`path\`,{d:\`${OFFICIAL_TRASH_ICON_PATH}\`})})`
+  );
+}
+
 function applySourceReplacements(code, replacements) {
   let next = code;
   for (const replacement of [...replacements].sort((left, right) => right.start - left.start)) {
@@ -493,6 +507,50 @@ function objectProperty(object, name) {
   return object?.type === "ObjectExpression"
     ? object.properties.find((property) => propertyName(property) === name)
     : null;
+}
+
+function objectProperties(object, name) {
+  return object?.type === "ObjectExpression"
+    ? object.properties.filter((property) => propertyName(property) === name)
+    : [];
+}
+
+function isFormatMessageFor(node, messageName) {
+  return (
+    node?.type === "CallExpression" &&
+    node.callee.type === "MemberExpression" &&
+    !node.callee.computed &&
+    node.callee.property.type === "Identifier" &&
+    node.callee.property.name === "formatMessage" &&
+    node.arguments.length === 1 &&
+    node.arguments[0]?.type === "MemberExpression" &&
+    !node.arguments[0].computed &&
+    node.arguments[0].property.type === "Identifier" &&
+    node.arguments[0].property.name === messageName
+  );
+}
+
+function isOfficialTrashIcon(node, requireErrorColor = true) {
+  const jsxAlias = sequenceMemberAlias(node, "jsx");
+  if (
+    !jsxAlias ||
+    literalValue(node.arguments[0]) !== "svg" ||
+    node.arguments[1]?.type !== "ObjectExpression"
+  ) return false;
+  const props = node.arguments[1];
+  const child = objectProperty(props, "children")?.value;
+  return (
+    literalValue(objectProperty(props, "width")?.value) === 20 &&
+    literalValue(objectProperty(props, "height")?.value) === 20 &&
+    literalValue(objectProperty(props, "viewBox")?.value) === "0 0 20 20" &&
+    literalValue(objectProperty(props, "fill")?.value) === "currentColor" &&
+    literalValue(objectProperty(props, "xmlns")?.value) === "http://www.w3.org/2000/svg" &&
+    (!requireErrorColor ||
+      literalValue(objectProperty(props, "className")?.value) === "text-token-error-foreground") &&
+    sequenceMemberAlias(child, "jsx") === jsxAlias &&
+    literalValue(child.arguments[0]) === "path" &&
+    literalValue(objectProperty(child.arguments[1], "d")?.value) === OFFICIAL_TRASH_ICON_PATH
+  );
 }
 
 function isFunctionNode(node) {
@@ -1004,6 +1062,48 @@ function callToIdentifier(root, name, predicate = () => true) {
   return calls;
 }
 
+function isDeleteConfirmResetHandler(code, node) {
+  return (
+    node?.type === "ArrowFunctionExpression" &&
+    node.params.length === 0 &&
+    !node.async &&
+    node.body?.type === "CallExpression" &&
+    node.body.callee?.type === "Identifier" &&
+    node.body.callee.name === "CodexSetDeleteConfirm" &&
+    node.body.arguments.length === 1 &&
+    sourceFor(code, node.body.arguments[0]) === "!1"
+  );
+}
+
+function identifierSpreadNames(object) {
+  return object?.type === "ObjectExpression"
+    ? object.properties
+      .filter(
+        (property) =>
+          property?.type === "SpreadElement" && property.argument?.type === "Identifier",
+      )
+      .map((property) => property.argument.name)
+    : [];
+}
+
+function resetDataAttributesSource(code, object) {
+  const existing = objectProperties(object, "dataAttributes");
+  if (existing.length > 1) {
+    throw new Error("sidebar row has duplicate dataAttributes props");
+  }
+  if (existing.length === 1) {
+    return `{...(${sourceFor(code, existing[0].value)}??{}),onMouseLeave:()=>CodexSetDeleteConfirm(!1)}`;
+  }
+  const spreadNames = identifierSpreadNames(object);
+  if (spreadNames.length > 1) {
+    throw new Error("sidebar row dataAttributes spread source is ambiguous");
+  }
+  const preserved = spreadNames.length === 1
+    ? `...(${spreadNames[0]}.dataAttributes??{}),`
+    : "";
+  return `{${preserved}onMouseLeave:()=>CodexSetDeleteConfirm(!1)}`;
+}
+
 function inspectSidebarPostcondition(code) {
   const { ast, comments } = parseSidebarDocument(code, "sidebar UI");
   const hoverComments = exactSidebarComments(comments, "CodexSidebarDeleteHover");
@@ -1052,17 +1152,21 @@ function inspectSidebarPostcondition(code) {
     ["thread-delete-action", "onRequest"],
     ["thread-delete-confirm-action", "onConfirm"],
   ]);
-  const actionObjects = new Map();
+  const actionObjects = new Map([...expectedActions.keys()].map((id) => [id, []]));
   walk(hoverDeclaration.declaration.init, (node) => {
     if (node.type !== "ObjectExpression") return;
     const id = literalValue(objectProperty(node, "id")?.value);
-    if (expectedActions.has(id)) actionObjects.set(id, node);
+    if (expectedActions.has(id)) actionObjects.get(id).push(node);
   });
-  if (deleteActionBindings.length !== 1 || actionObjects.size !== expectedActions.size) {
+  if (
+    deleteActionBindings.length !== 1 ||
+    [...actionObjects.values()].some((objects) => objects.length !== 1)
+  ) {
     throw new Error("sidebar hover action wiring is incomplete");
   }
   for (const [id, method] of expectedActions) {
-    const onClick = objectProperty(actionObjects.get(id), "onClick")?.value;
+    const actionObject = actionObjects.get(id)[0];
+    const onClick = objectProperty(actionObject, "onClick")?.value;
     if (
       onClick?.type !== "MemberExpression" ||
       onClick.object?.type !== "Identifier" ||
@@ -1070,6 +1174,28 @@ function inspectSidebarPostcondition(code) {
       onClick.property?.name !== method
     ) throw new Error(`sidebar hover ${id} handler is detached`);
   }
+  const deleteActionObject = actionObjects.get("thread-delete-action")[0];
+  if (
+    objectProperties(deleteActionObject, "ariaLabel").length !== 1 ||
+    !isFormatMessageFor(objectProperty(deleteActionObject, "ariaLabel")?.value, "deleteThread") ||
+    objectProperties(deleteActionObject, "icon").length !== 1 ||
+    !isOfficialTrashIcon(objectProperty(deleteActionObject, "icon")?.value) ||
+    objectProperties(deleteActionObject, "label").length !== 0
+  ) throw new Error("sidebar normal delete action must use the official icon and accessible label");
+  const confirmActionObject = actionObjects.get("thread-delete-confirm-action")[0];
+  if (
+    objectProperties(confirmActionObject, "ariaLabel").length !== 1 ||
+    !isFormatMessageFor(
+      objectProperty(confirmActionObject, "ariaLabel")?.value,
+      "deleteThreadConfirmAction",
+    ) ||
+    objectProperties(confirmActionObject, "label").length !== 1 ||
+    !isFormatMessageFor(
+      objectProperty(confirmActionObject, "label")?.value,
+      "deleteThreadConfirmAction",
+    ) ||
+    objectProperties(confirmActionObject, "icon").length !== 0
+  ) throw new Error("sidebar confirm delete action must keep its accessible confirmation label");
   let spreadIntoRenderedActions = 0;
   walk(hoverFunction, (node) => {
     if (
@@ -1101,7 +1227,7 @@ function inspectSidebarPostcondition(code) {
   const deleteMenuItems = [];
   const deleteActionProps = [];
   const hoverCounts = [];
-  const mouseLeaves = [];
+  const hoverCountObjects = [];
   walk(rowFunction, (node) => {
     if (node.type === "ObjectPattern" && patternBinding(node, "deleteThread") === "CodexDeleteThread") {
       deleteThreadBinding += 1;
@@ -1120,9 +1246,10 @@ function inspectSidebarPostcondition(code) {
       const deleteAction = objectProperty(node, "deleteAction");
       if (deleteAction) deleteActionProps.push(deleteAction.value);
       const hoverCount = objectProperty(node, "additionalHoverActionCount");
-      if (hoverCount) hoverCounts.push(hoverCount.value);
-      const mouseLeave = objectProperty(node, "onMouseLeave");
-      if (mouseLeave) mouseLeaves.push(mouseLeave.value);
+      if (hoverCount) {
+        hoverCounts.push(hoverCount.value);
+        hoverCountObjects.push(node);
+      }
     }
   });
   const requestDelete = rowDeclarations.get("CodexRequestDelete");
@@ -1135,7 +1262,7 @@ function inspectSidebarPostcondition(code) {
     deleteMenuItems.length !== 1 ||
     deleteActionProps.length !== 1 ||
     hoverCounts.length !== 1 ||
-    mouseLeaves.length !== 1
+    hoverCountObjects.length !== 1
   ) throw new Error("sidebar row delete state/action wiring is incomplete");
   const menuOnSelect = objectProperty(deleteMenuItems[0], "onSelect")?.value;
   if (menuOnSelect?.type !== "Identifier" || menuOnSelect.name !== "CodexRequestDelete") {
@@ -1159,6 +1286,40 @@ function inspectSidebarPostcondition(code) {
     hoverCounts[0].operator !== "+" ||
     literalValue(hoverCounts[0].right) !== 1
   ) throw new Error("sidebar row additional hover action count is not incremented");
+  const taskRowProps = hoverCountObjects[0];
+  const topLevelMouseLeaves = objectProperties(taskRowProps, "onMouseLeave");
+  const dataAttributesProps = objectProperties(taskRowProps, "dataAttributes");
+  const dataAttributes = dataAttributesProps[0]?.value;
+  const dataAttributeMouseLeaves = objectProperties(dataAttributes, "onMouseLeave");
+  if (
+    topLevelMouseLeaves.length !== 0 ||
+    dataAttributesProps.length !== 1 ||
+    dataAttributes?.type !== "ObjectExpression" ||
+    dataAttributeMouseLeaves.length !== 1 ||
+    !isDeleteConfirmResetHandler(code, dataAttributeMouseLeaves[0].value)
+  ) throw new Error("sidebar row mouseleave reset must be attached through dataAttributes");
+  const rowSpreadNames = identifierSpreadNames(taskRowProps);
+  if (rowSpreadNames.length > 1) {
+    throw new Error("sidebar row dataAttributes spread source is ambiguous");
+  }
+  if (rowSpreadNames.length === 1) {
+    const nestedSpreads = dataAttributes.properties.filter(
+      (property) => property?.type === "SpreadElement",
+    );
+    const preserved = nestedSpreads[0]?.argument;
+    if (
+      nestedSpreads.length !== 1 ||
+      preserved?.type !== "LogicalExpression" ||
+      preserved.operator !== "??" ||
+      preserved.left?.type !== "MemberExpression" ||
+      preserved.left.computed ||
+      preserved.left.object?.type !== "Identifier" ||
+      preserved.left.object.name !== rowSpreadNames[0] ||
+      preserved.left.property?.name !== "dataAttributes" ||
+      preserved.right?.type !== "ObjectExpression" ||
+      preserved.right.properties.length !== 0
+    ) throw new Error("sidebar row existing dataAttributes are not preserved");
+  }
   const confirmCalls = callToIdentifier(confirmDelete, "CodexDeleteThread", (call) =>
     call.arguments[0]?.type === "ObjectExpression" &&
     ["conversationId", "hostId"].every((name) => objectProperty(call.arguments[0], name)),
@@ -1166,10 +1327,148 @@ function inspectSidebarPostcondition(code) {
   if (
     callToIdentifier(requestDelete, "CodexSetDeleteConfirm", (call) => sourceFor(code, call.arguments[0]) === "!0").length !== 1 ||
     callToIdentifier(confirmDelete, "CodexSetDeleteConfirm", (call) => sourceFor(code, call.arguments[0]) === "!1").length !== 1 ||
-    confirmCalls.length !== 1 ||
-    callToIdentifier(mouseLeaves[0], "CodexSetDeleteConfirm", (call) => sourceFor(code, call.arguments[0]) === "!1").length !== 1
+    confirmCalls.length !== 1
   ) throw new Error("sidebar row request/confirm/reset handlers are not wired");
   return { status: "already" };
+}
+
+function migrateSidebarDeleteIcon(code) {
+  const { ast } = parseSidebarDocument(code, "sidebar icon migration");
+  const functions = [];
+  const deleteActionObjects = [];
+  walk(ast, (node) => {
+    if (node.type === "FunctionDeclaration") functions.push(node);
+    if (
+      node.type === "ObjectExpression" &&
+      literalValue(objectProperty(node, "id")?.value) === "thread-delete-action"
+    ) deleteActionObjects.push(node);
+  });
+  if (deleteActionObjects.length !== 1) {
+    throw new Error(
+      `sidebar icon migration expected exactly 1 normal delete action, found ${deleteActionObjects.length}`,
+    );
+  }
+  const actionObject = deleteActionObjects[0];
+  const labels = objectProperties(actionObject, "label");
+  const icons = objectProperties(actionObject, "icon");
+  if (
+    !(
+      (labels.length === 1 && icons.length === 0) ||
+      (labels.length === 0 && icons.length === 1)
+    )
+  ) {
+    throw new Error("sidebar icon migration found a malformed text/icon action state");
+  }
+  if (labels.length === 1 && !isFormatMessageFor(labels[0].value, "deleteThread")) {
+    throw new Error("sidebar icon migration found an unexpected delete label binding");
+  }
+  const owners = functionContaining(functions, actionObject);
+  if (owners.length !== 1) throw new Error("sidebar icon migration action owner is ambiguous");
+  const renderAliases = [];
+  walk(owners[0], (node) => {
+    const alias = sequenceMemberAlias(node, "jsx");
+    if (!alias || node.arguments[1]?.type !== "ObjectExpression") return;
+    const actions = objectProperty(node.arguments[1], "actions")?.value;
+    if (
+      actions?.type === "ArrayExpression" &&
+      actions.elements.some(
+        (element) =>
+          element?.type === "SpreadElement" &&
+          element.argument?.type === "Identifier" &&
+          element.argument.name === "CodexSidebarDeleteActions",
+      )
+    ) renderAliases.push(alias);
+  });
+  const uniqueAliases = [...new Set(renderAliases)];
+  if (uniqueAliases.length !== 1) {
+    throw new Error(
+      `sidebar icon migration expected exactly 1 JSX runtime alias, found ${uniqueAliases.length}`,
+    );
+  }
+  const replacements = [];
+  if (labels.length === 1) {
+    replacements.push({
+      start: labels[0].start,
+      end: labels[0].end,
+      text: `icon:${trashIconSource(uniqueAliases[0])}`,
+    });
+  } else {
+    const icon = icons[0].value;
+    if (!isOfficialTrashIcon(icon, false)) {
+      throw new Error("sidebar icon migration found an unexpected delete icon");
+    }
+    const iconProps = icon.arguments[1];
+    const colorClasses = objectProperties(iconProps, "className");
+    if (colorClasses.length > 1) {
+      throw new Error("sidebar icon migration found duplicate SVG color classes");
+    }
+    if (colorClasses.length === 1) {
+      if (literalValue(colorClasses[0].value) !== "text-token-error-foreground") {
+        throw new Error("sidebar icon migration found an unexpected SVG color class");
+      }
+    } else {
+      replacements.push({
+        start: iconProps.end - 1,
+        end: iconProps.end - 1,
+        text: ",className:`text-token-error-foreground`",
+      });
+    }
+  }
+  return {
+    code: applySourceReplacements(code, replacements),
+    changed: replacements.length > 0,
+  };
+}
+
+function migrateSidebarMouseLeave(code) {
+  const { ast, comments } = parseSidebarDocument(code, "sidebar mouseleave migration");
+  const rowComments = exactSidebarComments(comments, "CodexSidebarDeleteRow");
+  const functions = [];
+  walk(ast, (node) => {
+    if (node.type === "FunctionDeclaration") functions.push(node);
+  });
+  if (rowComments.length !== 1) {
+    throw new Error("sidebar mouseleave migration row marker is malformed");
+  }
+  const rowFunctions = functions.filter(
+    (fn) => fn.body.start < rowComments[0].start && fn.body.end > rowComments[0].end,
+  );
+  if (rowFunctions.length !== 1) {
+    throw new Error("sidebar mouseleave migration row owner is ambiguous");
+  }
+  const taskRowProps = [];
+  walk(rowFunctions[0], (node) => {
+    if (
+      node.type === "ObjectExpression" &&
+      objectProperty(node, "additionalHoverActionCount")
+    ) taskRowProps.push(node);
+  });
+  if (taskRowProps.length !== 1) {
+    throw new Error(
+      `sidebar mouseleave migration expected exactly 1 task row, found ${taskRowProps.length}`,
+    );
+  }
+  const props = taskRowProps[0];
+  const topLevelMouseLeaves = objectProperties(props, "onMouseLeave");
+  const dataAttributes = objectProperties(props, "dataAttributes");
+  if (topLevelMouseLeaves.length === 0 && dataAttributes.length === 1) {
+    return { code, changed: false };
+  }
+  if (
+    topLevelMouseLeaves.length !== 1 ||
+    dataAttributes.length !== 0 ||
+    !isDeleteConfirmResetHandler(code, topLevelMouseLeaves[0].value)
+  ) {
+    throw new Error("sidebar mouseleave migration found a malformed reset contract");
+  }
+  return {
+    code: applySourceReplacements(code, [{
+      start: topLevelMouseLeaves[0].start,
+      end: topLevelMouseLeaves[0].end,
+      text: `dataAttributes:${resetDataAttributesSource(code, props)}`,
+    }]),
+    changed: true,
+  };
 }
 
 function patchSidebarSource(code) {
@@ -1178,13 +1477,16 @@ function patchSidebarSource(code) {
   const hoverCount = countOccurrences(code, hoverMarker);
   const rowCount = countOccurrences(code, rowMarker);
   if (hoverCount > 0 || rowCount > 0) {
-    inspectSidebarPostcondition(code);
+    const iconMigration = migrateSidebarDeleteIcon(code);
+    const mouseLeaveMigration = migrateSidebarMouseLeave(iconMigration.code);
+    const changed = iconMigration.changed || mouseLeaveMigration.changed;
+    inspectSidebarPostcondition(mouseLeaveMigration.code);
     return {
-      code,
-      status: "already",
+      code: mouseLeaveMigration.code,
+      status: changed ? "patched" : "already",
       counts: {
-        hover: sidebarCount(0, 1, "sidebar hover"),
-        row: sidebarCount(0, 1, "sidebar row"),
+        hover: sidebarCount(iconMigration.changed ? 1 : 0, iconMigration.changed ? 0 : 1, "sidebar hover"),
+        row: sidebarCount(mouseLeaveMigration.changed ? 1 : 0, mouseLeaveMigration.changed ? 0 : 1, "sidebar row"),
       },
     };
   }
@@ -1234,7 +1536,7 @@ function patchSidebarSource(code) {
   const deleteActions =
     `${hoverMarker}let CodexSidebarDeleteActions=CodexDeleteAction==null?[]:CodexDeleteAction.confirming?` +
     `[{id:\`thread-delete-confirm-action\`,ariaLabel:${hover.intl}.formatMessage(${hover.messages}.deleteThreadConfirmAction),label:${hover.intl}.formatMessage(${hover.messages}.deleteThreadConfirmAction),buttonClassName:\`text-token-error-foreground hover:text-token-error-foreground\`,onClick:CodexDeleteAction.onConfirm}]:` +
-    `[{id:\`thread-delete-action\`,ariaLabel:${hover.intl}.formatMessage(${hover.messages}.deleteThread),label:${hover.intl}.formatMessage(${hover.messages}.deleteThread),buttonClassName:\`text-token-error-foreground hover:text-token-error-foreground\`,onClick:CodexDeleteAction.onRequest}];` +
+    `[{id:\`thread-delete-action\`,ariaLabel:${hover.intl}.formatMessage(${hover.messages}.deleteThread),icon:${trashIconSource(hover.render.jsxAlias)},buttonClassName:\`text-token-error-foreground hover:text-token-error-foreground\`,onClick:CodexDeleteAction.onRequest}];` +
     `return(0,${hover.render.jsxAlias}.jsx)(${renderComponent},{actions:[...${hover.spreadNames[0]},...${hover.spreadNames[1]},...CodexSidebarDeleteActions],className:${className}})`;
   const stateInit = sourceFor(code, row.stateDeclaration.init);
   const handlers =
@@ -1242,6 +1544,11 @@ function patchSidebarSource(code) {
     `CodexDeleteThread({conversationId:${row.conversationId},hostId:${row.hostId},onDeleteSuccess:${row.success},onDeleteError:${row.error}})}`;
   const renderObject = row.hoverRender.arguments[1];
   const countValue = sourceFor(code, row.hoverCount.property.value);
+  const existingDataAttributes = objectProperties(row.hoverCount.object, "dataAttributes");
+  if (existingDataAttributes.length > 1) {
+    throw new Error("sidebar row has duplicate dataAttributes props");
+  }
+  const resetDataAttributes = resetDataAttributesSource(code, row.hoverCount.object);
   const replacements = [
     { start: hover.pattern.end - 1, end: hover.pattern.end - 1, text: ",deleteAction:CodexDeleteAction" },
     {
@@ -1278,11 +1585,17 @@ function patchSidebarSource(code) {
       end: row.hoverCount.property.value.end,
       text: `(${countValue})+1`,
     },
-    {
-      start: row.hoverCount.object.end - 1,
-      end: row.hoverCount.object.end - 1,
-      text: ",onMouseLeave:()=>CodexSetDeleteConfirm(!1)",
-    },
+    existingDataAttributes.length === 1
+      ? {
+        start: existingDataAttributes[0].value.start,
+        end: existingDataAttributes[0].value.end,
+        text: resetDataAttributes,
+      }
+      : {
+        start: row.hoverCount.object.end - 1,
+        end: row.hoverCount.object.end - 1,
+        text: `,dataAttributes:${resetDataAttributes}`,
+      },
   ];
   const next = applySourceReplacements(code, replacements);
   inspectSidebarPostcondition(next);

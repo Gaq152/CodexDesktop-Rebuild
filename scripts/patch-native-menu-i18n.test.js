@@ -56,3 +56,147 @@ const patchSource = loadPatchSource();
   assert.ok(code.includes("label:`复制`"));
   assert.ok(code.includes("menuTitle:`搜索文件...`"));
 }
+
+{
+  const source = [
+    "const fileMenu=[{menuTitle:`New Task`},{menuTitle:`New Projectless Task`},{role:`quit`}];",
+    "const taskCommands=[{menuTitle:`Search Tasks…`},{menuTitle:`Rename task`},{menuTitle:`Archive task`},{menuTitle:`Pin/unpin task`},{menuTitle:`Show pet`}];",
+    `const viewMenu=[{menuTitle:\`Previous Task\`},{menuTitle:\`Next Task\`},${Array.from(
+      { length: 9 },
+      (_, index) => `{menuTitle:\`Go to Task ${index + 1}\`}`,
+    ).join(",")}];`,
+    "const helpMenu=[{label:`Documentation`},{label:`What's New`},{label:intl.formatMessage({messageId:`electron.appMenu.help.systemStatus`,defaultMessage:`System Status`})}];",
+  ].join("");
+  const first = patchSource(source);
+
+  for (const expected of [
+    "menuTitle:`新建任务`",
+    "menuTitle:`新建无项目任务`",
+    "label:`退出`,role:`quit`",
+    "menuTitle:`搜索任务...`",
+    "menuTitle:`重命名任务`",
+    "menuTitle:`归档任务`",
+    "menuTitle:`固定/取消固定任务`",
+    "menuTitle:`显示助手`",
+    "menuTitle:`上一个任务`",
+    "menuTitle:`下一个任务`",
+    ...Array.from({ length: 9 }, (_, index) => `menuTitle:\`转到任务 ${index + 1}\``),
+    "label:`文档`",
+    "label:`更新内容`",
+    "defaultMessage:`系统状态`",
+  ]) {
+    assert.ok(first.code.includes(expected), `missing localized menu source: ${expected}`);
+  }
+
+  const second = patchSource(first.code);
+  assert.strictEqual(second.code, first.code);
+  assert.strictEqual(second.replacements.length, 0);
+}
+
+{
+  const source = [
+    "var Lu=`trayMenu.openApp`,Ru=`Open {appName}`,",
+    "zu=`trayMenu.newChat`,Bu=`New Task`,",
+    "Vu=`trayMenu.pinnedThreads`,Hu=`Pinned`,",
+    "Uu=`trayMenu.runningThreads`,Wu=`Running`,",
+    "Gu=`trayMenu.recentThreads`,Ku=`Recent`,",
+    "qu=`trayMenu.unreadThreads`,Ju=`Unread`,",
+    "Yu=`trayMenu.usage`,Xu=`Usage`,",
+    "Zu=`trayMenu.more`,Qu=`More`,",
+    "$u=`trayMenu.projectlessThreads`,ed=`Tasks`;",
+    "const decoys=[`Open {appName}`,`New Task`,`Pinned`,`Running`,`Recent`,`Unread`,`Usage`,`More`,`Tasks`];",
+  ].join("");
+  const first = patchSource(source);
+
+  for (const expected of [
+    "Lu=`trayMenu.openApp`,Ru=`打开 {appName}`",
+    "zu=`trayMenu.newChat`,Bu=`新建任务`",
+    "Vu=`trayMenu.pinnedThreads`,Hu=`置顶`",
+    "Uu=`trayMenu.runningThreads`,Wu=`运行中`",
+    "Gu=`trayMenu.recentThreads`,Ku=`最近`",
+    "qu=`trayMenu.unreadThreads`,Ju=`未读`",
+    "Yu=`trayMenu.usage`,Xu=`使用情况`",
+    "Zu=`trayMenu.more`,Qu=`更多`",
+    "$u=`trayMenu.projectlessThreads`,ed=`任务`",
+  ]) {
+    assert.ok(first.code.includes(expected), `missing localized tray message: ${expected}`);
+  }
+  assert.ok(
+    first.code.includes(
+      "const decoys=[`Open {appName}`,`New Task`,`Pinned`,`Running`,`Recent`,`Unread`,`Usage`,`More`,`Tasks`]",
+    ),
+    "unscoped tray words must not be replaced",
+  );
+  assert.strictEqual(
+    first.replacements.filter((item) => item.key === "trayMessage").length,
+    9,
+  );
+
+  const second = patchSource(first.code);
+  assert.strictEqual(second.code, first.code);
+  assert.strictEqual(second.replacements.length, 0);
+}
+
+{
+  const source = [
+    "var $='trayMenu.openApp',_='Open {appName}';",
+    "const descriptor={messageId:\"trayMenu.more\",defaultMessage:'More'};",
+  ].join("");
+  const first = patchSource(source);
+
+  assert.ok(first.code.includes("$='trayMenu.openApp',_=`打开 {appName}`"));
+  assert.ok(
+    first.code.includes('messageId:"trayMenu.more",defaultMessage:`更多`'),
+  );
+  assert.strictEqual(
+    first.replacements.filter((item) => item.key === "trayMessage").length,
+    2,
+  );
+  const second = patchSource(first.code);
+  assert.strictEqual(second.code, first.code);
+  assert.strictEqual(second.replacements.length, 0);
+}
+
+{
+  const source = `const help=[{label:"What's New"},{label:'Documentation'},{label:\`What's new\`},{label:\`Codex Documentation\`}];`;
+  const { code } = patchSource(source);
+
+  assert.strictEqual((code.match(/label:`更新内容`/g) ?? []).length, 2);
+  assert.ok(code.includes("label:`文档`"));
+  assert.ok(code.includes("label:`Codex 文档`"));
+}
+
+{
+  const source = [
+    "const contextMenu={",
+    "searchWithGoogle:T9({id:`searchWithGoogle`,label:`&Search with Google`}),",
+    "cut:T9({id:`cut`,label:`Cu&t`}),",
+    "copy:T9({id:`copy`,label:`&Copy`}),",
+    "paste:T9({id:`paste`,label:`&Paste`}),",
+    "selectAll:T9({id:`selectAll`,label:`Select &All`}),",
+    "inspect:T9({id:`inspect`,label:`I&nspect Element`})",
+    "};",
+  ].join("");
+  const first = patchSource(source);
+
+  assert.ok(first.code.includes("id:`searchWithGoogle`,label:`使用 Google 搜索`"));
+  assert.ok(first.code.includes("id:`cut`,label:`剪切`"));
+  assert.ok(first.code.includes("id:`copy`,label:`复制`"));
+  assert.ok(first.code.includes("id:`paste`,label:`粘贴`"));
+  assert.ok(first.code.includes("id:`selectAll`,label:`全选`"));
+  assert.ok(first.code.includes("id:`inspect`,label:`检查元素`"));
+  for (const english of [
+    "&Search with Google",
+    "Cu&t",
+    "&Copy",
+    "&Paste",
+    "Select &All",
+    "I&nspect Element",
+  ]) {
+    assert.ok(!first.code.includes(english), `untranslated context-menu label: ${english}`);
+  }
+
+  const second = patchSource(first.code);
+  assert.strictEqual(second.code, first.code);
+  assert.strictEqual(second.replacements.length, 0);
+}
