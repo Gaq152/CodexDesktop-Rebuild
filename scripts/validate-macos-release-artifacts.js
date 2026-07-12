@@ -2,7 +2,14 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const TARGET_RELEASE_VERSION = "26.707.41301";
+function validateReleaseVersion(version) {
+  if (typeof version !== "string" || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(version)) {
+    throw new Error(
+      `macOS promotion release version must be numeric X.Y.Z, found ${version || "missing"}`,
+    );
+  }
+  return version;
+}
 
 function expectedAssets(version) {
   return [
@@ -53,11 +60,7 @@ function collectAssetEntries(root) {
 }
 
 function validateMacosAssetEntries(entries, expectedVersion) {
-  if (expectedVersion !== TARGET_RELEASE_VERSION) {
-    throw new Error(
-      `macOS promotion release version expected ${TARGET_RELEASE_VERSION}, found ${expectedVersion || "missing"}`,
-    );
-  }
+  validateReleaseVersion(expectedVersion);
 
   const symlink = entries.find((entry) => entry.type === "symlink");
   if (symlink) throw new Error(`macOS promotion asset must not be a symbolic link: ${symlink.path}`);
@@ -97,6 +100,7 @@ function validateMacosAssetEntries(entries, expectedVersion) {
 }
 
 function validateMacosReleaseArtifacts(root, expectedVersion) {
+  validateReleaseVersion(expectedVersion);
   return validateMacosAssetEntries(collectAssetEntries(root), expectedVersion);
 }
 
@@ -125,7 +129,7 @@ function main() {
 }
 
 module.exports = {
-  TARGET_RELEASE_VERSION,
+  validateReleaseVersion,
   collectAssetEntries,
   validateMacosAssetEntries,
   validateMacosReleaseArtifacts,

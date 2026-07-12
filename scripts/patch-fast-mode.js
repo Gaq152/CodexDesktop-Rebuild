@@ -352,12 +352,20 @@ function analyzeFastModeSource(source) {
   for (const patch of [...patches].sort((left, right) => right.start - left.start)) {
     code = code.slice(0, patch.start) + patch.replacement + code.slice(patch.end);
   }
+  const targets = [...patches, ...already];
+  const targetCounts = Object.fromEntries(
+    FAST_MODE_CONTRACT_IDS.map((id) => [
+      id,
+      targets.filter((target) => target.id === id).length,
+    ]),
+  );
   return {
     code,
-    status: patches.length === 1 ? "patched" : "already",
+    status: patches.length > 0 ? "patched" : "already",
     counts: { patchable: patches.length, already: already.length, total },
     patches,
-    targetIds: [...new Set([...patches, ...already].map((target) => target.id))],
+    targetIds: [...new Set(targets.map((target) => target.id))],
+    targetCounts,
   };
 }
 
@@ -488,24 +496,33 @@ function probeMacFastModeRole(candidate, targetId) {
     return { state: "owned-malformed", evidence, error };
   }
 
-  const roleTargets = result.targetIds.filter((id) => id === targetId).length;
+  const roleTargets = result.targetCounts[targetId] ?? 0;
+  const duplicateContracts = Object.entries(result.targetCounts)
+    .filter(([, count]) => count > 1)
+    .map(([id, count]) => `${id}=${count}`);
   if (
-    result.counts.total !== 1 ||
-    result.targetIds.length !== 1 ||
-    roleTargets !== 1
+    roleTargets !== 1 ||
+    duplicateContracts.length > 0 ||
+    result.counts.total > FAST_MODE_CONTRACT_IDS.length
   ) {
     return {
       state: "owned-malformed",
       evidence,
       error: new Error(
-        `${targetId} strict analyzer expected exactly 1 isolated target, ` +
-          `found role=${roleTargets} total=${result.counts.total}`,
+        `${targetId} strict analyzer expected exactly 1 role target and at most 1 ` +
+          `target per known contract, found role=${roleTargets} total=${result.counts.total}` +
+          (duplicateContracts.length > 0
+            ? ` duplicates=${duplicateContracts.join(",")}`
+            : ""),
       ),
     };
   }
   return {
     state: "exact",
-    evidence: [...evidence, "strict analyzer target count=1"],
+    evidence: [
+      ...evidence,
+      `strict analyzer role target count=1 bundle target total=${result.counts.total}`,
+    ],
     result,
   };
 }
@@ -598,18 +615,37 @@ function commitFastModePlatforms({
   isCheck = false,
   writeFile = fs.writeFileSync,
 }) {
-  return platformPlans.flatMap(({ plan }) =>
+  const selectedWrites = platformPlans.flatMap(({ plan }) =>
     commitValidatedPlan({
       plan,
-      writer: (selected) => {
-        const write = selectedFastModeWrite(selected);
-        if (!isCheck && write.result.code !== write.source) {
-          writeFile(write.path, write.result.code, "utf-8");
-        }
-        return write;
-      },
+      writer: selectedFastModeWrite,
     }),
   );
+  const writesByPath = new Map();
+  for (const write of selectedWrites) {
+    const existing = writesByPath.get(write.path);
+    if (existing) {
+      if (
+        existing.source !== write.source ||
+        existing.result.code !== write.result.code
+      ) {
+        throw new Error(
+          `fast_mode consolidated roles produced conflicting writes for ${write.path}`,
+        );
+      }
+      continue;
+    }
+    writesByPath.set(write.path, write);
+  }
+  const writes = [...writesByPath.values()];
+  if (!isCheck) {
+    for (const write of writes) {
+      if (write.result.code !== write.source) {
+        writeFile(write.path, write.result.code, "utf-8");
+      }
+    }
+  }
+  return writes;
 }
 
 function executeFastModePlatforms({
@@ -682,7 +718,7 @@ function main() {
         `  [${platformPlan.platform}] ${relPath(plan.path)} (parse ${Date.now() - startedAt}ms)`,
       );
       console.log(
-        `    [${isCheck ? "check" : plan.result.status}] patchable=${plan.result.counts.patchable} already=${plan.result.counts.already} expected=1`,
+        `    [${isCheck ? "check" : plan.result.status}] patchable=${plan.result.counts.patchable} already=${plan.result.counts.already} expected=${plan.result.targetIds.length}`,
       );
       for (const patch of plan.result.patches) {
         console.log(`    ${isCheck ? "?" : "*"} ${patch.original} -> ${patch.replacement}`);

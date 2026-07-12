@@ -6,13 +6,12 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
-  TARGET_RELEASE_VERSION,
-  collectAssetEntries,
+  validateReleaseVersion,
   validateMacosAssetEntries,
   validateMacosReleaseArtifacts,
 } = require("./validate-macos-release-artifacts");
 
-const EXPECTED_VERSION = "26.707.41301";
+const EXPECTED_VERSION = "26.707.51957";
 
 function writeFile(root, relativePath, contents = "dmg") {
   const filePath = path.join(root, ...relativePath.split("/"));
@@ -26,9 +25,9 @@ function writeMinimalDmg(root, relativePath) {
   writeFile(root, relativePath, contents);
 }
 
-function createExactFixture(root) {
-  writeMinimalDmg(root, `arm64/Codex-mac-arm64-${EXPECTED_VERSION}.dmg`);
-  writeMinimalDmg(root, `x64/Codex-mac-x64-${EXPECTED_VERSION}.dmg`);
+function createExactFixture(root, version = EXPECTED_VERSION) {
+  writeMinimalDmg(root, `arm64/Codex-mac-arm64-${version}.dmg`);
+  writeMinimalDmg(root, `x64/Codex-mac-x64-${version}.dmg`);
 }
 
 function withTempDir(callback) {
@@ -43,7 +42,6 @@ function withTempDir(callback) {
 test("accepts exactly the two non-empty architecture DMGs", () => {
   withTempDir((root) => {
     createExactFixture(root);
-    assert.equal(TARGET_RELEASE_VERSION, EXPECTED_VERSION);
     assert.deepEqual(validateMacosReleaseArtifacts(root, EXPECTED_VERSION), {
       version: EXPECTED_VERSION,
       assets: [
@@ -52,6 +50,22 @@ test("accepts exactly the two non-empty architecture DMGs", () => {
       ],
     });
   });
+});
+
+test("accepts any strictly numeric three-part release version", () => {
+  for (const version of ["26.707.41301", "1.2.3"]) {
+    withTempDir((root) => {
+      createExactFixture(root, version);
+      assert.equal(validateReleaseVersion(version), version);
+      assert.deepEqual(validateMacosReleaseArtifacts(root, version), {
+        version,
+        assets: [
+          `Codex-mac-arm64-${version}.dmg`,
+          `Codex-mac-x64-${version}.dmg`,
+        ],
+      });
+    });
+  }
 });
 
 test("rejects a missing architecture DMG", () => {
@@ -189,16 +203,37 @@ test("rejects symbolic-link entries without following them", () => {
   );
 });
 
-test("rejects an unapproved release version and a missing root", () => {
-  withTempDir((root) => {
-    createExactFixture(root);
-    assert.throws(
-      () => validateMacosReleaseArtifacts(root, "26.707.31428"),
-      /expected 26\.707\.41301/i,
-    );
-  });
+test("rejects malformed release versions before inspecting artifacts", async (t) => {
+  const invalidVersions = [
+    undefined,
+    "",
+    "26.707",
+    "26.707.51957.1",
+    "v26.707.51957",
+    "26.beta.51957",
+    "26.707.51957-beta",
+    " 26.707.51957",
+    "26.707.51957 ",
+    "26/707/51957",
+    "26\\707\\51957",
+  ];
+  for (const version of invalidVersions) {
+    await t.test(String(version), () => {
+      assert.throws(
+        () => validateMacosAssetEntries([], version),
+        /release version.*numeric X\.Y\.Z|invalid.*version/i,
+      );
+    });
+  }
+});
+
+test("rejects a missing artifact root", () => {
   assert.throws(
-    () => collectAssetEntries(path.join(os.tmpdir(), "codex-missing-promotion-root")),
+    () =>
+      validateMacosReleaseArtifacts(
+        path.join(os.tmpdir(), "codex-missing-promotion-root"),
+        EXPECTED_VERSION,
+      ),
     /does not exist/i,
   );
 });

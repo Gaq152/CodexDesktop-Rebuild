@@ -267,7 +267,7 @@ const STRUCTURAL_PLUGIN_MAIN = [
   "function Ud(){let e=i.a.readFromPackageMetadata(),t=e!=null&&i.a.shouldIncludeBrowserUsePeerAuthorization(e,process.platform),n=!t&&Bd(process.env);if(!t&&!n)return()=>({authorized:!0})}",
 ].join(";");
 const STRUCTURAL_PLUGIN_WEBVIEW = [
-  "function F(e){let{enabled:n,hostId:r}=e,s=v(`1506311413`),c={featureName:`computer_use`,hostId:r},l=j(c),p=I({enabled:n}),y=l.enabled&&p.enabled&&s,b=l.isFetching,x=l.isLoading,_=s?l.reason:`statsig-disabled`;return{available:y,isFetching:b,isLoading:x,reason:_}}",
+  "function F(e){let{enabled:n,hostId:r}=e,s=v(`1506311413`),c={featureName:`computer_use`,hostId:r},l=j(c),p=I({enabled:n}),y=l.enabled&&p.enabled&&s,b=l.isFetching,x=l.isLoading,_=y?l.reason:`statsig-disabled`;return{available:y,isFetching:b,isLoading:x,reason:_}}",
   "function I(e){let t=(0,z.c)(21),{enabled:n}=e,r=(0,B.useContext)(x)?.authMethod===`chatgpt`;return{enabled:n&&r}}",
   "function H(e){let{hostId:n}=e,a=v(`410065390`),o={featureName:`browser_use_external`,hostId:n},s=j(o),l=a?s.enabled:`statsig-disabled`,u=l===`available`,d=l===`available`,f=l===`loading`;return{allowed:u,available:d,isLoading:f,reason:l}}",
   "function K(e){let{hostId:n}=e,a=v(`410262010`),o={featureName:`browser_use`,hostId:n},s=j(o),l=a?s.enabled:`statsig-disabled`,h=l===`available`,_=l===`available`,y=l===`loading`;return{allowed:h,available:_,isLoading:y,reason:l}}",

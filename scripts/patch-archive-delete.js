@@ -707,7 +707,7 @@ function inspectArchiveAppMainSource(source) {
 
 function analyzeArchiveAppMainLayer(source) {
   const inspection = inspectArchiveAppMainSource(source);
-  const routeRe = /(["`])archive-conversation\1:(\w+)\(async\((\w+),\{conversationId:(\w+),cleanupWorktree:(\w+),source:(\w+)\}\)=>\{\s*await \3\.archiveConversation\(\4,\{cleanupWorktree:\5,source:\6\}\)\s*\}\)/g;
+  const routeRe = /(["`])archive-conversation\1:([$A-Z_a-z][$\w]*)\(async\(([$A-Z_a-z][$\w]*),\{conversationId:([$A-Z_a-z][$\w]*),cleanupWorktree:([$A-Z_a-z][$\w]*),source:([$A-Z_a-z][$\w]*)\}\)=>\{\s*await \3\.archiveConversation\(\4,\{cleanupWorktree:\5,source:\6\}\)\s*\}\)/g;
   const patchableRoutes = [...source.matchAll(routeRe)];
   const ast = parseArchiveSource(source, "archive app-main");
   let archiveConversationEvidence = 0;
@@ -746,7 +746,7 @@ function patchAppMainSource(source) {
     };
   }
 
-  const routeRe = /(["`])archive-conversation\1:(\w+)\(async\((\w+),\{conversationId:(\w+),cleanupWorktree:(\w+),source:(\w+)\}\)=>\{\s*await \3\.archiveConversation\(\4,\{cleanupWorktree:\5,source:\6\}\)\s*\}\)/g;
+  const routeRe = /(["`])archive-conversation\1:([$A-Z_a-z][$\w]*)\(async\(([$A-Z_a-z][$\w]*),\{conversationId:([$A-Z_a-z][$\w]*),cleanupWorktree:([$A-Z_a-z][$\w]*),source:([$A-Z_a-z][$\w]*)\}\)=>\{\s*await \3\.archiveConversation\(\4,\{cleanupWorktree:\5,source:\6\}\)\s*\}\)/g;
   const matches = [...source.matchAll(routeRe)];
   if (matches.length !== 1) {
     throw new Error(`archive route expected exactly 1 target, found ${matches.length}`);

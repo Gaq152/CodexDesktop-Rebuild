@@ -208,6 +208,43 @@ test("macOS matrix locates consolidated structural roles and ignores token decoy
   }
 });
 
+test("macOS supports settings and request roles consolidated into one bundle", () => {
+  const source = `${LATEST_FAST_MODE_FIXTURE};${LATEST_FAST_REQUEST_FIXTURE}`;
+  const candidate = {
+    path: "webview/assets/app-initial~app-main~chatgpt-consolidated.js",
+    fileName: "app-initial~app-main~chatgpt-consolidated.js",
+    source,
+  };
+  const writes = [];
+  const execution = executeFastModePlatforms({
+    platformInputs: [{ platform: "mac-x64", candidates: [candidate] }],
+    writeFile: (...args) => writes.push(args),
+  });
+
+  assert.deepEqual(
+    execution.platformPlans[0].writes.map(({ role }) => role),
+    ["fast-settings", "fast-request"],
+  );
+  assert.equal(writes.length, 1, "a consolidated bundle must be committed only once");
+  const patched = writes[0][1];
+  assert.match(patched, /authMethod===`chatgpt`\|\|a\?\.authMethod===`apikey`/);
+  assert.match(patched, /n!==`chatgpt`&&n!==`apikey`/);
+
+  const idempotentWrites = [];
+  const second = executeFastModePlatforms({
+    platformInputs: [{
+      platform: "mac-x64",
+      candidates: [{ ...candidate, source: patched }],
+    }],
+    writeFile: (...args) => idempotentWrites.push(args),
+  });
+  assert.deepEqual(
+    second.platformPlans[0].writes.map(({ result }) => result.status),
+    ["already", "already"],
+  );
+  assert.equal(idempotentWrites.length, 0);
+});
+
 test("macOS accepts already-patched structural settings and request roles", () => {
   const settings = patchFastModeSource(LATEST_FAST_MODE_FIXTURE).code;
   const request = patchFastModeSource(LATEST_FAST_REQUEST_FIXTURE).code;
@@ -271,6 +308,19 @@ test("macOS malformed and duplicate role plans fail before any writer", async (t
         },
       ],
       /fast-settings|settings-one|settings-two|exact candidates: 2/i,
+    ],
+    [
+      "duplicate settings inside a consolidated bundle",
+      [
+        {
+          path: "webview/assets/consolidated-duplicate-settings.js",
+          fileName: "consolidated-duplicate-settings.js",
+          source:
+            `${LATEST_FAST_MODE_FIXTURE};${LATEST_FAST_MODE_FIXTURE};` +
+            LATEST_FAST_REQUEST_FIXTURE,
+        },
+      ],
+      /fast-settings|consolidated-duplicate-settings|owned-malformed|role=2|target/i,
     ],
     [
       "owned malformed request",
@@ -366,6 +416,33 @@ test("platform orchestrator plans every platform before commit writes", async (t
           writeFile: (...args) => writes.push(args),
         }),
       /mac-x64|fast-settings|exact candidates: 2/i,
+    );
+    assert.equal(writes.length, 0);
+  });
+
+  await t.test("conflicting consolidated paths fail before every write", () => {
+    const writes = [];
+    assert.throws(
+      () =>
+        executeFastModePlatforms({
+          platformInputs: [{
+            platform: "mac-x64",
+            candidates: [
+              {
+                path: "webview/assets/shared.js",
+                fileName: "shared-settings.js",
+                source: LATEST_FAST_MODE_FIXTURE,
+              },
+              {
+                path: "webview/assets/shared.js",
+                fileName: "shared-request.js",
+                source: LATEST_FAST_REQUEST_FIXTURE,
+              },
+            ],
+          }],
+          writeFile: (...args) => writes.push(args),
+        }),
+      /consolidated roles produced conflicting writes.*shared\.js/i,
     );
     assert.equal(writes.length, 0);
   });

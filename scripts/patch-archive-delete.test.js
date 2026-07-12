@@ -58,6 +58,11 @@ const LATEST_MAC_NATIVE_APP_MAIN = [
   "handoff(`archive-conversation`,{conversationId:id});",
 ].join("");
 
+const LATEST_DOLLAR_WRAPPER_APP_MAIN = withLiveRouter(
+  '"archive-conversation":$7(async($e,{conversationId:$t,cleanupWorktree:$n,source:$r})=>{await $e.archiveConversation($t,{cleanupWorktree:$n,source:$r})}),' +
+    '"delete-archived-conversation":e9((e,{conversationId:t})=>e.deleteArchivedConversation(t))',
+);
+
 test("keeps native archive deletion and injects an independent active delete route", () => {
   assert.equal(
     typeof patchArchiveContracts,
@@ -107,6 +112,26 @@ test("keeps the unambiguous legacy custom route patch idempotent", () => {
   const second = patchAppMainSource(first.code);
   assert.equal(second.status, "already");
   assert.equal(second.code, first.code);
+});
+
+test("patches a live archive route whose compressed identifiers start with dollars", () => {
+  const first = patchArchiveContracts({
+    appMainSource: LATEST_DOLLAR_WRAPPER_APP_MAIN,
+    dataControlsSource: LATEST_NATIVE_DATA_CONTROLS,
+  });
+  assert.equal(first.status, "patched");
+  assert.match(
+    first.appMain.code,
+    /"delete-conversation":\$7\(async\(\$e,\{conversationId:\$t\}\)/,
+  );
+  assert.match(first.appMain.code, /sendRequest\("thread\/delete",\{threadId:\$t\}\)/);
+
+  const second = patchArchiveContracts({
+    appMainSource: first.appMain.code,
+    dataControlsSource: first.dataControls.code,
+  });
+  assert.equal(second.status, "already");
+  assert.equal(second.appMain.code, first.appMain.code);
 });
 
 test("patches a missing legacy route when the matching legacy UI is already present", () => {

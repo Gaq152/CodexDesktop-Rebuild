@@ -23,12 +23,13 @@ function namedStep(workflow, name) {
   )?.groups.body;
 }
 
-test("workflow validates fixed promotion inputs before any external action", () => {
+test("workflow validates parameterized promotion inputs before any external action", () => {
   const workflow = readWorkflow();
   assert.match(workflow, /on:\n  workflow_dispatch:\n    inputs:/);
   assert.match(workflow, /source_run_id:\n\s+description:.*\n\s+required: true\n\s+type: string/);
   assert.match(workflow, /release_version:\n\s+description:.*\n\s+required: true\n\s+type: string/);
   assert.match(workflow, /permissions:\n\s+actions: read\n\s+contents: write/);
+  assert.match(workflow, /concurrency:\n\s+group: promote-macos-release\n\s+cancel-in-progress: false/);
 
   const firstStep = workflow.match(
     /    steps:\n      - name: Validate promotion inputs\n(?<body>[\s\S]*?)(?=\n      - name:)/,
@@ -37,7 +38,11 @@ test("workflow validates fixed promotion inputs before any external action", () 
   assert.match(firstStep, /RELEASE_VERSION: \$\{\{ inputs\.release_version \}\}/);
   assert.match(firstStep, /SOURCE_RUN_ID: \$\{\{ inputs\.source_run_id \}\}/);
   assert.match(firstStep, /\^\[1-9\]\[0-9\]\*\$/);
-  assert.match(firstStep, /"\$RELEASE_VERSION" != "26\.707\.41301"/);
+  assert.ok(
+    firstStep.includes("^[0-9]+\\.[0-9]+\\.[0-9]+$"),
+    "release_version should use a strict numeric X.Y.Z check",
+  );
+  assert.doesNotMatch(firstStep, /26\.707\.(?:41301|51957)/);
   assert.doesNotMatch(firstStep, /uses:/);
 });
 
@@ -92,17 +97,25 @@ test("workflow downloads exactly the two architecture artifacts from the selecte
   );
 });
 
-test("workflow publishes only the fixed macOS release and two exact DMGs", () => {
+test("workflow publishes only the selected macOS release and two exact DMGs", () => {
   const workflow = readWorkflow();
   const releaseIndex = workflow.indexOf("uses: softprops/action-gh-release@v3");
   const validatorIndex = workflow.indexOf("validate-macos-release-artifacts.js");
   const preflightIndex = workflow.indexOf("Validate target release and tag state");
   assert.ok(validatorIndex !== -1 && validatorIndex < preflightIndex && preflightIndex < releaseIndex);
-  assert.match(workflow, /tag_name: v26\.707\.41301/);
-  assert.match(workflow, /name: Codex 26\.707\.41301/);
+  assert.ok(workflow.includes("tag_name: v${{ inputs.release_version }}"));
+  assert.ok(workflow.includes("name: Codex ${{ inputs.release_version }}"));
   assert.match(workflow, /macOS-only release promoted from GitHub Actions run/);
-  assert.match(workflow, /artifacts\/arm64\/Codex-mac-arm64-26\.707\.41301\.dmg/);
-  assert.match(workflow, /artifacts\/x64\/Codex-mac-x64-26\.707\.41301\.dmg/);
+  assert.ok(
+    workflow.includes(
+      "artifacts/arm64/Codex-mac-arm64-${{ inputs.release_version }}.dmg",
+    ),
+  );
+  assert.ok(
+    workflow.includes(
+      "artifacts/x64/Codex-mac-x64-${{ inputs.release_version }}.dmg",
+    ),
+  );
   assert.match(workflow, /fail_on_unmatched_files: true/);
   assert.match(workflow, /overwrite_files: true/);
   assert.match(workflow, /make_latest: false/);
@@ -116,8 +129,8 @@ test("workflow publishes only the fixed macOS release and two exact DMGs", () =>
   const files = workflow.match(/          files: \|\n(?<files>(?:            .*\n)+)/)?.groups.files ?? "";
   const fileLines = files.trim().split("\n").map((line) => line.trim());
   assert.deepEqual(fileLines, [
-    "artifacts/arm64/Codex-mac-arm64-26.707.41301.dmg",
-    "artifacts/x64/Codex-mac-x64-26.707.41301.dmg",
+    "artifacts/arm64/Codex-mac-arm64-${{ inputs.release_version }}.dmg",
+    "artifacts/x64/Codex-mac-x64-${{ inputs.release_version }}.dmg",
   ]);
   assert.doesNotMatch(files, /[*?\[\]]/);
 });
@@ -128,7 +141,13 @@ test("workflow safely refreshes an existing release or creates a wholly unused r
   const postflight = namedStep(workflow, "Verify exact promoted release assets");
   assert.ok(preflight);
   assert.ok(postflight);
-  assert.match(preflight, /RELEASE_TAG: v26\.707\.41301/);
+  assert.ok(preflight.includes("RELEASE_VERSION: ${{ inputs.release_version }}"));
+  assert.ok(preflight.includes("RELEASE_TAG: v${{ inputs.release_version }}"));
+  assert.ok(
+    preflight.includes(
+      "SOURCE_HEAD_SHA: ${{ steps.source_run.outputs.source_head_sha }}",
+    ),
+  );
   assert.match(preflight, /curl --silent --show-error/);
   assert.match(preflight, /--write-out '%\{http_code\}'/);
   assert.match(preflight, /releases\/tags\/\$\{RELEASE_TAG\}/);
@@ -140,8 +159,29 @@ test("workflow safely refreshes an existing release or creates a wholly unused r
   assert.match(preflight, /\.tag_name == \$release_tag/);
   assert.match(preflight, /\.draft == false/);
   assert.match(preflight, /\.prerelease == false/);
+  assert.match(preflight, /\.object\.type == "commit"/);
+  assert.match(preflight, /\.object\.sha == \$source_head_sha/);
+  assert.match(preflight, /existing tag.*source run|source run.*existing tag/i);
+  assert.match(preflight, /\.assets\[\]\.name/);
+  assert.match(preflight, /unexpected asset|only contain.*DMG/i);
   assert.match(preflight, /Unexpected API status/);
-  assert.match(postflight, /RELEASE_TAG: v26\.707\.41301/);
+  assert.ok(postflight.includes("RELEASE_VERSION: ${{ inputs.release_version }}"));
+  assert.ok(postflight.includes("RELEASE_TAG: v${{ inputs.release_version }}"));
+  assert.ok(
+    postflight.includes(
+      "SOURCE_HEAD_SHA: ${{ steps.source_run.outputs.source_head_sha }}",
+    ),
+  );
+  assert.ok(postflight.includes('"Codex-mac-arm64-${RELEASE_VERSION}.dmg"'));
+  assert.ok(postflight.includes('"Codex-mac-x64-${RELEASE_VERSION}.dmg"'));
+  assert.match(postflight, /releases\/tags\/\$\{RELEASE_TAG\}/);
+  assert.match(postflight, /git\/ref\/tags\/\$\{RELEASE_TAG\}/);
+  assert.match(postflight, /\.tag_name == \$release_tag/);
+  assert.match(postflight, /\.draft == false/);
+  assert.match(postflight, /\.prerelease == false/);
+  assert.match(postflight, /\.object\.type == "commit"/);
+  assert.match(postflight, /\.object\.sha == \$source_head_sha/);
+  assert.match(postflight, /selected source run commit/i);
   assert.match(postflight, /cmp -s "\$desired_assets" "\$actual_assets"/);
   assert.match(postflight, /Exact macOS release asset verification failed/);
   assert.doesNotMatch(workflow, /delete-asset|gh release delete/);
@@ -152,7 +192,7 @@ test("workflow is isolated from old and non-macOS release channels", () => {
   const workflow = readWorkflow();
   assert.doesNotMatch(
     workflow,
-    /26\.707\.31428|windows|update[-_]feed|\.zip|\.exe|\.nupkg|tag_name:.*\|\||\*\.dmg/i,
+    /26\.707\.(?:31428|41301|51957)|windows|update[-_]feed|\.zip|\.exe|\.nupkg|tag_name:.*\|\||\*\.dmg/i,
   );
   assert.doesNotMatch(workflow, /(?:^|\s)RELEASES(?:\s|$)/);
   assert.doesNotMatch(workflow, /push:|schedule:|workflow_call:/);

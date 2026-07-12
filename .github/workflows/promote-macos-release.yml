@@ -17,7 +17,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: promote-macos-v26.707.41301
+  group: promote-macos-release
   cancel-in-progress: false
 
 jobs:
@@ -35,8 +35,8 @@ jobs:
             echo "Invalid source_run_id: expected a positive integer" >&2
             exit 1
           fi
-          if [ "$RELEASE_VERSION" != "26.707.41301" ]; then
-            echo "Invalid release_version: expected 26.707.41301" >&2
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release_version: expected numeric X.Y.Z" >&2
             exit 1
           fi
 
@@ -123,11 +123,15 @@ jobs:
       - name: Validate target release and tag state
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: v26.707.41301
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_TAG: v${{ inputs.release_version }}
+          SOURCE_HEAD_SHA: ${{ steps.source_run.outputs.source_head_sha }}
         run: |
           set -euo pipefail
           release_json="$(mktemp)"
           tag_json="$(mktemp)"
+          arm64_asset="Codex-mac-arm64-${RELEASE_VERSION}.dmg"
+          x64_asset="Codex-mac-x64-${RELEASE_VERSION}.dmg"
           trap 'rm -f "$release_json" "$tag_json"' EXIT
 
           if ! release_status="$(curl --silent --show-error \
@@ -181,12 +185,28 @@ jobs:
                 echo "Existing release $RELEASE_TAG is not a published non-prerelease target" >&2
                 exit 1
               fi
-              if ! jq -e --arg tag_ref "refs/tags/${RELEASE_TAG}" '
+              if ! jq -e \
+                --arg arm64_asset "$arm64_asset" \
+                --arg x64_asset "$x64_asset" \
+                '
+                  [.assets[].name] as $names |
+                  ($names | length) == ($names | unique | length) and
+                  all($names[]; . == $arm64_asset or . == $x64_asset)
+                ' "$release_json" >/dev/null
+              then
+                echo "Existing release $RELEASE_TAG may only contain the two expected DMG names; found an unexpected asset" >&2
+                exit 1
+              fi
+              if ! jq -e \
+                --arg tag_ref "refs/tags/${RELEASE_TAG}" \
+                --arg source_head_sha "$SOURCE_HEAD_SHA" \
+                '
                 .ref == $tag_ref and
-                (.object.sha | test("^[0-9a-f]{40}$"))
+                .object.type == "commit" and
+                .object.sha == $source_head_sha
               ' "$tag_json" >/dev/null
               then
-                echo "Existing tag $RELEASE_TAG is malformed" >&2
+                echo "Existing tag $RELEASE_TAG does not point to the selected source run commit" >&2
                 exit 1
               fi
               echo "Refreshing the existing published release $RELEASE_TAG in place."
@@ -203,8 +223,8 @@ jobs:
       - name: Create macOS-only release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v26.707.41301
-          name: Codex 26.707.41301
+          tag_name: v${{ inputs.release_version }}
+          name: Codex ${{ inputs.release_version }}
           target_commitish: ${{ steps.source_run.outputs.source_head_sha }}
           body: |
             macOS-only release promoted from GitHub Actions run `${{ inputs.source_run_id }}`.
@@ -212,8 +232,8 @@ jobs:
             - macOS arm64 DMG
             - macOS x64 DMG
           files: |
-            artifacts/arm64/Codex-mac-arm64-26.707.41301.dmg
-            artifacts/x64/Codex-mac-x64-26.707.41301.dmg
+            artifacts/arm64/Codex-mac-arm64-${{ inputs.release_version }}.dmg
+            artifacts/x64/Codex-mac-x64-${{ inputs.release_version }}.dmg
           fail_on_unmatched_files: true
           overwrite_files: true
           draft: false
@@ -223,18 +243,40 @@ jobs:
       - name: Verify exact promoted release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: v26.707.41301
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_TAG: v${{ inputs.release_version }}
+          SOURCE_HEAD_SHA: ${{ steps.source_run.outputs.source_head_sha }}
         run: |
           set -euo pipefail
           desired_assets="$(mktemp)"
           actual_assets="$(mktemp)"
-          trap 'rm -f "$desired_assets" "$actual_assets"' EXIT
+          release_json="$(mktemp)"
+          tag_json="$(mktemp)"
+          trap 'rm -f "$desired_assets" "$actual_assets" "$release_json" "$tag_json"' EXIT
           printf '%s\n' \
-            "Codex-mac-arm64-26.707.41301.dmg" \
-            "Codex-mac-x64-26.707.41301.dmg" \
+            "Codex-mac-arm64-${RELEASE_VERSION}.dmg" \
+            "Codex-mac-x64-${RELEASE_VERSION}.dmg" \
             | sort > "$desired_assets"
-          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' \
-            | sort > "$actual_assets"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "$release_json"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" > "$tag_json"
+          if ! jq -e \
+            --arg release_tag "$RELEASE_TAG" \
+            '.tag_name == $release_tag and .draft == false and .prerelease == false' \
+            "$release_json" >/dev/null
+          then
+            echo "Promoted release state verification failed for $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if ! jq -e \
+            --arg tag_ref "refs/tags/${RELEASE_TAG}" \
+            --arg source_head_sha "$SOURCE_HEAD_SHA" \
+            '.ref == $tag_ref and .object.type == "commit" and .object.sha == $source_head_sha' \
+            "$tag_json" >/dev/null
+          then
+            echo "Promoted tag $RELEASE_TAG no longer points to the selected source run commit" >&2
+            exit 1
+          fi
+          jq -r '.assets[].name' "$release_json" | sort > "$actual_assets"
           if ! cmp -s "$desired_assets" "$actual_assets"; then
             echo "Exact macOS release asset verification failed for $RELEASE_TAG" >&2
             diff -u "$desired_assets" "$actual_assets" >&2 || true

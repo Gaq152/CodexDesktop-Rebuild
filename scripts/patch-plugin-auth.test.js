@@ -13,7 +13,7 @@ const {
 } = require("./patch-plugin-auth");
 
 const LATEST_WEBVIEW_FIXTURE = [
-  "function F(e){let{enabled:n,hostId:r}=e,s=v(`1506311413`),c={featureName:`computer_use`,hostId:r},l=j(c),p=I({enabled:n}),y=l.enabled&&p.enabled&&s,b=l.isFetching,x=l.isLoading,_=s?l.reason:`statsig-disabled`;return{available:y,isFetching:b,isLoading:x,reason:_}}",
+  "function F(e){let{enabled:n,hostId:r}=e,s=v(`1506311413`),c={featureName:`computer_use`,hostId:r},l=j(c),p=I({enabled:n}),y=l.enabled&&p.enabled&&s,b=l.isFetching,x=l.isLoading,_=y?l.reason:`statsig-disabled`;return{available:y,isFetching:b,isLoading:x,reason:_}}",
   "function I(e){let t=(0,z.c)(21),{enabled:n}=e,r=(0,B.useContext)(x)?.authMethod===`chatgpt`;return{enabled:n&&r}}",
   "function H(e){let{hostId:n}=e,a=v(`410065390`),o={featureName:`browser_use_external`,hostId:n},s=j(o),l=a?s.enabled:`statsig-disabled`,u=l===`available`,d=l===`available`,f=l===`loading`;return{allowed:u,available:d,isLoading:f,reason:l}}",
   "function K(e){let{hostId:n}=e,a=v(`410262010`),o={featureName:`browser_use`,hostId:n},s=j(o),l=a?s.enabled:`statsig-disabled`,h=l===`available`,_=l===`available`,y=l===`loading`;return{allowed:h,available:_,isLoading:y,reason:l}}",
@@ -147,9 +147,74 @@ test("rejects main-only, missing, and ambiguous plugin contracts", () => {
   assert.throws(
     () =>
       patchPluginWebviewSource(
-        `${LATEST_WEBVIEW_FIXTURE};function Q(){return y.authMethod===\`chatgpt\`}`,
+        LATEST_WEBVIEW_FIXTURE.replace(
+          "r=(0,B.useContext)(x)?.authMethod===`chatgpt`;return{enabled:n&&r}",
+          "r=(0,B.useContext)(x)?.authMethod===`chatgpt`,q=e.authMethod===`chatgpt`;return{enabled:n&&r&&q}",
+        ),
       ),
     /auth.*expected exactly 1.*found 2/i,
+  );
+});
+
+test("ignores unrelated auth comparisons outside exported plugin hook return flow", () => {
+  const detachedFastMode =
+    "function fastSettings(e,r){let allowed=e.authMethod===`chatgpt`;return allowed&&r.requirements.featureRequirements.fast_mode}";
+  const detachedAccount =
+    "function unrelatedAccount(e){return e.authMethod===`chatgpt`&&e.accountId}";
+  const source = `${LATEST_WEBVIEW_FIXTURE};${detachedFastMode};${detachedAccount}`;
+
+  const first = patchPluginWebviewSource(source);
+  assert.equal(first.status, "patched");
+  assert.deepEqual(first.counts.auth, { patchable: 1, already: 0, total: 1 });
+  assert.ok(first.code.includes(detachedFastMode));
+  assert.ok(first.code.includes(detachedAccount));
+  assert.equal(
+    (first.code.match(/authMethod===`apikey`/g) ?? []).length,
+    1,
+    "only the plugin hook auth comparison should gain the API-key alternative",
+  );
+
+  const second = patchPluginWebviewSource(first.code);
+  assert.equal(second.status, "already");
+  assert.deepEqual(second.counts.auth, { patchable: 0, already: 1, total: 1 });
+  assert.equal(second.code, first.code);
+});
+
+test("rejects an unused auth helper called from the computer-use hook", () => {
+  const source =
+    LATEST_WEBVIEW_FIXTURE
+      .replace("function F(e){let", "function F(e){Q();let")
+      .replace("r=(0,B.useContext)(x)?.authMethod===`chatgpt`", "r=!0") +
+    ";function Q(){return{enabled:y.authMethod===`chatgpt`}}";
+
+  assert.throws(
+    () => patchPluginWebviewSource(source),
+    /auth.*expected exactly 1.*found 0/i,
+  );
+});
+
+test("requires plugin auth to feed the computer-use helper enabled property", () => {
+  const wrongProperty = LATEST_WEBVIEW_FIXTURE.replace(
+    "return{enabled:n&&r}",
+    "return{enabled:n,accountAllowed:n&&r}",
+  );
+  assert.throws(
+    () => patchPluginWebviewSource(wrongProperty),
+    /auth.*detached.*enabled|auth.*detached.*return/i,
+  );
+
+  const browserOnly =
+    LATEST_WEBVIEW_FIXTURE
+      .replace("r=(0,B.useContext)(x)?.authMethod===`chatgpt`", "r=!0")
+      .replace(
+        "function H(e){let{hostId:n}=e",
+        "function H(e){let q=Q(),{hostId:n}=e",
+      )
+      .replace("return{allowed:u,available:d", "return{allowed:u&&q.enabled,available:d") +
+    ";function Q(){let r=y.authMethod===`chatgpt`;return{enabled:r}}";
+  assert.throws(
+    () => patchPluginWebviewSource(browserOnly),
+    /auth.*expected exactly 1.*found 0/i,
   );
 });
 

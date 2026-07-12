@@ -704,33 +704,63 @@ function createFunctionReturnFlow(functionNode, model) {
     returnExpressions.push(functionNode.body);
   }
 
-  const liveExpressions = new Set();
-  const liveBindings = new Set();
-  const pendingBindings = [];
+  function collectLiveExpressions(initialExpressions) {
+    const liveExpressions = new Set();
+    const liveBindings = new Set();
+    const pendingBindings = [];
 
-  function addLiveExpression(expression) {
-    if (!expression || liveExpressions.has(expression)) return;
-    liveExpressions.add(expression);
-    walkExpression(expression, (node, parent) => {
-      if (!isReferenceIdentifier(node, parent)) return;
-      const binding = model.resolve(node);
-      if (!binding || liveBindings.has(binding)) return;
-      liveBindings.add(binding);
-      pendingBindings.push(binding);
-    });
-  }
-
-  for (const expression of returnExpressions) addLiveExpression(expression);
-  while (pendingBindings.length > 0) {
-    const binding = pendingBindings.shift();
-    for (const expression of definitions.get(binding) ?? []) {
-      addLiveExpression(expression);
+    function addLiveExpression(expression) {
+      if (!expression || liveExpressions.has(expression)) return;
+      liveExpressions.add(expression);
+      walkExpression(expression, (node, parent) => {
+        if (!isReferenceIdentifier(node, parent)) return;
+        const binding = model.resolve(node);
+        if (!binding || liveBindings.has(binding)) return;
+        liveBindings.add(binding);
+        pendingBindings.push(binding);
+      });
     }
+
+    for (const expression of initialExpressions) addLiveExpression(expression);
+    while (pendingBindings.length > 0) {
+      const binding = pendingBindings.shift();
+      for (const expression of definitions.get(binding) ?? []) {
+        addLiveExpression(expression);
+      }
+    }
+    return liveExpressions;
   }
+
+  const liveExpressions = collectLiveExpressions(returnExpressions);
+  const feedsReturn = (target) =>
+    [...liveExpressions].some((expression) => nodeContainsNode(expression, target));
 
   return {
-    feedsReturn: (target) =>
-      [...liveExpressions].some((expression) => nodeContainsNode(expression, target)),
+    feedsReturn,
+    feedsReturnedProperty(target, propertyName) {
+      let found = false;
+      walkOwnFunction(functionNode, (node) => {
+        if (found || node.type !== "ObjectExpression" || !feedsReturn(node)) return;
+        for (const property of node.properties) {
+          if (
+            property.type !== "Property" ||
+            pluginPropertyName(property) !== propertyName
+          ) {
+            continue;
+          }
+          const propertyExpressions = collectLiveExpressions([property.value]);
+          if (
+            [...propertyExpressions].some((expression) =>
+              nodeContainsNode(expression, target),
+            )
+          ) {
+            found = true;
+            break;
+          }
+        }
+      });
+      return found;
+    },
   };
 }
 
@@ -800,24 +830,35 @@ function collectWebviewHookTopology(ast) {
     return flow;
   }
 
-  const reachableFunctions = new Set(hooks.values());
-  const pending = [...hooks.values()].map((functionNode) => ({ functionNode, depth: 0 }));
   // Current bundles call the auth helper directly from an exported hook. Two
   // direct identifier-call hops leave adaptation room while keeping analysis bounded.
   const MAX_HELPER_CALL_DEPTH = 2;
-  while (pending.length > 0) {
-    const { functionNode, depth } = pending.shift();
-    if (depth >= MAX_HELPER_CALL_DEPTH) continue;
-    walkOwnFunction(functionNode, (node) => {
-      if (node.type !== "CallExpression" || node.callee?.type !== "Identifier") return;
-      const called = functionsByBinding.get(model.resolve(node.callee));
-      if (!called || reachableFunctions.has(called)) return;
-      reachableFunctions.add(called);
-      pending.push({ functionNode: called, depth: depth + 1 });
-    });
+  const reachableFunctionsByContext = new Map();
+  for (const [context, hook] of hooks) {
+    const reachableFunctions = new Set([hook]);
+    const pending = [{ functionNode: hook, depth: 0 }];
+    while (pending.length > 0) {
+      const { functionNode, depth } = pending.shift();
+      if (depth >= MAX_HELPER_CALL_DEPTH) continue;
+      const callerFlow = flowFor(functionNode);
+      walkOwnFunction(functionNode, (node) => {
+        if (
+          node.type !== "CallExpression" ||
+          node.callee?.type !== "Identifier" ||
+          !callerFlow.feedsReturn(node)
+        ) {
+          return;
+        }
+        const called = functionsByBinding.get(model.resolve(node.callee));
+        if (!called || reachableFunctions.has(called)) return;
+        reachableFunctions.add(called);
+        pending.push({ functionNode: called, depth: depth + 1 });
+      });
+    }
+    reachableFunctionsByContext.set(context, reachableFunctions);
   }
 
-  return { hooks, model, reachableFunctions, flowFor };
+  return { hooks, model, reachableFunctionsByContext, flowFor };
 }
 
 function flattenLogical(node, operator, terms = []) {
@@ -902,13 +943,18 @@ function collectWebviewAuth(source, ast, topology) {
     return functionNode;
   }
 
-  function isHookReturnEvidence(node) {
+  function hookReturnEvidenceState(node) {
     const functionNode = evidenceFunction(node);
-    return (
-      functionNode != null &&
-      topology.reachableFunctions.has(functionNode) &&
-      topology.flowFor(functionNode).feedsReturn(node)
-    );
+    const computerUseFunctions =
+      topology.reachableFunctionsByContext.get("computer_use");
+    if (functionNode == null || !computerUseFunctions?.has(functionNode)) {
+      return "irrelevant";
+    }
+    return topology
+      .flowFor(functionNode)
+      .feedsReturnedProperty(node, "enabled")
+      ? "live"
+      : "detached";
   }
 
   walkWithParent(ast, (node, parent) => {
@@ -930,11 +976,13 @@ function collectWebviewAuth(source, ast, topology) {
         })
         .filter(Boolean);
       if (chatTerms.length === 0 || apiTerms.length === 0) return;
+      const evidenceState = hookReturnEvidenceState(node);
+      if (evidenceState === "irrelevant") return;
       const operand = chatTerms[0].operand;
       if (terms.length !== 2 || chatTerms.length !== 1 || apiTerms.length !== 1 || apiTerms[0] !== operand) {
         throw new Error("plugin webview auth postcondition has extra or mismatched alternatives");
       }
-      const live = isHookReturnEvidence(node);
+      const live = evidenceState === "live";
       evidence.push({ node, live });
       if (live) already.push(node.start);
       return;
@@ -943,7 +991,9 @@ function collectWebviewAuth(source, ast, topology) {
     const operand = expressionForChatGptSide(node, source);
     if (operand == null || !operand.includes("authMethod")) return;
     if (parent?.type === "LogicalExpression" && parent.operator === "||") return;
-    const live = isHookReturnEvidence(node);
+    const evidenceState = hookReturnEvidenceState(node);
+    if (evidenceState === "irrelevant") return;
+    const live = evidenceState === "live";
     evidence.push({ node, live });
     if (!live) return;
     const original = source.slice(node.start, node.end);
