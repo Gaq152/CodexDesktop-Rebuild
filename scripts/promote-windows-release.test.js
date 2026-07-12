@@ -118,15 +118,16 @@ test("promotion workflow publishes the exact Windows-only release contract", () 
   assert.match(workflow, /Windows-only/i);
   assert.match(workflow, /App 26\.707\.31428/);
   assert.match(workflow, /CLI 0\.144\.1/);
-  assert.match(workflow, /full-only,? no delta/i);
+  assert.match(workflow, /full package.*guaranteed/i);
+  assert.match(workflow, /delta package.*optional.*10-minute/i);
   assert.match(workflow, /artifacts\/installer\/CodexSetup-win-x64-\$\{\{ inputs\.release_version \}\}\.exe/);
   assert.match(workflow, /artifacts\/portable\/Codex-win-x64-\$\{\{ inputs\.release_version \}\}\.zip/);
-  assert.match(workflow, /artifacts\/update-feed\/Codex-\$\{\{ inputs\.release_version \}\}-full\.nupkg/);
+  assert.match(workflow, /artifacts\/update-feed\/\*\.nupkg/);
   assert.match(workflow, /artifacts\/update-feed\/RELEASES/);
   assert.match(workflow, /make_latest: true/);
 });
 
-test("promotion workflow reconciles the release to exactly four Windows assets", () => {
+test("promotion workflow reconciles four required Windows assets plus an optional delta", () => {
   const workflow = readWorkflow();
   const step = workflow.match(
     /      - name: Reconcile exact release assets\n(?<body>[\s\S]*?)$/,
@@ -145,5 +146,8 @@ test("promotion workflow reconciles the release to exactly four Windows assets",
     "RELEASES",
   ];
   for (const asset of expectedAssets) assert.ok(step.includes(`"${asset}"`));
-  assert.doesNotMatch(step, /\.dmg|delta|\*\.nupkg|\*\.zip|\*\.exe/i);
+  assert.match(step, /Codex-\$\{RELEASE_VERSION\}-delta\.nupkg/);
+  assert.match(step, /\[ -f "\$delta_path" \]/);
+  assert.match(step, /printf '%s\\n' "\$\(basename "\$delta_path"\)"/);
+  assert.doesNotMatch(step, /\.dmg|\*\.nupkg|\*\.zip|\*\.exe/i);
 });

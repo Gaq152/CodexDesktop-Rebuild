@@ -124,44 +124,80 @@ test("resolveSquirrelReleaseOptions rejects invalid no-delta values", () => {
   );
 });
 
-function assertWindowsUpdateFeedBranches(workflow) {
+function namedWorkflowStep(workflow, name) {
   const normalized = workflow.replace(/\r\n/g, "\n");
-  const stepMatch = normalized.match(
-    /      - name: Configure Windows update feed\n(?<step>[\s\S]*?)(?=\n      - name:)/,
-  );
-  assert.ok(stepMatch, "Configure Windows update feed step should exist");
-  const runMatch = stepMatch.groups.step.match(/        run: \|\n(?<runBlock>[\s\S]*)$/);
-  assert.ok(runMatch, "Configure Windows update feed should have a PowerShell run block");
-  const branches = runMatch.groups.runBlock.match(
-    /^(?<before>[\s\S]*?)          if \(\"\$\{\{ inputs\.skip_windows_delta \}\}\" -eq \"true\"\) \{\n(?<trueBranch>[\s\S]*?)          \} else \{\n(?<falseBranch>[\s\S]*?)          \}\n?$/,
-  );
-  assert.ok(branches, "update feed run block should contain the skip_windows_delta if/else");
-
-  const { before, trueBranch, falseBranch } = branches.groups;
-  assert.match(before, /CODEX_REBUILD_UPDATE_URL=\$feed/);
-  assert.doesNotMatch(`${trueBranch}${falseBranch}`, /CODEX_REBUILD_UPDATE_URL/);
-  assert.match(trueBranch, /CODEX_REBUILD_NO_DELTA=1/);
-  assert.doesNotMatch(trueBranch, /CODEX_REBUILD_REMOTE_RELEASES/);
-  assert.match(falseBranch, /CODEX_REBUILD_REMOTE_RELEASES=\$feed/);
-  assert.doesNotMatch(falseBranch, /CODEX_REBUILD_NO_DELTA/);
+  return normalized.match(
+    new RegExp(`      - name: ${name}\\n(?<body>[\\s\\S]*?)(?=\\n      - (?:name:|uses:)|$)`),
+  )?.groups.body;
 }
 
-test("Windows workflow configures mutually exclusive delta modes", () => {
-  const workflow = fs.readFileSync(path.join(__dirname, "..", ".github", "workflows", "build.yml"), "utf-8");
-  assert.match(workflow, /skip_windows_delta:\s*\n(?:\s+.*\n)*?\s+default: false\s*\n\s+type: boolean/);
-  assertWindowsUpdateFeedBranches(workflow);
+function assertFullFirstWindowsInstallerWorkflow(workflow, { supportsSkip }) {
+  const configure = namedWorkflowStep(workflow, "Configure Windows update feed");
+  const full = namedWorkflowStep(workflow, "Build guaranteed full Windows installer");
+  const backup = namedWorkflowStep(workflow, "Back up guaranteed full Windows installer");
+  const delta = namedWorkflowStep(workflow, "Attempt Windows delta package");
+  const finalize = namedWorkflowStep(workflow, "Finalize Windows installer output");
 
-  const remoteInTrueBranch = workflow.replace(
-    "CODEX_REBUILD_NO_DELTA=1",
-    "CODEX_REBUILD_REMOTE_RELEASES=$feed",
-  );
-  assert.throws(() => assertWindowsUpdateFeedBranches(remoteInTrueBranch));
+  assert.ok(configure, "Windows update feed configuration step should exist");
+  assert.match(configure, /CODEX_REBUILD_UPDATE_URL=\$feed/);
+  assert.match(configure, /CODEX_REBUILD_REMOTE_RELEASES=\$feed/);
+  assert.doesNotMatch(configure, /CODEX_REBUILD_NO_DELTA/);
 
-  const noDeltaInFalseBranch = workflow.replace(
-    "CODEX_REBUILD_REMOTE_RELEASES=$feed",
-    "CODEX_REBUILD_NO_DELTA=1",
+  assert.ok(full, "guaranteed full installer step should exist");
+  assert.match(full, /id: windows_full/);
+  assert.match(full, /timeout-minutes: 30/);
+  assert.match(full, /CODEX_REBUILD_NO_DELTA: "1"/);
+  assert.match(full, /npm run build:win-installer/);
+
+  assert.ok(backup, "full installer backup step should exist");
+  assert.match(backup, /out[\\/]make[\\/]squirrel\.windows[\\/]x64/);
+  assert.match(backup, /out[\\/]full-only-squirrel/);
+  assert.match(backup, /Move-Item/);
+
+  assert.ok(delta, "bounded delta attempt step should exist");
+  assert.match(delta, /id: windows_delta/);
+  assert.match(delta, /continue-on-error: true/);
+  assert.match(delta, /timeout-minutes: 10/);
+  assert.match(delta, /npm run build:win-installer/);
+  assert.doesNotMatch(delta, /CODEX_REBUILD_NO_DELTA/);
+  if (supportsSkip) {
+    assert.match(delta, /if: inputs\.skip_windows_delta != true/);
+  } else {
+    assert.doesNotMatch(delta, /skip_windows_delta/);
+  }
+
+  assert.ok(finalize, "installer fallback finalization step should exist");
+  assert.match(finalize, /if: always\(\) && steps\.windows_full\.outcome == 'success'/);
+  assert.match(finalize, /DELTA_OUTCOME: \$\{\{ steps\.windows_delta\.outcome \}\}/);
+  assert.match(finalize, /\$env:DELTA_OUTCOME -ne "success"/);
+  assert.match(finalize, /Move-Item/);
+  assert.match(finalize, /Remove-Item/);
+
+  const fullIndex = workflow.indexOf("name: Build guaranteed full Windows installer");
+  const backupIndex = workflow.indexOf("name: Back up guaranteed full Windows installer");
+  const deltaIndex = workflow.indexOf("name: Attempt Windows delta package");
+  const finalizeIndex = workflow.indexOf("name: Finalize Windows installer output");
+  const resolveIndex = workflow.indexOf("name: Resolve Windows artifact versions");
+  assert.ok(fullIndex < backupIndex && backupIndex < deltaIndex && deltaIndex < finalizeIndex);
+  assert.ok(finalizeIndex < resolveIndex, "fallback must finish before artifacts are resolved");
+}
+
+test("Windows workflows guarantee full installers and bound optional delta generation", () => {
+  const buildWorkflow = fs.readFileSync(
+    path.join(__dirname, "..", ".github", "workflows", "build.yml"),
+    "utf-8",
   );
-  assert.throws(() => assertWindowsUpdateFeedBranches(noDeltaInFalseBranch));
+  const syncWorkflow = fs.readFileSync(
+    path.join(__dirname, "..", ".github", "workflows", "sync.yml"),
+    "utf-8",
+  );
+
+  assert.match(
+    buildWorkflow,
+    /skip_windows_delta:\s*\n(?:\s+.*\n)*?\s+default: false\s*\n\s+type: boolean/,
+  );
+  assertFullFirstWindowsInstallerWorkflow(buildWorkflow, { supportsSkip: true });
+  assertFullFirstWindowsInstallerWorkflow(syncWorkflow, { supportsSkip: false });
 });
 
 function writePeWithoutVersionInfo(file) {

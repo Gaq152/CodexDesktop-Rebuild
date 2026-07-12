@@ -90,14 +90,9 @@ jobs:
         run: |
           $feed = "${{ env.WINDOWS_UPDATE_FEED }}"
           "CODEX_REBUILD_UPDATE_URL=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CODEX_REBUILD_REMOTE_RELEASES=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           Write-Host "Using Windows update feed URL: $feed"
-          if ("${{ inputs.skip_windows_delta }}" -eq "true") {
-            "CODEX_REBUILD_NO_DELTA=1" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-            Write-Host "Building full Windows packages only."
-          } else {
-            "CODEX_REBUILD_REMOTE_RELEASES=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-            Write-Host "Using Windows update feed as Squirrel remoteReleases for delta generation."
-          }
+          Write-Host "Using Windows update feed as Squirrel remoteReleases for the optional delta attempt."
       - name: Configure installer version override
         if: inputs.installer_version != ''
         shell: pwsh
@@ -105,11 +100,65 @@ jobs:
           "CODEX_REBUILD_INSTALLER_VERSION=${{ inputs.installer_version }}" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - run: node scripts/patch-all.js win
       - run: npm run build:win-x64
-      - name: Build Windows installer with diagnostics
+      - name: Build guaranteed full Windows installer
+        id: windows_full
         timeout-minutes: 30
+        env:
+          CODEX_REBUILD_NO_DELTA: "1"
+          DEBUG: electron-windows-installer:*
+        run: npm run build:win-installer
+      - name: Back up guaranteed full Windows installer
+        shell: pwsh
+        run: |
+          $source = Join-Path $PWD.Path "out/make/squirrel.windows/x64"
+          $backup = Join-Path $PWD.Path "out/full-only-squirrel"
+          if (-not (Test-Path -LiteralPath $source -PathType Container)) {
+            throw "Guaranteed full installer output is missing: $source"
+          }
+          if (Test-Path -LiteralPath $backup) {
+            throw "Refusing to overwrite unexpected full installer backup: $backup"
+          }
+          Move-Item -LiteralPath $source -Destination $backup
+          Write-Host "Backed up guaranteed full installer output to $backup"
+      - name: Attempt Windows delta package
+        id: windows_delta
+        if: inputs.skip_windows_delta != true
+        continue-on-error: true
+        timeout-minutes: 10
         env:
           DEBUG: electron-windows-installer:*
         run: npm run build:win-installer
+      - name: Finalize Windows installer output
+        if: always() && steps.windows_full.outcome == 'success'
+        env:
+          DELTA_OUTCOME: ${{ steps.windows_delta.outcome }}
+        shell: pwsh
+        run: |
+          $output = Join-Path $PWD.Path "out/make/squirrel.windows/x64"
+          $backup = Join-Path $PWD.Path "out/full-only-squirrel"
+          if (-not (Test-Path -LiteralPath $backup -PathType Container)) {
+            throw "Guaranteed full installer backup is missing: $backup"
+          }
+
+          if ($env:DELTA_OUTCOME -ne "success") {
+            if (Test-Path -LiteralPath $output) {
+              Remove-Item -LiteralPath $output -Recurse -Force
+            }
+            New-Item -ItemType Directory -Path (Split-Path -Parent $output) -Force | Out-Null
+            Move-Item -LiteralPath $backup -Destination $output
+            Write-Host "Delta outcome was '$env:DELTA_OUTCOME'; restored guaranteed full-only output."
+          } else {
+            if (-not (Test-Path -LiteralPath $output -PathType Container)) {
+              throw "Delta attempt reported success but installer output is missing: $output"
+            }
+            Remove-Item -LiteralPath $backup -Recurse -Force
+            Write-Host "Delta attempt completed within the 10-minute budget; keeping its output."
+          }
+
+          Get-ChildItem -LiteralPath $output -File |
+            Where-Object { $_.Extension -in '.exe', '.nupkg' -or $_.Name -eq 'RELEASES' } |
+            Sort-Object Name |
+            ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) bytes)" }
       - name: Resolve Windows artifact versions
         id: windows_artifacts
         run: node scripts/resolve-release-artifacts.js --root out --rename-windows-setup --github-output

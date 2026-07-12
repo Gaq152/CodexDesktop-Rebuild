@@ -35,41 +35,87 @@ async function validateWindowsReleaseFeed({ root, version }) {
   const lines = fs.readFileSync(releasesPath, "utf8")
     .split(/\r?\n/)
     .filter((line) => line.trim().length > 0);
-  if (lines.length !== 1) {
-    throw new Error(`RELEASES must contain exactly one non-empty line, found ${lines.length}`);
+  if (lines.length < 1 || lines.length > 2) {
+    throw new Error(`RELEASES must contain one or two non-empty lines, found ${lines.length}`);
   }
 
-  const match = lines[0].match(/^([A-Fa-f0-9]{40}) ([^\s]+) ([0-9]+)$/);
-  if (!match) {
-    throw new Error("RELEASES line must contain a 40-hex SHA1, package filename, and byte size");
-  }
-  const [, declaredSha1, fileName, declaredSizeText] = match;
-  const expectedFileName = `Codex-${version}-full.nupkg`;
-  if (fileName !== expectedFileName) {
-    throw new Error(`RELEASES must reference exact full package version ${expectedFileName}, found ${fileName}`);
+  const expectedNames = {
+    full: `Codex-${version}-full.nupkg`,
+    delta: `Codex-${version}-delta.nupkg`,
+  };
+  const declaredPackages = {};
+  for (const line of lines) {
+    const match = line.match(/^([A-Fa-f0-9]{40}) ([^\s]+) ([0-9]+)$/);
+    if (!match) {
+      throw new Error("Each RELEASES line must contain a 40-hex SHA1, package filename, and byte size");
+    }
+    const [, declaredSha1, fileName, declaredSizeText] = match;
+    const kind = Object.keys(expectedNames).find((candidate) => expectedNames[candidate] === fileName);
+    if (!kind) {
+      throw new Error(
+        `RELEASES must reference only the exact package names ${expectedNames.full} and optional ${expectedNames.delta}, found ${fileName}`,
+      );
+    }
+    if (declaredPackages[kind]) {
+      throw new Error(`RELEASES contains a duplicate ${kind} package entry: ${fileName}`);
+    }
+    declaredPackages[kind] = { declaredSha1, declaredSizeText, fileName };
   }
 
-  const packagePath = path.join(resolvedRoot, expectedFileName);
-  if (!fs.existsSync(packagePath) || !fs.statSync(packagePath).isFile()) {
-    throw new Error(`RELEASES full package is missing: ${packagePath}`);
-  }
-  const actualSize = fs.statSync(packagePath).size;
-  const declaredSize = Number(declaredSizeText);
-  if (!Number.isSafeInteger(declaredSize) || declaredSize !== actualSize) {
-    throw new Error(`RELEASES size mismatch: declared ${declaredSizeText}, actual ${actualSize}`);
+  if (!declaredPackages.full) {
+    throw new Error(`RELEASES is missing required full package ${expectedNames.full}`);
   }
 
-  const actualSha1 = await sha1File(packagePath);
-  if (declaredSha1.toLowerCase() !== actualSha1) {
-    throw new Error(`RELEASES SHA1 mismatch: declared ${declaredSha1}, actual ${actualSha1}`);
+  const referencedNames = new Set(Object.values(declaredPackages).map(({ fileName }) => fileName));
+  const unreferencedPackages = fs.readdirSync(resolvedRoot, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".nupkg"))
+    .map((entry) => entry.name)
+    .filter((fileName) => !referencedNames.has(fileName))
+    .sort();
+  if (unreferencedPackages.length > 0) {
+    throw new Error(`Update feed contains unreferenced nupkg package(s): ${unreferencedPackages.join(", ")}`);
   }
-  return { fileName, sha1: actualSha1, size: actualSize };
+
+  const validatePackage = async (kind) => {
+    const declaration = declaredPackages[kind];
+    if (!declaration) return null;
+    const { declaredSha1, declaredSizeText, fileName } = declaration;
+    const packagePath = path.join(resolvedRoot, fileName);
+    if (!fs.existsSync(packagePath) || !fs.statSync(packagePath).isFile()) {
+      throw new Error(`RELEASES ${kind} package is missing: ${packagePath}`);
+    }
+    const actualSize = fs.statSync(packagePath).size;
+    const declaredSize = Number(declaredSizeText);
+    if (!Number.isSafeInteger(declaredSize) || declaredSize !== actualSize) {
+      throw new Error(
+        `RELEASES ${kind} package size mismatch: declared ${declaredSizeText}, actual ${actualSize}`,
+      );
+    }
+
+    const actualSha1 = await sha1File(packagePath);
+    if (declaredSha1.toLowerCase() !== actualSha1) {
+      throw new Error(
+        `RELEASES ${kind} package SHA1 mismatch: declared ${declaredSha1}, actual ${actualSha1}`,
+      );
+    }
+    return { fileName, sha1: actualSha1, size: actualSize };
+  };
+
+  return {
+    full: await validatePackage("full"),
+    delta: await validatePackage("delta"),
+  };
+}
+
+function formatValidationResult(result) {
+  const delta = result.delta ? result.delta.fileName : "none";
+  return `full=${result.full.fileName}; delta=${delta}`;
 }
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   const result = await validateWindowsReleaseFeed(options);
-  console.log(`[ok] validated Windows release feed: ${result.fileName}`);
+  console.log(`[ok] validated Windows release feed: ${formatValidationResult(result)}`);
 }
 
 module.exports = { validateWindowsReleaseFeed };

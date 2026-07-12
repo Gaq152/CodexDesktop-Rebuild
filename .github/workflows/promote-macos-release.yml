@@ -120,7 +120,7 @@ jobs:
           RELEASE_VERSION: ${{ inputs.release_version }}
         run: node scripts/validate-macos-release-artifacts.js --root artifacts --version "$RELEASE_VERSION"
 
-      - name: Require unused target release and tag
+      - name: Validate target release and tag state
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: v26.707.41301
@@ -143,12 +143,7 @@ jobs:
           fi
 
           case "$release_status" in
-            200)
-              echo "Target release $RELEASE_TAG already exists; refusing overwrite or retry" >&2
-              exit 1
-              ;;
-            404)
-              ;;
+            200|404) ;;
             *)
               echo "Unexpected API status $release_status while querying release $RELEASE_TAG" >&2
               exit 1
@@ -168,14 +163,39 @@ jobs:
           fi
 
           case "$tag_status" in
-            200)
-              echo "Target tag $RELEASE_TAG already exists; refusing overwrite or retry" >&2
-              exit 1
-              ;;
-            404)
-              ;;
+            200|404) ;;
             *)
               echo "Unexpected API status $tag_status while querying tag $RELEASE_TAG" >&2
+              exit 1
+              ;;
+          esac
+
+          case "$release_status:$tag_status" in
+            200:200)
+              if ! jq -e --arg release_tag "$RELEASE_TAG" '
+                .tag_name == $release_tag and
+                .draft == false and
+                .prerelease == false
+              ' "$release_json" >/dev/null
+              then
+                echo "Existing release $RELEASE_TAG is not a published non-prerelease target" >&2
+                exit 1
+              fi
+              if ! jq -e --arg tag_ref "refs/tags/${RELEASE_TAG}" '
+                .ref == $tag_ref and
+                (.object.sha | test("^[0-9a-f]{40}$"))
+              ' "$tag_json" >/dev/null
+              then
+                echo "Existing tag $RELEASE_TAG is malformed" >&2
+                exit 1
+              fi
+              echo "Refreshing the existing published release $RELEASE_TAG in place."
+              ;;
+            404:404)
+              echo "Creating new release and tag $RELEASE_TAG."
+              ;;
+            *)
+              echo "Target release and tag must either both exist or both be absent for $RELEASE_TAG" >&2
               exit 1
               ;;
           esac
@@ -195,7 +215,7 @@ jobs:
             artifacts/arm64/Codex-mac-arm64-26.707.41301.dmg
             artifacts/x64/Codex-mac-x64-26.707.41301.dmg
           fail_on_unmatched_files: true
-          overwrite_files: false
+          overwrite_files: true
           draft: false
           prerelease: false
           make_latest: false

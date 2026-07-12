@@ -21,6 +21,7 @@ try {
   fs.mkdirSync(source, { recursive: true });
 
   writePackage(path.join(source, "Codex-26.623.101658-full.nupkg"));
+  writePackage(path.join(source, "Codex-26.623.101658-delta.nupkg"));
   fs.writeFileSync(
     path.join(source, "RELEASES"),
     [
@@ -45,9 +46,10 @@ try {
 
   const releases = fs.readFileSync(path.join(dest, "RELEASES"), "utf8");
   assert.ok(releases.includes("Codex-26.623.101658-full.nupkg"));
-  assert.ok(!releases.includes("Codex-26.623.101658-delta.nupkg"));
+  assert.ok(releases.includes("Codex-26.623.101658-delta.nupkg"));
+  assert.ok(!releases.includes("Codex-26.623.101657-full.nupkg"));
   assert.ok(fs.existsSync(path.join(dest, "Codex-26.623.101658-full.nupkg")));
-  assert.ok(!fs.existsSync(path.join(dest, "Codex-26.623.101658-delta.nupkg")));
+  assert.ok(fs.existsSync(path.join(dest, "Codex-26.623.101658-delta.nupkg")));
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

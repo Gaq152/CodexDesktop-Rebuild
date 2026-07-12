@@ -111,13 +111,14 @@ jobs:
 
             - App 26.707.31428
             - CLI 0.144.1
-            - Windows installer: full-only, no delta
+            - Windows full package is guaranteed; delta package is optional with a 10-minute generation budget
           files: |
             artifacts/installer/CodexSetup-win-x64-${{ inputs.release_version }}.exe
             artifacts/portable/Codex-win-x64-${{ inputs.release_version }}.zip
-            artifacts/update-feed/Codex-${{ inputs.release_version }}-full.nupkg
+            artifacts/update-feed/*.nupkg
             artifacts/update-feed/RELEASES
           fail_on_unmatched_files: true
+          overwrite_files: true
           draft: false
           prerelease: false
           make_latest: true
@@ -137,7 +138,13 @@ jobs:
             "Codex-win-x64-${RELEASE_VERSION}.zip" \
             "Codex-${RELEASE_VERSION}-full.nupkg" \
             "RELEASES" \
-            | sort > "$desired_assets"
+            > "$desired_assets"
+
+          delta_path="artifacts/update-feed/Codex-${RELEASE_VERSION}-delta.nupkg"
+          if [ -f "$delta_path" ]; then
+            printf '%s\n' "$(basename "$delta_path")" >> "$desired_assets"
+          fi
+          sort -o "$desired_assets" "$desired_assets"
 
           gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' \
             | while IFS= read -r asset; do

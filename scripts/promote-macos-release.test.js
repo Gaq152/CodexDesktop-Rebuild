@@ -96,7 +96,7 @@ test("workflow publishes only the fixed macOS release and two exact DMGs", () =>
   const workflow = readWorkflow();
   const releaseIndex = workflow.indexOf("uses: softprops/action-gh-release@v3");
   const validatorIndex = workflow.indexOf("validate-macos-release-artifacts.js");
-  const preflightIndex = workflow.indexOf("Require unused target release and tag");
+  const preflightIndex = workflow.indexOf("Validate target release and tag state");
   assert.ok(validatorIndex !== -1 && validatorIndex < preflightIndex && preflightIndex < releaseIndex);
   assert.match(workflow, /tag_name: v26\.707\.41301/);
   assert.match(workflow, /name: Codex 26\.707\.41301/);
@@ -104,7 +104,7 @@ test("workflow publishes only the fixed macOS release and two exact DMGs", () =>
   assert.match(workflow, /artifacts\/arm64\/Codex-mac-arm64-26\.707\.41301\.dmg/);
   assert.match(workflow, /artifacts\/x64\/Codex-mac-x64-26\.707\.41301\.dmg/);
   assert.match(workflow, /fail_on_unmatched_files: true/);
-  assert.match(workflow, /overwrite_files: false/);
+  assert.match(workflow, /overwrite_files: true/);
   assert.match(workflow, /make_latest: false/);
   assert.doesNotMatch(workflow, /make_latest: true/);
   assert.match(workflow, /target_commitish: \$\{\{ steps\.source_run\.outputs\.source_head_sha \}\}/);
@@ -122,9 +122,9 @@ test("workflow publishes only the fixed macOS release and two exact DMGs", () =>
   assert.doesNotMatch(files, /[*?\[\]]/);
 });
 
-test("workflow refuses any existing target release or tag and verifies the final exact set", () => {
+test("workflow safely refreshes an existing release or creates a wholly unused release and tag", () => {
   const workflow = readWorkflow();
-  const preflight = namedStep(workflow, "Require unused target release and tag");
+  const preflight = namedStep(workflow, "Validate target release and tag state");
   const postflight = namedStep(workflow, "Verify exact promoted release assets");
   assert.ok(preflight);
   assert.ok(postflight);
@@ -133,20 +133,19 @@ test("workflow refuses any existing target release or tag and verifies the final
   assert.match(preflight, /--write-out '%\{http_code\}'/);
   assert.match(preflight, /releases\/tags\/\$\{RELEASE_TAG\}/);
   assert.match(preflight, /git\/ref\/tags\/\$\{RELEASE_TAG\}/);
-  assert.match(
-    preflight,
-    /case "\$release_status" in[\s\S]*?200\)[\s\S]*?already exists[\s\S]*?exit 1[\s\S]*?404\)/,
-  );
-  assert.match(
-    preflight,
-    /case "\$tag_status" in[\s\S]*?200\)[\s\S]*?already exists[\s\S]*?exit 1[\s\S]*?404\)/,
-  );
+  assert.match(preflight, /"\$release_status:\$tag_status"/);
+  assert.match(preflight, /200:200\)/);
+  assert.match(preflight, /404:404\)/);
+  assert.match(preflight, /release and tag must either both exist or both be absent/i);
+  assert.match(preflight, /\.tag_name == \$release_tag/);
+  assert.match(preflight, /\.draft == false/);
+  assert.match(preflight, /\.prerelease == false/);
   assert.match(preflight, /Unexpected API status/);
   assert.match(postflight, /RELEASE_TAG: v26\.707\.41301/);
   assert.match(postflight, /cmp -s "\$desired_assets" "\$actual_assets"/);
   assert.match(postflight, /Exact macOS release asset verification failed/);
   assert.doesNotMatch(workflow, /delete-asset|gh release delete/);
-  assert.doesNotMatch(preflight, /comm -23|existing.*subset/i);
+  assert.doesNotMatch(preflight, /refusing overwrite|already exists/i);
 });
 
 test("workflow is isolated from old and non-macOS release channels", () => {
