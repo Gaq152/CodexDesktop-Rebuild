@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
-function loadPatchSource() {
+function loadPatchModule() {
   const filePath = path.join(__dirname, "patch-native-menu-i18n.js");
   const source = fs
     .readFileSync(filePath, "utf8")
@@ -17,10 +17,55 @@ function loadPatchSource() {
     require,
   };
   vm.runInNewContext(source, sandbox, { filename: filePath });
-  return sandbox.module.exports.patchSource;
+  return sandbox.module.exports;
 }
 
-const patchSource = loadPatchSource();
+const { COMMAND_TITLE_TRANSLATIONS, locateTargets, patchSource } = loadPatchModule();
+
+{
+  const commandObjects = COMMAND_TITLE_TRANSLATIONS.map(
+    ([messageId, from], index) => index % 2 === 0
+      ? `{id:\`${messageId}\`,defaultMessage:\`${from}\`,description:\`fixture\`}`
+      : `{defaultMessage:\`${from}\`,id:\`${messageId}\`,description:\`fixture\`}`,
+  );
+  const source = `const messages=[${commandObjects.join(",")}];const decoy={defaultMessage:\`Close Tab\`};`;
+  const first = patchSource(source);
+
+  assert.strictEqual(
+    first.replacements.filter((item) => item.key === "commandMessage").length,
+    COMMAND_TITLE_TRANSLATIONS.length,
+  );
+  for (const [messageId, from, to] of COMMAND_TITLE_TRANSLATIONS) {
+    assert.ok(first.code.includes(`id:\`${messageId}\``), `missing command message: ${messageId}`);
+    assert.ok(first.code.includes(`defaultMessage:\`${to}\``), `missing translation: ${from} -> ${to}`);
+  }
+  assert.ok(first.code.includes("const decoy={defaultMessage:`Close Tab`}"));
+
+  const second = patchSource(first.code);
+  assert.strictEqual(second.code, first.code);
+  assert.strictEqual(second.replacements.length, 0);
+}
+
+{
+  const commandTargets = locateTargets("win").filter((target) => {
+    if (!target.path.includes(path.join("webview", "assets"))) return false;
+    const source = fs.readFileSync(target.path, "utf8");
+    return (
+      source.includes("codex.commandMenuTitle.") &&
+      (source.includes("menuTitleIntlId") || source.includes("codex.commandDescription."))
+    );
+  });
+  const sources = commandTargets.map((target) => fs.readFileSync(target.path, "utf8"));
+
+  assert.strictEqual(commandTargets.length, 3);
+  assert.ok(sources.some((source) => source.includes("menuTitleIntlId")));
+  assert.ok(sources.some((source) => source.includes("codex.commandDescription.")));
+  const localized = sources.map((source) => patchSource(source).code).join("\n");
+  for (const [messageId, , to] of COMMAND_TITLE_TRANSLATIONS) {
+    assert.ok(localized.includes(`id:\`${messageId}\``), `missing catalog message: ${messageId}`);
+    assert.ok(localized.includes(`defaultMessage:\`${to}\``), `missing catalog translation: ${to}`);
+  }
+}
 
 {
   const source = "let menu=[{role:`editMenu`,id:t.fo.edit},{label:`View`,submenu:[]}];";

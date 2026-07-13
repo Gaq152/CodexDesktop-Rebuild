@@ -163,6 +163,56 @@ const MENU_LABEL_TRANSLATIONS = [
   ["Toggle React Scan", "切换 React Scan"],
 ];
 
+const COMMAND_TITLE_MESSAGE_SPECS = [
+  ["archiveThread", "Archive task"],
+  ["closeTab", "Close Tab"],
+  ["closeWindow", "Close"],
+  ["composer.startDictation", "Dictation"],
+  ["copyConversationPath", "Copy conversation path"],
+  ["copyDeeplink", "Copy deeplink"],
+  ["copySessionId", "Copy session id"],
+  ["copyWorkingDirectory", "Copy working directory"],
+  ["findInThread", "Find"],
+  ["focusBrowserAddressBar", "Focus Browser Address Bar"],
+  ["hardReloadBrowserPage", "Force Reload Browser Page"],
+  ["navigateBack", "Back"],
+  ["navigateForward", "Forward"],
+  ["newProjectlessTask", "New Projectless Task"],
+  ["newThread", "New Task"],
+  ["newWindow", "New Window"],
+  ["nextThread", "Next Task"],
+  ["openAvatarOverlay", "Show pet"],
+  ["openBrowserTab", "Open Browser Tab"],
+  ["openCommandMenu", "Open command menu"],
+  ["openFolder", "Open Folder…"],
+  ["openProcessManager", "Process Manager"],
+  ["openThreadInNewWindow", "Open in New Window"],
+  ["previousThread", "Previous Task"],
+  ["reloadBrowserPage", "Reload Browser Page"],
+  ["renameThread", "Rename task"],
+  ["searchChats", "Search Tasks…"],
+  ["searchFiles", "Search Files…"],
+  ["settings", "Settings…"],
+  ["showKeyboardShortcuts", "Keyboard Shortcuts"],
+  ...Array.from({ length: 9 }, (_, index) => [`thread${index + 1}`, `Go to Task ${index + 1}`]),
+  ["toggleBottomPanel", "Toggle Bottom Panel"],
+  ["toggleBrowserPanel", "Toggle Browser Panel"],
+  ["toggleFileTreePanel", "Toggle File Tree"],
+  ["togglePinnedSummary", "Toggle Pinned Summary"],
+  ["toggleSidebar", "Toggle Sidebar"],
+  ["toggleSidePanel", "Toggle Side Panel"],
+  ["toggleTerminal", "Open Terminal"],
+  ["toggleThreadPin", "Pin/unpin task"],
+  ["toggleTraceRecording", "Start Trace Recording"],
+];
+
+const MENU_TRANSLATION_BY_SOURCE = new Map(MENU_LABEL_TRANSLATIONS);
+const COMMAND_TITLE_TRANSLATIONS = COMMAND_TITLE_MESSAGE_SPECS.map(([suffix, from]) => {
+  const to = MENU_TRANSLATION_BY_SOURCE.get(from);
+  if (!to) throw new Error(`Missing command-title translation for: ${from}`);
+  return [`codex.commandMenuTitle.${suffix}`, from, to];
+});
+
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -264,10 +314,31 @@ function patchTrayMessageDefaults(code, replacements) {
   return code;
 }
 
+function patchCommandTitleDefaults(code, replacements) {
+  for (const [messageId, from, to] of COMMAND_TITLE_TRANSLATIONS) {
+    const idPattern = jsStringLiteralVariants(messageId).map(escapeRegex).join("|");
+    const defaultPattern = jsStringLiteralVariants(from).map(escapeRegex).join("|");
+    const objectPattern = new RegExp(
+      `\\{(?=[^{}]*\\bid\\s*:\\s*(?:${idPattern}))([^{}]*)\\}`,
+      "g",
+    );
+    code = code.replace(objectPattern, (object, body) => {
+      const defaultMessagePattern = new RegExp(
+        `(\\bdefaultMessage\\s*:\\s*)(?:${defaultPattern})`,
+      );
+      if (!defaultMessagePattern.test(body)) return object;
+      replacements.push({ key: "commandMessage", from, to, messageId });
+      return `{${body.replace(defaultMessagePattern, `$1${templateLiteral(to)}`)}}`;
+    });
+  }
+  return code;
+}
+
 function patchSource(source) {
   let code = source;
   const replacements = [];
 
+  code = patchCommandTitleDefaults(code, replacements);
   code = patchTrayMessageDefaults(code, replacements);
 
   for (const [from, to] of MENU_LABEL_TRANSLATIONS) {
@@ -336,6 +407,29 @@ function locateTargets(platform) {
 
   for (const target of locateCommandMetadataTargets(platforms)) {
     addTarget(target);
+  }
+  for (const target of locateWebviewCommandTargets(platforms)) {
+    addTarget(target);
+  }
+  return targets;
+}
+
+function locateWebviewCommandTargets(platforms) {
+  const targets = [];
+  for (const plat of platforms ?? ["mac-arm64", "mac-x64", "win"]) {
+    const dir = path.join(__dirname, "..", "src", plat, "_asar", "webview", "assets");
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith(".js")) continue;
+      const filePath = path.join(dir, name);
+      const source = fs.readFileSync(filePath, "utf8");
+      if (
+        source.includes("codex.commandMenuTitle.") &&
+        (source.includes("menuTitleIntlId") || source.includes("codex.commandDescription."))
+      ) {
+        targets.push({ platform: plat, path: filePath });
+      }
+    }
   }
   return targets;
 }
@@ -413,4 +507,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { patchSource, locateTargets };
+module.exports = { COMMAND_TITLE_TRANSLATIONS, patchSource, locateTargets };
