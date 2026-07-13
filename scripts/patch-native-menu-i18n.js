@@ -300,16 +300,10 @@ function patchSource(source) {
 
 function locateTargets(platform) {
   const platforms = platform === "unix" ? ["mac-arm64", "mac-x64"] : platform ? [platform] : null;
-  const specs = [
-    {
-      dir: "build",
-      pattern: /^main(?:-[A-Za-z0-9_-]+)?\.js$/,
-    },
-    {
-      dir: "assets",
-      pattern: /^electron-menu-shortcuts(?:-[A-Za-z0-9_-]+)?\.js$/,
-    },
-  ];
+  const specs = [{
+    dir: "build",
+    pattern: /^main(?:-[A-Za-z0-9_-]+)?\.js$/,
+  }];
   const targets = [];
   const seen = new Set();
   const addTarget = (target) => {
@@ -325,6 +319,18 @@ function locateTargets(platform) {
         })) {
         addTarget(target);
       }
+    }
+  }
+
+  // electron-menu-shortcuts was a legacy optional renderer bundle. Newer
+  // builds folded/removed it, so absence is not a localization failure and
+  // should not be reported by locateBundles as a warning.
+  for (const plat of platforms ?? ["mac-arm64", "mac-x64", "win"]) {
+    const assetsDir = path.join(__dirname, "..", "src", plat, "_asar", "webview", "assets");
+    if (!fs.existsSync(assetsDir)) continue;
+    for (const name of fs.readdirSync(assetsDir)) {
+      if (!/^electron-menu-shortcuts(?:-[A-Za-z0-9_-]+)?\.js$/.test(name)) continue;
+      addTarget({ platform: plat, path: path.join(assetsDir, name) });
     }
   }
 
@@ -405,4 +411,6 @@ function main() {
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { patchSource, locateTargets };

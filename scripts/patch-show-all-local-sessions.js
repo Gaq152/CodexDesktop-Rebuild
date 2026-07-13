@@ -1,72 +1,127 @@
 #!/usr/bin/env node
 /**
- * patch-show-all-local-sessions.js - Keep local history visible across auth/provider changes.
+ * Keep local history visible across auth/provider changes.
  *
- * Upstream treats local threads whose hostId no longer matches the current
- * primary host as remote/foreign, then hides them unless that host is an
- * enabled remote project. For local desktop rebuilds, those are still local
- * unarchived sessions, so unknown non-primary hostIds are folded back into the
- * primary local host for sidebar grouping.
+ * Upstream can classify a local thread from an older host as remote/foreign.
+ * Normalize unknown host ids back to the current local host while preserving
+ * explicitly enabled remote hosts/projects.
  */
 const fs = require("fs");
-const { locateBundles, relPath } = require("./patch-util");
+const path = require("path");
+const { relPath, SRC_DIR } = require("./patch-util");
 
-function patchProjectGroups(bundles) {
-  let patched = 0;
+const LOCAL_HOST_MARKER = "/* CodexRebuildLocalSessionHost */";
+const ROOT_HOST_MARKER = "/* CodexRebuildWorkspaceRootHost */";
 
-  for (const bundle of bundles) {
-    let code = fs.readFileSync(bundle.path, "utf-8");
-    let changed = false;
+const LOCAL_HOST_PATTERN =
+  /let ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.hostId==null\|\|([A-Za-z_$][\w$]*)\(\2\.hostId\)\?([A-Za-z_$][\w$]*):\2\.hostId,([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\?\.threadProjectAssignments\?\.\[\2\.conversationId\]/g;
+const ROOT_HOST_PATTERN =
+  /let ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.hostId==null\|\|([A-Za-z_$][\w$]*)\(\2\.hostId\)\?([A-Za-z_$][\w$]*):\2\.hostId,([A-Za-z_$][\w$]*)=\2\.cwd;if\(!\5\|\|\1!==\4&&!([A-Za-z_$][\w$]*)\.has\(\1\)\)continue;/g;
 
-    const oldLocalHost =
-      "let d=e.hostId==null||l(e.hostId)?c:e.hostId,p=u?.threadProjectAssignments?.[e.conversationId]";
-    const newLocalHost =
-      "let d=e.hostId==null||l(e.hostId)||!(u?.enabledRemoteHostIds?.has(e.hostId)||u?.remoteProjects?.some(t=>t.hostId===e.hostId))?c:e.hostId,p=u?.threadProjectAssignments?.[e.conversationId]";
+function countOccurrences(source, needle) {
+  return source.split(needle).length - 1;
+}
 
-    if (code.includes(oldLocalHost)) {
-      code = code.replace(oldLocalHost, newLocalHost);
-      changed = true;
-    } else if (!code.includes(newLocalHost)) {
-      console.log(`  [!] ${relPath(bundle.path)}: local thread host normalization not found`);
-      continue;
-    }
-
-    const oldRootHost =
-      "let e=n.hostId==null||l(n.hostId)?t:n.hostId,r=n.cwd;if(!r||e!==t&&!a.has(e))continue;";
-    const newRootHost =
-      "let e=n.hostId==null||l(n.hostId)||!a.has(n.hostId)?t:n.hostId,r=n.cwd;if(!r||e!==t&&!a.has(e))continue;";
-
-    if (code.includes(oldRootHost)) {
-      code = code.replace(oldRootHost, newRootHost);
-      changed = true;
-    } else if (!code.includes(newRootHost)) {
-      console.log(`  [!] ${relPath(bundle.path)}: workspace root host normalization not found`);
-      continue;
-    }
-
-    if (changed) {
-      fs.writeFileSync(bundle.path, code);
-      console.log(`  [ok] ${relPath(bundle.path)}: patched local session visibility`);
-      patched++;
-    } else {
-      console.log(`  [ok] ${relPath(bundle.path)}: local session visibility already patched`);
-    }
+function patchProjectGroupSource(source) {
+  const localMatches = [...source.matchAll(LOCAL_HOST_PATTERN)];
+  const rootMatches = [...source.matchAll(ROOT_HOST_PATTERN)];
+  const localAlready = countOccurrences(source, LOCAL_HOST_MARKER);
+  const rootAlready = countOccurrences(source, ROOT_HOST_MARKER);
+  if (localMatches.length + localAlready !== 1) {
+    throw new Error(
+      `local session host normalization expected exactly 1 target, found ${localMatches.length + localAlready}`,
+    );
+  }
+  if (rootMatches.length + rootAlready !== 1) {
+    throw new Error(
+      `workspace root host normalization expected exactly 1 target, found ${rootMatches.length + rootAlready}`,
+    );
   }
 
-  return patched;
+  let code = source;
+  if (localMatches.length === 1) {
+    code = code.replace(LOCAL_HOST_PATTERN, (_match, host, thread, isLocal, primary, assignment, options) =>
+      `let ${host}=${thread}.hostId==null||${isLocal}(${thread}.hostId)||!(${options}?.enabledRemoteHostIds?.has(${thread}.hostId)||${options}?.remoteProjects?.some(t=>t.hostId===${thread}.hostId))${LOCAL_HOST_MARKER}?${primary}:${thread}.hostId,${assignment}=${options}?.threadProjectAssignments?.[${thread}.conversationId]`,
+    );
+  }
+  if (rootMatches.length === 1) {
+    code = code.replace(ROOT_HOST_PATTERN, (_match, host, thread, isLocal, primary, cwd, remoteHosts) =>
+      `let ${host}=${thread}.hostId==null||${isLocal}(${thread}.hostId)||!${remoteHosts}.has(${thread}.hostId)${ROOT_HOST_MARKER}?${primary}:${thread}.hostId,${cwd}=${thread}.cwd;if(!${cwd}||${host}!==${primary}&&!${remoteHosts}.has(${host}))continue;`,
+    );
+  }
+  return {
+    code,
+    status: localMatches.length + rootMatches.length > 0 ? "patched" : "already",
+    counts: {
+      local: localMatches.length + localAlready,
+      root: rootMatches.length + rootAlready,
+    },
+  };
+}
+
+function locatePlatformCandidates(platform) {
+  const assetsDir = path.join(SRC_DIR, platform, "_asar", "webview", "assets");
+  if (!fs.existsSync(assetsDir)) return [];
+  const candidates = [];
+  for (const fileName of fs.readdirSync(assetsDir)) {
+    if (!fileName.endsWith(".js")) continue;
+    const filePath = path.join(assetsDir, fileName);
+    const source = fs.readFileSync(filePath, "utf8");
+    if (
+      source.includes("threadProjectAssignments") &&
+      (source.includes("enabledRemoteHostIds") || source.includes(LOCAL_HOST_MARKER)) &&
+      (ROOT_HOST_PATTERN.test(source) || source.includes(ROOT_HOST_MARKER))
+    ) {
+      ROOT_HOST_PATTERN.lastIndex = 0;
+      candidates.push({ platform, path: filePath, source });
+    }
+    ROOT_HOST_PATTERN.lastIndex = 0;
+  }
+  return candidates;
+}
+
+function planPlatforms(platforms) {
+  const plans = [];
+  for (const platform of platforms) {
+    const candidates = locatePlatformCandidates(platform);
+    if (candidates.length !== 1) {
+      throw new Error(
+        `local session visibility expected exactly 1 structural bundle for ${platform}, found ${candidates.length}`,
+      );
+    }
+    const candidate = candidates[0];
+    plans.push({ ...candidate, result: patchProjectGroupSource(candidate.source) });
+  }
+  return plans;
 }
 
 function main() {
   const args = process.argv.slice(2);
-  const platform = args.find((arg) => ["mac-arm64", "mac-x64", "win"].includes(arg));
-
-  const bundles = locateBundles({
-    dir: "assets",
-    pattern: /^sidebar-project-groups-.*\.js$/,
-    ...(platform ? { platform } : {}),
-  });
-  const count = patchProjectGroups(bundles);
-  console.log(`  [done] project group bundles: ${count}`);
+  const isCheck = args.includes("--check");
+  const selected = args.find((arg) => ["mac-arm64", "mac-x64", "win"].includes(arg));
+  const platforms = selected
+    ? [selected]
+    : ["mac-arm64", "mac-x64", "win"].filter((platform) =>
+        fs.existsSync(path.join(SRC_DIR, platform, "_asar", "webview", "assets")),
+      );
+  const plans = planPlatforms(platforms);
+  for (const plan of plans) {
+    if (!isCheck && plan.result.code !== plan.source) {
+      fs.writeFileSync(plan.path, plan.result.code, "utf8");
+    }
+    console.log(
+      `  [${isCheck ? "check" : plan.result.status}] ${relPath(plan.path)}: local session visibility`,
+    );
+  }
+  console.log(`  [done] project group bundles: ${plans.length}`);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = {
+  LOCAL_HOST_MARKER,
+  ROOT_HOST_MARKER,
+  patchProjectGroupSource,
+  locatePlatformCandidates,
+  planPlatforms,
+};

@@ -19,6 +19,8 @@ const { locateBundles, relPath } = require("./patch-util");
 
 const OLD_COPYRIGHT = "\u00A9 OpenAI"; // (c) OpenAI
 const NEW_COPYRIGHT = "\u00A9 OpenAI \u00B7 Cometix Space"; // (c) OpenAI . Cometix Space
+const OLD_COPYRIGHT_HTML = `<div class="copyright">${OLD_COPYRIGHT}</div>`;
+const NEW_COPYRIGHT_HTML = `<div class="copyright">${NEW_COPYRIGHT}</div>`;
 
 // ──────────────────────────────────────────────
 //  AST walker
@@ -84,7 +86,65 @@ function collectPatches(ast, source) {
       return;
     }
   });
+
+  // Newer desktop builds render the About window from an inline HTML template
+  // instead of setAboutPanelOptions({ copyright: ... }). Keep this target exact
+  // so unrelated OpenAI strings are never rewritten.
+  let htmlOffset = source.indexOf(OLD_COPYRIGHT_HTML);
+  while (htmlOffset !== -1) {
+    patches.push({
+      start: htmlOffset,
+      end: htmlOffset + OLD_COPYRIGHT_HTML.length,
+      replacement: NEW_COPYRIGHT_HTML,
+      original: OLD_COPYRIGHT_HTML,
+    });
+    htmlOffset = source.indexOf(OLD_COPYRIGHT_HTML, htmlOffset + OLD_COPYRIGHT_HTML.length);
+  }
   return patches;
+}
+
+function countPropertyValues(ast, expected) {
+  let count = 0;
+  walk(ast, (node) => {
+    if (node.type !== "Property") return;
+    const keyName =
+      node.key.type === "Identifier"
+        ? node.key.name
+        : node.key.type === "Literal"
+          ? node.key.value
+          : null;
+    if (keyName !== "copyright") return;
+    if (node.value.type === "Literal" && node.value.value === expected) count += 1;
+    if (
+      node.value.type === "TemplateLiteral" &&
+      node.value.expressions.length === 0 &&
+      node.value.quasis.length === 1 &&
+      node.value.quasis[0].value.cooked === expected
+    ) count += 1;
+  });
+  return count;
+}
+
+function patchCopyrightSource(source) {
+  const ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  const patches = collectPatches(ast, source);
+  const alreadyCount =
+    countPropertyValues(ast, NEW_COPYRIGHT) +
+    (source.split(NEW_COPYRIGHT_HTML).length - 1);
+  if (patches.length + alreadyCount !== 1) {
+    throw new Error(
+      `copyright expected exactly 1 recognized target, found ${patches.length + alreadyCount}`,
+    );
+  }
+  let code = source;
+  for (const patch of [...patches].sort((a, b) => b.start - a.start)) {
+    code = code.slice(0, patch.start) + patch.replacement + code.slice(patch.end);
+  }
+  return {
+    code,
+    status: patches.length === 1 ? "patched" : "already",
+    patches,
+  };
 }
 
 // ──────────────────────────────────────────────
@@ -113,18 +173,13 @@ function main() {
     console.log(`   size: ${(source.length / 1024 / 1024).toFixed(1)} MB`);
 
     const t0 = Date.now();
-    const ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+    const result = patchCopyrightSource(source);
     console.log(`   parse: ${Date.now() - t0}ms`);
 
-    const patches = collectPatches(ast, source);
+    const patches = result.patches;
 
-    if (patches.length === 0) {
-      // Check if already patched
-      if (source.includes(NEW_COPYRIGHT)) {
-        console.log("   [ok] Already patched");
-      } else {
-        console.log("   [!] No copyright property matched");
-      }
+    if (result.status === "already") {
+      console.log("   [ok] Already patched");
       continue;
     }
 
@@ -136,16 +191,22 @@ function main() {
       continue;
     }
 
-    patches.sort((a, b) => b.start - a.start);
-    let code = source;
     for (const p of patches) {
       console.log(`   * offset ${p.start}: ${p.original} -> ${p.replacement}`);
-      code = code.slice(0, p.start) + p.replacement + code.slice(p.end);
     }
 
-    fs.writeFileSync(bundle.path, code, "utf-8");
+    fs.writeFileSync(bundle.path, result.code, "utf-8");
     console.log(`   [ok] Copyright updated: ${patches.length} replacements`);
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = {
+  OLD_COPYRIGHT,
+  NEW_COPYRIGHT,
+  OLD_COPYRIGHT_HTML,
+  NEW_COPYRIGHT_HTML,
+  collectPatches,
+  patchCopyrightSource,
+};

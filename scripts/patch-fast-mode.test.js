@@ -29,6 +29,8 @@ test("patches the latest fast_mode API-key auth gate exactly once and is idempot
     first.code,
     /\(a\?\.authMethod===`chatgpt`\|\|a\?\.authMethod===`apikey`\)/,
   );
+  assert.match(first.code, /CodexRebuildFastModeModelCapabilityOnly/);
+  assert.doesNotMatch(first.code, /featureRequirements\?\.fast_mode/);
 
   const second = patchFastModeSource(first.code);
   assert.equal(second.status, "already");
@@ -44,6 +46,8 @@ test("patches the latest request-time fast_mode auth gate and remains idempotent
     first.code,
     /if\(\(n!==`chatgpt`&&n!==`apikey`\)\/\* CodexRebuildFastModeRequestAuth \*\/\)return!1/,
   );
+  assert.match(first.code, /return e\.query\.setData\([^)]+\),!0\/\* CodexRebuildFastModeModelCapabilityOnly \*\//);
+  assert.doesNotMatch(first.code, /featureRequirements\?\.fast_mode/);
 
   const second = patchFastModeSource(first.code);
   assert.equal(second.status, "already");
@@ -53,12 +57,12 @@ test("patches the latest request-time fast_mode auth gate and remains idempotent
 
 test("request-time fast_mode authorization still rejects non-OpenAI auth kinds", () => {
   const source =
-    "function T(n){if(n!==`chatgpt`)return!1;return `fast_mode`}";
+    "function T(n,requirements){if(n!==`chatgpt`)return!1;return requirements?.featureRequirements?.fast_mode!==!1}";
   const { code } = patchFastModeSource(source);
   const requestFastMode = Function(`${code};return T`)();
 
-  assert.equal(requestFastMode("chatgpt"), "fast_mode");
-  assert.equal(requestFastMode("apikey"), "fast_mode");
+  assert.equal(requestFastMode("chatgpt", { featureRequirements: { fast_mode: false } }), true);
+  assert.equal(requestFastMode("apikey", { featureRequirements: { fast_mode: false } }), true);
   assert.equal(requestFastMode("amazonBedrock"), false);
   assert.equal(requestFastMode("copilot"), false);
   assert.equal(requestFastMode(null), false);
@@ -104,7 +108,7 @@ test("rejects parse failures and zero or ambiguous fast_mode anchors", () => {
   assert.throws(
     () =>
       patchFastModeSource(
-        "function J(a,b){return `fast_mode`&&(a.authMethod===`chatgpt`||b.authMethod===`chatgpt`)}",
+        "function J(a,b,r){return r.featureRequirements.fast_mode!==!1&&(a.authMethod===`chatgpt`||b.authMethod===`chatgpt`)}",
       ),
     /expected exactly 1.*found 2/i,
   );
@@ -206,6 +210,22 @@ test("macOS matrix locates consolidated structural roles and ignores token decoy
       ],
     );
   }
+});
+
+test("ignores requires_openai_auth-derived fast_mode flags and leaves model capability to built-in options", () => {
+  const source =
+    "function settings(auth,requirements){let allowed=auth===`chatgpt`&&requirements.featureRequirements.fast_mode!==!1;return allowed}";
+  const { code } = patchFastModeSource(source);
+  const settings = Function(`${code};return settings`)();
+  const remoteDisabled = { featureRequirements: { fast_mode: false } };
+  assert.equal(settings("chatgpt", remoteDisabled), true);
+  assert.equal(settings("apikey", remoteDisabled), true);
+
+  const visible = (allowed, model) =>
+    allowed && model.serviceTierOptions.some((option) => option.iconKind === "fast");
+  assert.equal(visible(true, { serviceTierOptions: [{ iconKind: "fast" }] }), true);
+  assert.equal(visible(true, { serviceTierOptions: [{ iconKind: "standard" }] }), false);
+  assert.doesNotMatch(code, /gpt-?5|mini/i, "model names must remain owned by the built-in catalog");
 });
 
 test("macOS supports settings and request roles consolidated into one bundle", () => {

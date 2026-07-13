@@ -36,6 +36,35 @@ npm run build:all
 npm run dev
 ```
 
+## Windows updater
+
+Windows full-package downloads are written to `packages/<file>.partial` and
+resume with HTTP Range after a network failure or app restart. The completed
+package is checked against the size and SHA1 from `RELEASES` before Squirrel is
+allowed to install it.
+
+The update popup also provides an optional acceleration-prefix field. Values
+entered there are saved locally, may contain multiple HTTP(S) prefixes separated
+by commas or semicolons, and are tried before the direct GitHub URL for that
+download. Leave the field empty to use the automatic GitHub-direct-then-proxy
+strategy below.
+
+Environment overrides remain available for deployment:
+
+```powershell
+# Use a trusted mirror as the complete update feed
+$env:CODEX_REBUILD_UPDATE_URL = "https://mirror.example/windows-update-feed"
+
+# Override proxy prefixes; use an empty value to disable proxy fallback
+$env:CODEX_REBUILD_UPDATE_PROXY_PREFIXES = "https://ghfast.top/;https://gh-proxy.com/"
+
+# Try configured proxies before the direct GitHub URL
+$env:CODEX_REBUILD_UPDATE_PROXY_FIRST = "1"
+```
+
+Proxy downloads are never trusted by transport alone: package size and SHA1
+must still match the direct `RELEASES` manifest.
+
 ## Project Structure
 
 ```

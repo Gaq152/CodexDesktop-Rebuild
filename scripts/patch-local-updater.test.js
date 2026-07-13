@@ -6,6 +6,8 @@ const path = require("path");
 const test = require("node:test");
 const vm = require("vm");
 const { EventEmitter } = require("events");
+const crypto = require("crypto");
+const http = require("http");
 
 function withRealQuotedKeys(source) {
   return source
@@ -26,6 +28,11 @@ const {
   patchPackageMetadataSource,
   planLocalUpdaterSources,
   executeLocalUpdater,
+  DEFAULT_WINDOWS_UPDATE_PROXY_PREFIXES,
+  normalizeUpdateProxyPrefixes,
+  validateUpdateProxyPrefixes,
+  buildPackageDownloadUrls,
+  parseReleaseManifestEntries,
 } = require("./patch-local-updater");
 
 const LATEST_LOCAL_MAIN_SOURCE =
@@ -132,18 +139,25 @@ function snapshotLocalUpdaterTargets(asarRoot, relativePaths) {
   assert.ok(!bootstrap.includes("let preview=kind=>{"));
   assert.ok(
     bootstrap.includes(
-      "globalThis.__CodexRebuildUpdaterCommand={check:()=>checkOnly(!0),download:startDownload,install:installUpdate,clear:clearStatus};",
+      "globalThis.__CodexRebuildUpdaterCommand={check:()=>checkOnly(!0),download:startDownload,retry:options=>",
     ),
   );
   assert.ok(!bootstrap.includes("if(command==='preview')"));
   assert.ok(bootstrap.includes("if(command==='clear')return clearStatus();"));
+  assert.ok(bootstrap.includes("Range:'bytes='+offset+'-'"));
+  assert.ok(bootstrap.includes("package size or SHA1 mismatch"));
+  assert.ok(bootstrap.includes("bytes retained for resume"));
+  assert.ok(bootstrap.includes("CODEX_REBUILD_UPDATE_PROXY_PREFIXES"));
   assert.ok(!bootstrap.includes("99.999.999999"));
 }
 
 {
   const preload = makePreloadPatch();
 
-  assert.ok(preload.includes("downloadUpdate:()=>invoke('download')"));
+  assert.ok(preload.includes("const invoke=(command,options={})=>"));
+  assert.ok(preload.includes("{command,...options}"));
+  assert.ok(preload.includes("downloadUpdate:options=>invoke('download',options)"));
+  assert.ok(preload.includes("retryUpdate:options=>invoke('retry',options)"));
   assert.ok(preload.includes("clearUpdateState:()=>invoke('clear')"));
   assert.ok(preload.includes("e.contextBridge.exposeInMainWorld('codexRebuildUpdater',updaterApi)"));
   assert.ok(!preload.includes("document.createElement('div')"));
@@ -152,6 +166,202 @@ function snapshotLocalUpdaterTargets(asarRoot, relativePaths) {
   assert.ok(!preload.includes("z-index:2147483647"));
   assert.ok(!preload.includes("attachShadow"));
 }
+
+test("builds direct and configurable proxy package URLs deterministically", () => {
+  assert.deepEqual(normalizeUpdateProxyPrefixes(" https://a/ ;https://b/\nhttps://a/ "), [
+    "https://a/",
+    "https://b/",
+  ]);
+  const urls = buildPackageDownloadUrls(
+    "https://github.com/org/repo/releases/download/feed",
+    "Codex-2.0.0-full.nupkg",
+    ["https://ghfast.top/", "https://mirror.invalid/?target={url}"],
+  );
+  assert.equal(
+    urls[0],
+    "https://github.com/org/repo/releases/download/feed/Codex-2.0.0-full.nupkg",
+  );
+  assert.equal(urls[1], `https://ghfast.top/${urls[0]}`);
+  assert.equal(urls[2], `https://mirror.invalid/?target=${urls[0]}`);
+  assert.deepEqual(
+    buildPackageDownloadUrls(
+      "https://github.com/org/repo/releases/download/feed",
+      "Codex-2.0.0-full.nupkg",
+      ["https://custom.invalid/"],
+      true,
+    ),
+    ["https://custom.invalid/" + urls[0], urls[0]],
+  );
+  assert.deepEqual(
+    validateUpdateProxyPrefixes("https://one.invalid/; http://two.invalid/"),
+    ["https://one.invalid/", "http://two.invalid/"],
+  );
+  assert.throws(
+    () => validateUpdateProxyPrefixes("file:///tmp/releases/"),
+    /invalid update proxy prefix/i,
+  );
+  assert.ok(DEFAULT_WINDOWS_UPDATE_PROXY_PREFIXES.length >= 2);
+});
+
+test("preload forwards popup download options to updater IPC", async () => {
+  const requests = [];
+  const context = {
+    e: {
+      contextBridge: {
+        exposeInMainWorld(name, value) {
+          context[name] = value;
+        },
+      },
+      ipcRenderer: {
+        invoke(_channel, request) {
+          requests.push(request);
+          return Promise.resolve(request);
+        },
+        on() {},
+      },
+    },
+  };
+  vm.runInNewContext(makePreloadPatch("e"), context);
+  await context.codexRebuildUpdater.downloadUpdate({
+    proxyPrefix: "https://custom.invalid/",
+  });
+  await context.codexRebuildUpdater.retryUpdate({
+    proxyPrefixes: ["https://one.invalid/", "https://two.invalid/"],
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(requests)),
+    [
+      { command: "download", proxyPrefix: "https://custom.invalid/" },
+      {
+        command: "retry",
+        proxyPrefixes: ["https://one.invalid/", "https://two.invalid/"],
+      },
+    ],
+  );
+});
+
+test("retains RELEASES SHA1 and size for package verification", () => {
+  const sha1 = "a".repeat(40);
+  assert.deepEqual(
+    parseReleaseManifestEntries(`${sha1} Codex-2.0.0-full.nupkg 629145600`),
+    [{ sha1, fileName: "Codex-2.0.0-full.nupkg", size: 629145600 }],
+  );
+  assert.deepEqual(parseReleaseManifestEntries("not-a-sha package.nupkg 12"), []);
+});
+
+test("runtime downloader resumes a partial package with Range and verifies SHA1", async (t) => {
+  const body = Buffer.from("0123456789abcdefghijklmnopqrstuvwxyz");
+  const sha1 = crypto.createHash("sha1").update(body).digest("hex");
+  const fileName = "Codex-2.0.0-full.nupkg";
+  const ranges = [];
+  const packageRequests = [];
+  const server = http.createServer((request, response) => {
+    if (request.url.startsWith("/RELEASES")) {
+      response.end(`${sha1} ${fileName} ${body.length}\n`);
+      return;
+    }
+    if (request.url.startsWith("/proxy/http://")) {
+      packageRequests.push(request.url);
+      response.writeHead(503);
+      response.end("proxy unavailable");
+      return;
+    }
+    if (request.url === `/${fileName}`) {
+      packageRequests.push(request.url);
+      const range = request.headers.range;
+      ranges.push(range ?? null);
+      if (range) {
+        const offset = Number(range.match(/^bytes=(\d+)-$/)?.[1]);
+        response.writeHead(206, {
+          "Content-Range": `bytes ${offset}-${body.length - 1}/${body.length}`,
+          "Content-Length": body.length - offset,
+        });
+        response.end(body.subarray(offset));
+      } else {
+        response.writeHead(200, { "Content-Length": body.length });
+        response.end(body);
+      }
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const updateUrl = `http://127.0.0.1:${server.address().port}`;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "updater-resume-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const appDir = path.join(root, "app-1.0.0");
+  const packagesDir = path.join(root, "packages");
+  fs.mkdirSync(appDir, { recursive: true });
+  fs.mkdirSync(packagesDir, { recursive: true });
+  fs.writeFileSync(path.join(root, "Update.exe"), "fixture");
+  fs.writeFileSync(path.join(packagesDir, `${fileName}.partial`), body.subarray(0, 9));
+
+  const autoUpdater = new EventEmitter();
+  let updaterChecks = 0;
+  autoUpdater.setFeedURL = () => {};
+  autoUpdater.checkForUpdates = () => { updaterChecks += 1; };
+  autoUpdater.quitAndInstall = () => {};
+  const context = {
+    Buffer,
+    URL,
+    clearInterval,
+    clearTimeout,
+    console,
+    globalThis: null,
+    process: {
+      platform: "win32",
+      arch: "x64",
+      argv: ["Codex.exe"],
+      execPath: path.join(appDir, "Codex.exe"),
+      env: {
+        CODEX_REBUILD_UPDATE_URL: updateUrl,
+        CODEX_REBUILD_UPDATE_PROXY_PREFIXES: "",
+      },
+    },
+    require(id) {
+      if (id === "electron") {
+        return {
+          app: {
+            isPackaged: true,
+            getVersion: () => "1.0.0",
+            whenReady: () => Promise.resolve(),
+          },
+          autoUpdater,
+          dialog: {},
+          ipcMain: { handle() {} },
+          BrowserWindow: { getAllWindows: () => [] },
+        };
+      }
+      if (id === "../../package.json") return { codexRebuildWindowsUpdateUrl: updateUrl };
+      return require(id);
+    },
+    setInterval,
+    setTimeout,
+  };
+  context.globalThis = context;
+  vm.runInNewContext(`${makeBootstrapPrefix()}void 0;\n}\n`, context);
+  await new Promise((resolve) => setImmediate(resolve));
+  await context.__CodexRebuildUpdaterCommand.check();
+  await context.__CodexRebuildUpdaterCommand.download({
+    proxyPrefix: "file:///not-allowed/",
+  });
+  assert.match(context.__CodexRebuildUpdaterLastState.error, /invalid update proxy prefix/i);
+  assert.deepEqual(packageRequests, []);
+  await context.__CodexRebuildUpdaterCommand.retry({
+    proxyPrefix: updateUrl + "/proxy/",
+  });
+
+  assert.deepEqual(ranges, ["bytes=9-"]);
+  assert.equal(packageRequests.length, 2);
+  assert.match(packageRequests[0], /^\/proxy\/http:\/\//);
+  assert.equal(packageRequests[1], `/${fileName}`);
+  assert.deepEqual(fs.readFileSync(path.join(packagesDir, fileName)), body);
+  assert.equal(fs.existsSync(path.join(packagesDir, `${fileName}.partial`)), false);
+  assert.equal(updaterChecks, 1);
+  assert.equal(context.__CodexRebuildUpdaterLastState.status, "preparing");
+  assert.equal(context.__CodexRebuildUpdaterLastState.resumedBytes, 9);
+});
 
 {
   const mainMenu = makeMainMenuPatch();
@@ -222,6 +432,10 @@ function snapshotLocalUpdaterTargets(asarRoot, relativePaths) {
   assert.ok(patched.includes("role:'dialog'"));
   assert.ok(patched.includes("'aria-live':'polite'"));
   assert.ok(patched.includes("downloadUpdate"));
+  assert.ok(patched.includes("codexRebuildUpdateProxyPrefix"));
+  assert.ok(patched.includes("加速地址前缀（可选）"));
+  assert.ok(patched.includes("proxyPrefix:p()"));
+  assert.ok(patched.includes("cru-proxy-input"));
   assert.ok(patched.includes("clearUpdateState"));
   assert.ok(patched.includes("if(s==='codex-rebuild-updater-top')"));
   assert.ok(

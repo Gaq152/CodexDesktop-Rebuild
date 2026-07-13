@@ -44,7 +44,7 @@ const MARKERS = [
     id: "fast-mode",
     contract: "fast",
     file: "webview/assets/use-service-tier-settings-fixture.js",
-    text: "const selectedTier = `fast_mode`;",
+    text: "const modelCapabilityOnly = !0/* CodexRebuildFastModeModelCapabilityOnly */;",
   },
   {
     id: "fast-api-key-authorization",
@@ -56,7 +56,7 @@ const MARKERS = [
     id: "fast-request-api-key-authorization",
     contract: "fast",
     file: "webview/assets/read-service-tier-for-request-fixture.js",
-    text: "async function readFast(authMethod, requirements) { if(authMethod !== `chatgpt` && authMethod !== `apikey`/* CodexRebuildFastModeRequestAuth */) return !1; return requirements.featureRequirements.fast_mode !== !1; }",
+    text: "async function readFast(authMethod) { if(authMethod !== `chatgpt` && authMethod !== `apikey`/* CodexRebuildFastModeRequestAuth */) return !1; return !0/* CodexRebuildFastModeModelCapabilityOnly */; }",
   },
   {
     id: "browser-availability",

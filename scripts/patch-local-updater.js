@@ -14,7 +14,12 @@ const { SRC_DIR } = require("./patch-util");
 
 const DEFAULT_WINDOWS_UPDATE_URL =
   "https://github.com/Gaq152/CodexDesktop-Rebuild/releases/download/windows-update-feed";
-const LOCAL_UPDATER_CONTRACT_VERSION = 1;
+const DEFAULT_WINDOWS_UPDATE_PROXY_PREFIXES = [
+  "https://ghfast.top/",
+  "https://gh-proxy.com/",
+  "https://ghproxy.net/",
+];
+const LOCAL_UPDATER_CONTRACT_VERSION = 2;
 const START_MARKER = "/* CodexRebuildLocalUpdater:start */";
 const END_MARKER = "/* CodexRebuildLocalUpdater:end */";
 const FILE_END_MARKER = "/* CodexRebuildLocalUpdater:file-end */";
@@ -35,6 +40,55 @@ const WEBVIEW_MENU_BAR_MESSAGE =
   "{id:`windowsMenuBar.checkUpdates`,defaultMessage:`检查更新`,description:`Label for the update menu in the desktop application menu bar`}";
 const WEBVIEW_MENU_BAR_ITEM =
   `{id:'codex-rebuild-updater-top',message:${WEBVIEW_MENU_BAR_MESSAGE}}`;
+
+function normalizeUpdateProxyPrefixes(value) {
+  const values = Array.isArray(value)
+    ? value
+    : String(value ?? "").split(/[;,\r\n]+/);
+  return [...new Set(values.map((item) => String(item).trim()).filter(Boolean))];
+}
+
+function validateUpdateProxyPrefixes(value) {
+  const prefixes = normalizeUpdateProxyPrefixes(value);
+  if (prefixes.length > 10) {
+    throw new Error("update proxy prefix count exceeds 10");
+  }
+  for (const prefix of prefixes) {
+    if (prefix.length > 2048 || !/^https?:\/\//i.test(prefix)) {
+      throw new Error("invalid update proxy prefix: " + prefix);
+    }
+    try {
+      new URL(prefix);
+    } catch {
+      throw new Error("invalid update proxy prefix: " + prefix);
+    }
+  }
+  return prefixes;
+}
+
+function buildPackageDownloadUrls(updateUrl, fileName, proxyPrefixes = [], proxyFirst = false) {
+  const base = String(updateUrl || "").replace(/\/+$/, "") + "/";
+  const direct = new URL(encodeURIComponent(fileName), base).toString();
+  const proxies = normalizeUpdateProxyPrefixes(proxyPrefixes).map((prefix) =>
+    prefix.includes("{url}")
+      ? prefix.replaceAll("{url}", direct)
+      : prefix.replace(/\/+$/, "") + "/" + direct,
+  );
+  return [...new Set(proxyFirst ? [...proxies, direct] : [direct, ...proxies])];
+}
+
+function parseReleaseManifestEntries(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim().split(/\s+/))
+    .filter((parts) => parts.length >= 3 && /^[a-f0-9]{40}$/i.test(parts[0]))
+    .map(([sha1, fileName, rawSize]) => ({
+      sha1: sha1.toLowerCase(),
+      fileName,
+      size: Number(rawSize),
+    }))
+    .filter((item) => Number.isFinite(item.size) && item.size >= 0);
+}
 
 function layerVersionMarker(layer, version = LOCAL_UPDATER_CONTRACT_VERSION) {
   return `/* CodexRebuildLocalUpdater:${layer}:v${version} */`;
@@ -205,8 +259,8 @@ ${makeSquirrelLifecycleBlock(legacyLifecycle, detachedLifecycle, unboundedLifecy
 function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWindow){
   if(process.platform!==\`win32\`||!app.isPackaged)return;
   if(process.env.CODEX_REBUILD_DISABLE_UPDATES===\`1\`)return;
-  let fs,path,http,https,urlMod;
-  try{fs=require('node:fs'),path=require('node:path'),http=require('node:http'),https=require('node:https'),urlMod=require('node:url')}catch{return}
+  let fs,path,http,https,urlMod,crypto;
+  try{fs=require('node:fs'),path=require('node:path'),http=require('node:http'),https=require('node:https'),urlMod=require('node:url'),crypto=require('node:crypto')}catch{return}
   let appDir=path.dirname(process.execPath);
   let rootDir=path.resolve(appDir,'..');
   let packagesDir=path.join(rootDir,'packages');
@@ -216,6 +270,9 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
   try{metadata=require('../../package.json')}catch{}
   let updateUrl=(process.env.CODEX_REBUILD_UPDATE_URL||metadata.codexRebuildWindowsUpdateUrl||'${DEFAULT_WINDOWS_UPDATE_URL}').trim();
   if(!updateUrl)return;
+  let proxySetting=process.env.CODEX_REBUILD_UPDATE_PROXY_PREFIXES;
+  let proxyPrefixes=(proxySetting!=null?proxySetting:(metadata.codexRebuildWindowsUpdateProxyPrefixes||${JSON.stringify(DEFAULT_WINDOWS_UPDATE_PROXY_PREFIXES)})).toString().split(/[;,\\r\\n]+/).map(value=>value.trim()).filter(Boolean);
+  let proxyFirst=process.env.CODEX_REBUILD_UPDATE_PROXY_FIRST==='1';
   let getInstalledVersion=()=>path.basename(appDir).match(/^app-(.+)$/)?.[1]||app.getVersion?.()||null;
   let compareVersions=(a,b)=>{
     let aa=String(a||'').split(/[^0-9]+/).filter(Boolean).map(Number);
@@ -232,17 +289,19 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     for(let line of String(text||'').split(/\\r?\\n/)){
       let parts=line.trim().split(/\\s+/);
       if(parts.length<3)continue;
-      let fileName=parts[1],size=Number(parts[2]);
+      let sha1=parts[0].toLowerCase(),fileName=parts[1],size=Number(parts[2]);
+      if(!/^[a-f0-9]{40}$/.test(sha1))continue;
       let kind=/-delta\\.nupkg$/i.test(fileName)?'delta':/-full\\.nupkg$/i.test(fileName)?'full':null;
       if(!kind)continue;
       let version=parseReleaseVersion(fileName);
       if(!version||!Number.isFinite(size))continue;
-      let release=byVersion.get(version)||{version,fileName:null,size:null,files:[]};
-      let item={fileName,size,kind};
+      let release=byVersion.get(version)||{version,fileName:null,size:null,sha1:null,files:[]};
+      let item={fileName,size,kind,sha1};
       release.files.push(item);
       if(kind==='full'){
         release.fileName=fileName;
         release.size=size;
+        release.sha1=sha1;
       }
       byVersion.set(version,release);
     }
@@ -291,6 +350,111 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     u.searchParams.set('t',String(Date.now()));
     return u.toString();
   };
+  let normalizeRequestedProxyPrefixes=value=>{
+    let values=Array.isArray(value)?value:String(value??'').split(/[;,\\r\\n]+/);
+    let prefixes=[...new Set(values.map(item=>String(item).trim()).filter(Boolean))];
+    if(prefixes.length>10)throw Error('update proxy prefix count exceeds 10');
+    for(let prefix of prefixes){
+      if(prefix.length>2048||!/^https?:\\/\\//i.test(prefix))throw Error('invalid update proxy prefix: '+prefix);
+      try{new urlMod.URL(prefix)}catch{throw Error('invalid update proxy prefix: '+prefix)}
+    }
+    return prefixes;
+  };
+  let packageUrls=(fileName,requestedPrefixes)=>{
+    let direct=new urlMod.URL(encodeURIComponent(fileName),updateUrl.replace(/\\/+$/,'')+'/').toString();
+    let customPrefixes=normalizeRequestedProxyPrefixes(requestedPrefixes);
+    let activePrefixes=customPrefixes.length>0?customPrefixes:proxyPrefixes;
+    let proxies=activePrefixes.map(prefix=>prefix.includes('{url}')?prefix.split('{url}').join(direct):prefix.replace(/\\/+$/,'')+'/'+direct);
+    return [...new Set(customPrefixes.length>0?[...proxies,direct]:proxyFirst?[...proxies,direct]:[direct,...proxies])];
+  };
+  let sha1File=filePath=>new Promise((resolve,reject)=>{
+    let hash=crypto.createHash('sha1'),input=fs.createReadStream(filePath),digest=null;
+    input.on('data',chunk=>hash.update(chunk));
+    input.on('error',reject);
+    input.on('end',()=>{digest=hash.digest('hex').toLowerCase()});
+    input.on('close',()=>{if(digest!=null)resolve(digest)});
+  });
+  let verifyPackage=async(filePath,item)=>{
+    try{
+      if(fs.statSync(filePath).size!==item.size)return!1;
+      return await sha1File(filePath)===item.sha1;
+    }catch{return!1}
+  };
+  let downloadAttempt=(target,filePath,expectedSize,redirects=0)=>new Promise((resolve,reject)=>{
+    let offset=0;
+    try{offset=fs.existsSync(filePath)?fs.statSync(filePath).size:0}catch{}
+    if(offset>expectedSize){try{fs.rmSync(filePath,{force:!0})}catch{}offset=0}
+    let headers=offset>0?{Range:'bytes='+offset+'-'}:{};
+    let client=target.startsWith('http:')?http:https,settled=!1,req,output=null;
+    let finish=(error,value)=>{if(settled)return;settled=!0;if(error)try{output?.destroy()}catch{}error?reject(error):resolve(value)};
+    req=client.get(target,{headers},res=>{
+      if(res.statusCode>=300&&res.statusCode<400&&res.headers.location&&redirects<5){
+        res.resume();
+        let next=new urlMod.URL(res.headers.location,target).toString();
+        downloadAttempt(next,filePath,expectedSize,redirects+1).then(value=>finish(null,value),finish);
+        return;
+      }
+      if(res.statusCode===416&&offset===expectedSize){res.resume();finish(null,{resumedFrom:offset,source:target});return}
+      let append=res.statusCode===206&&offset>0;
+      if(res.statusCode===206){
+        let match=String(res.headers['content-range']||'').match(/^bytes (\\d+)-/i);
+        if(!match||Number(match[1])!==offset){res.resume();finish(Error('invalid Content-Range'));return}
+      }else if(res.statusCode===200){
+        append=!1;
+        offset=0;
+      }else{
+        res.resume();
+        finish(Error('HTTP '+res.statusCode));
+        return;
+      }
+      output=fs.createWriteStream(filePath,{flags:append?'a':'w'});let received=offset,lastEmit=0;
+      res.on('data',chunk=>{
+        received+=chunk.length;
+        let now=Date.now();
+        if(now-lastEmit>=500){lastEmit=now;state={...state,downloadedBytes:received,elapsedMs:state.downloadStartedAt?now-state.downloadStartedAt:null,downloadSource:target};emit()}
+      });
+      res.on('error',finish);
+      output.on('error',finish);
+      output.on('close',()=>finish(null,{resumedFrom:append?offset:0,source:target}));
+      res.pipe(output);
+    });
+    req.setTimeout(45000,()=>req.destroy(Error('download inactivity timeout')));
+    req.on('error',finish);
+  });
+  let downloadPackage=async(item,requestedProxyPrefixes)=>{
+    fs.mkdirSync(packagesDir,{recursive:!0});
+    let finalPath=path.join(packagesDir,item.fileName),partialPath=finalPath+'.partial';
+    if(await verifyPackage(finalPath,item))return{source:'cache',resumedFrom:item.size};
+    if(fs.existsSync(finalPath))try{fs.rmSync(finalPath,{force:!0})}catch{}
+    let existing=0;
+    try{existing=fs.existsSync(partialPath)?fs.statSync(partialPath).size:0}catch{}
+    if(existing>item.size){try{fs.rmSync(partialPath,{force:!0})}catch{}existing=0}
+    if(existing===item.size&&await verifyPackage(partialPath,item)){
+      if(fs.existsSync(finalPath))fs.rmSync(finalPath,{force:!0});
+      fs.renameSync(partialPath,finalPath);
+      return{source:'partial-cache',resumedFrom:existing};
+    }
+    let errors=[];
+    for(let target of packageUrls(item.fileName,requestedProxyPrefixes)){
+      try{
+        setStatus('downloading',{error:null,activeDownloadFile:item.fileName,activeDownloadSize:item.size,downloadedBytes:existing,resumedBytes:existing,downloadSource:target});
+        let result=await downloadAttempt(target,partialPath,item.size);
+        if(!await verifyPackage(partialPath,item)){
+          try{fs.rmSync(partialPath,{force:!0})}catch{}
+          existing=0;
+          throw Error('package size or SHA1 mismatch');
+        }
+        if(fs.existsSync(finalPath))fs.rmSync(finalPath,{force:!0});
+        fs.renameSync(partialPath,finalPath);
+        return result;
+      }catch(error){
+        try{existing=fs.existsSync(partialPath)?fs.statSync(partialPath).size:0}catch{existing=0}
+        errors.push(target+': '+(error&&error.message?error.message:String(error)));
+        setStatus('downloading',{downloadedBytes:existing,resumedBytes:existing,downloadSource:target});
+      }
+    }
+    throw Error('package download failed; '+existing+' bytes retained for resume; '+errors.join(' | '));
+  };
   let checking=!1,downloading=!1,downloaded=!1,downloadRequested=!1,transientTimer=null,progressTimer=null;
   let state={
     status:'idle',
@@ -304,6 +468,8 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     activeDownloadFile:null,
     activeDownloadSize:null,
     downloadedBytes:null,
+    resumedBytes:null,
+    downloadSource:null,
     downloadStartedAt:null,
     elapsedMs:null,
     lastCheckedAt:null,
@@ -343,8 +509,9 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     if(file){
       try{
         let p=path.join(packagesDir,file);
-        if(fs.existsSync(p)){
-          downloadedBytes=fs.statSync(p).size;
+        let partial=p+'.partial';
+        if(fs.existsSync(partial)||fs.existsSync(p)){
+          downloadedBytes=fs.statSync(fs.existsSync(partial)?partial:p).size;
           let known=state.updateFiles?.find?.(item=>item.fileName===file)?.size;
           if(Number.isFinite(known))activeDownloadSize=known;
         }else if(state.updateVersion&&fs.existsSync(packagesDir)){
@@ -393,6 +560,8 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
           activeDownloadFile:null,
           activeDownloadSize:null,
           downloadedBytes:null,
+          resumedBytes:null,
+          downloadSource:null,
           downloadStartedAt:null,
           elapsedMs:null,
           lastCheckedAt:Date.now(),
@@ -408,6 +577,8 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
           activeDownloadFile:null,
           activeDownloadSize:null,
           downloadedBytes:null,
+          resumedBytes:null,
+          downloadSource:null,
           downloadStartedAt:null,
           elapsedMs:null,
           lastCheckedAt:Date.now(),
@@ -421,22 +592,44 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     }
     return emit();
   };
-  let startDownload=()=>{
+  let startDownload=async(options={})=>{
+    let requestedProxyPrefixes;
+    try{requestedProxyPrefixes=normalizeRequestedProxyPrefixes(options?.proxyPrefixes??options?.proxyPrefix)}catch(e){
+      setStatus('error',{error:e&&e.message?e.message:String(e),lastCheckedAt:Date.now()});
+      return emit();
+    }
     if(downloaded){setStatus('ready');return emit()}
     if(downloading)return emit();
+    if(!state.updateFile||!state.updateSize){
+      await checkOnly(!0);
+      if(state.status!=='available')return emit();
+    }
+    let item=state.updateFiles?.find?.(candidate=>candidate.fileName===state.updateFile);
+    if(!item?.sha1||!Number.isFinite(item.size)){
+      setStatus('error',{error:'RELEASES is missing a valid full-package SHA1 or size'});
+      return emit();
+    }
     downloadRequested=!0;
     checking=!1;
     downloading=!0;
     let started=Date.now();
-    setStatus('downloading',{error:null,downloadStartedAt:started,downloadedBytes:0,elapsedMs:0,version:getInstalledVersion()});
+    let retained=0;
+    try{retained=fs.statSync(path.join(packagesDir,item.fileName+'.partial')).size}catch{}
+    setStatus('downloading',{error:null,downloadStartedAt:started,downloadedBytes:retained,resumedBytes:retained,elapsedMs:0,version:getInstalledVersion(),activeDownloadFile:item.fileName,activeDownloadSize:item.size});
     startProgress();
-    try{autoUpdater.checkForUpdates()}catch(e){
+    try{
+      let result=await downloadPackage(item,requestedProxyPrefixes);
+      setStatus('preparing',{error:null,downloadedBytes:item.size,resumedBytes:result.resumedFrom||retained,downloadSource:result.source});
+      autoUpdater.checkForUpdates();
+    }catch(e){
       downloading=!1;
       downloadRequested=!1;
       stopProgress();
       let message=e&&e.message?e.message:String(e);
       console.warn('[CodexRebuildUpdater] update download failed',message);
-      setStatus('error',{error:message,lastCheckedAt:Date.now()});
+      let resumableBytes=0;
+      try{resumableBytes=fs.statSync(path.join(packagesDir,item.fileName+'.partial')).size}catch{}
+      setStatus('error',{error:message,lastCheckedAt:Date.now(),downloadedBytes:resumableBytes,resumedBytes:resumableBytes});
     }
     return emit();
   };
@@ -449,10 +642,10 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     downloading=!1;
     downloadRequested=!1;
     stopProgress();
-    setStatus('idle',{error:null,updateVersion:null,updateFile:null,updateFiles:null,updateSize:null,activeDownloadFile:null,activeDownloadSize:null,downloadedBytes:null,downloadStartedAt:null,elapsedMs:null});
+    setStatus('idle',{error:null,updateVersion:null,updateFile:null,updateFiles:null,updateSize:null,activeDownloadFile:null,activeDownloadSize:null,downloadedBytes:null,resumedBytes:null,downloadSource:null,downloadStartedAt:null,elapsedMs:null});
     return emit();
   };
-  globalThis.__CodexRebuildUpdaterCommand={check:()=>checkOnly(!0),download:startDownload,install:installUpdate,clear:clearStatus};
+  globalThis.__CodexRebuildUpdaterCommand={check:()=>checkOnly(!0),download:startDownload,retry:options=>state.updateFile?startDownload(options):checkOnly(!0),install:installUpdate,clear:clearStatus};
   try{
     if(ipcMain&&!globalThis.__CodexRebuildUpdaterIpcRegistered){
       globalThis.__CodexRebuildUpdaterIpcRegistered=!0;
@@ -460,7 +653,8 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
         let command=typeof request==='string'?request:request?.command;
         if(command==='get-state')return emit();
         if(command==='check')return checkOnly(!0);
-        if(command==='download')return startDownload();
+        if(command==='download')return startDownload(request);
+        if(command==='retry')return state.updateFile?startDownload(request):checkOnly(!0);
         if(command==='clear')return clearStatus();
         if(command==='install'){
           return installUpdate();
@@ -524,11 +718,12 @@ ${versionLine};(()=>{try{
   const channelState='codex_rebuild:update-state';
   const channelCommand='codex_rebuild:update-command';
   const listeners=new Set;
-  const invoke=command=>${electronAlias}.ipcRenderer.invoke(channelCommand,{command});
+  const invoke=(command,options={})=>${electronAlias}.ipcRenderer.invoke(channelCommand,{command,...options});
   const updaterApi={
     getState:()=>invoke('get-state'),
     checkForUpdates:()=>invoke('check'),
-    downloadUpdate:()=>invoke('download'),
+    downloadUpdate:options=>invoke('download',options),
+    retryUpdate:options=>invoke('retry',options),
     installUpdate:()=>invoke('install'),
     clearUpdateState:()=>invoke('clear'),
     onState:t=>{if(typeof t!=='function')return()=>{};listeners.add(t);return()=>listeners.delete(t)}
@@ -595,7 +790,7 @@ ${versionLine}(()=>{
     if(status==='preparing')return '准备中';
     if(status==='ready')return '重启安装';
     if(status==='no-update')return '已是最新';
-    if(status==='error')return '检查失败';
+    if(status==='error')return state.resumedBytes>0?'下载中断':'检查失败';
     return '检查更新';
   };
   let codexRebuildUpdaterStatusText=state=>{
@@ -606,7 +801,7 @@ ${versionLine}(()=>{
     if(status==='preparing')return '下载完成，正在准备安装';
     if(status==='ready')return '更新已下载，可以重启安装';
     if(status==='no-update')return '当前已是最新版本';
-    if(status==='error')return '检查更新失败';
+    if(status==='error')return state.resumedBytes>0?'下载中断，进度已保留':'检查更新失败';
     return '未检查更新';
   };
   let codexRebuildUpdaterMenuItem=id=>{
@@ -682,7 +877,7 @@ ${versionLine}(()=>{
         {id:'codex-rebuild-updater-action-check',label:'立即检查更新',click:()=>{codexRebuildRunUpdaterCommand('check','checking')}},
         {id:'codex-rebuild-updater-action-download',label:'下载更新',visible:false,click:()=>{codexRebuildRunUpdaterCommand('download','downloading')}},
         {id:'codex-rebuild-updater-action-install',label:'重启安装',visible:false,click:()=>{codexRebuildRunUpdaterCommand('install',null)}},
-        {id:'codex-rebuild-updater-action-retry',label:'重试',visible:false,click:()=>{codexRebuildRunUpdaterCommand('check','checking')}},
+        {id:'codex-rebuild-updater-action-retry',label:'继续下载',visible:false,click:()=>{codexRebuildRunUpdaterCommand('retry','downloading')}},
         {id:'codex-rebuild-updater-action-clear',label:'取消',visible:false,click:()=>{codexRebuildRunUpdaterCommand('clear','idle')}}
       ]}
     ]
@@ -974,11 +1169,23 @@ function inspectUpdaterMainMenuSource(code, { allowLegacy = false } = {}) {
       },
     );
   }
-  const candidate = candidates.find((item) => item.block === range.code);
+  let candidate = candidates.find((item) => item.block === range.code);
+  const versions = updaterVersionSignatures(code);
+  if (
+    !candidate &&
+    allowLegacy &&
+    versions.length === 1 &&
+    versions[0] === layerVersionMarker("main-menu", 1)
+  ) {
+    candidate = {
+      dialect: "structural-v1",
+      version: 1,
+      versionMarker: layerVersionMarker("main-menu", 1),
+    };
+  }
   if (!candidate) {
     throw new Error("Windows main menu canonical block bytes or version do not match");
   }
-  const versions = updaterVersionSignatures(code);
   const expectedVersions = candidate.versionMarker ? [candidate.versionMarker] : [];
   if (
     versions.length !== expectedVersions.length ||
@@ -1056,6 +1263,12 @@ function makeWebviewMenuBarFunctionBody() {
 '.cru-grid{display:grid;gap:6px;margin-top:8px}',
 '.cru-row{display:flex;min-height:22px;align-items:center;justify-content:space-between;gap:14px;color:var(--color-token-text-secondary);font-size:12px}',
 '.cru-row strong{min-width:0;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;color:var(--color-token-text-primary);font-weight:550}',
+'.cru-proxy{display:grid;gap:5px;margin-top:10px;color:var(--color-token-text-secondary);font-size:12px}',
+'.cru-proxy-label{color:var(--color-token-text-primary);font-weight:550}',
+'.cru-proxy-input{-webkit-app-region:no-drag;width:100%;height:30px;box-sizing:border-box;border:1px solid color-mix(in srgb,var(--color-token-border-default) 78%,transparent);border-radius:7px;background:color-mix(in srgb,var(--color-token-foreground) 4%,transparent);color:var(--color-token-text-primary);padding:0 8px;font:400 12px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;outline:none}',
+'.cru-proxy-input::placeholder{color:var(--color-token-text-tertiary)}',
+'.cru-proxy-input:focus{border-color:color-mix(in srgb,var(--color-token-text-primary) 42%,transparent);box-shadow:0 0 0 2px color-mix(in srgb,var(--color-token-text-primary) 10%,transparent)}',
+'.cru-proxy-help{font-size:11px;line-height:1.4;color:var(--color-token-text-tertiary)}',
 '.cru-meter{height:6px;border-radius:999px;background:color-mix(in srgb,var(--color-token-border-default) 46%,transparent);overflow:hidden;margin:10px 0 4px}',
 '.cru-meter span{display:block;height:100%;width:0;border-radius:inherit;background:var(--cru-success);transition:width .18s ease}',
 '.cru-error{margin-top:8px;border:1px solid color-mix(in srgb,var(--cru-error) 42%,transparent);border-radius:8px;background:color-mix(in srgb,var(--cru-error) 9%,transparent);padding:8px;color:var(--color-token-text-primary);font-size:12px;line-height:1.45;word-break:break-word}',
@@ -1075,11 +1288,11 @@ function codexRebuildUpdaterFormatVersion(e){return e?String(e):'-'}
 function codexRebuildUpdaterFormatBytes(e){let t=Number(e);if(!Number.isFinite(t)||t<=0)return'-';let n=['B','KB','MB','GB'],r=t,i=0;for(;r>=1024&&i<n.length-1;)r/=1024,i+=1;let a=i===0?0:r>=100?0:r>=10?1:2;return r.toFixed(a)+' '+n[i]}
 function codexRebuildUpdaterFormatElapsed(e){let t=Number(e);if(!Number.isFinite(t)||t<0)return'-';let n=Math.floor(t/1000),r=Math.floor(n/60),i=n%60;return r>0?r+'分'+String(i).padStart(2,'0')+'秒':i+'秒'}
 function codexRebuildUpdaterMenuBarProgress(e){let t=Number(e?.activeDownloadSize||e?.updateSize),n=Number(e?.downloadedBytes);return!Number.isFinite(t)||t<=0||!Number.isFinite(n)||n<0?null:Math.max(0,Math.min(100,n/t*100))}
-function codexRebuildUpdaterMenuBarLabel(e){let t=e?.status||'idle';if(t==='checking')return'检查中...';if(t==='available')return'有新版本';if(t==='downloading'){let n=codexRebuildUpdaterMenuBarProgress(e);return n==null?'下载中':'下载中 '+Math.floor(n)+'%'}if(t==='preparing')return'准备中';if(t==='ready')return'重启安装';if(t==='no-update')return'已是最新';if(t==='error')return'检查失败';return'检查更新'}
-function codexRebuildUpdaterStatusText(e){let t=e?.status||'idle';if(t==='checking')return'正在检查更新';if(t==='available')return'发现新版本';if(t==='downloading')return'正在下载更新';if(t==='preparing')return'正在准备安装';if(t==='ready')return'更新已下载';if(t==='no-update')return'当前已是最新版本';if(t==='error')return'检查更新失败';return'检查更新'}
-function codexRebuildUpdaterDescription(e){let t=e?.status||'idle';if(t==='checking')return'正在连接更新源，请稍候。';if(t==='available')return'确认后开始下载，下载完成后可重启安装。';if(t==='downloading')return'下载会在后台继续，点击按钮可随时查看进度。';if(t==='preparing')return'下载已完成，正在准备安装包。';if(t==='ready')return'重启 Codex 后会自动完成安装。';if(t==='no-update')return'当前安装版本已经是最新。';if(t==='error')return'请重试，或取消后稍后再检查。';return'点击后立即检查是否有新版本。'}
-function codexRebuildUpdaterBuildPanel(e,t){let n=e||{status:'idle'},r=n.status||'idle',i=codexRebuildUpdaterMenuBarProgress(n),a=i==null?0:Math.floor(i),o=codexRebuildUpdaterStatusText(n),s=codexRebuildUpdaterDescription(n),c=(e,t)=>(0,Zr.jsxs)('div',{className:'cru-row',children:[(0,Zr.jsx)('span',{children:e}),(0,Zr.jsx)('strong',{children:t})]}),l=(e,n,r='')=>(0,Zr.jsx)('button',{type:'button',className:'cru-action '+r,onClick:e=>{e.stopPropagation(),t(n)},children:e}),u=[c('当前版本',codexRebuildUpdaterFormatVersion(n.version||n.appVersion))];n.updateVersion&&u.push(c('新版本',codexRebuildUpdaterFormatVersion(n.updateVersion)));(n.updateSize||n.activeDownloadSize)&&u.push(c('更新包',codexRebuildUpdaterFormatBytes(n.updateSize||n.activeDownloadSize)));(r==='downloading'||r==='preparing')&&u.push(c('已下载',codexRebuildUpdaterFormatBytes(n.downloadedBytes)+' / '+codexRebuildUpdaterFormatBytes(n.activeDownloadSize||n.updateSize)));(r==='downloading'||r==='preparing')&&u.push(c('耗时',codexRebuildUpdaterFormatElapsed(n.elapsedMs)));let d=[];r==='idle'&&d.push(l('立即检查','check','primary'));r==='available'&&d.push(l('下载更新','download','primary'),l('稍后','close'));r==='ready'&&d.push(l('重启安装','install','primary'),l('稍后','close'));r==='error'&&d.push(l('重试','retry','primary'),l('取消','clear','danger'));(r==='checking'||r==='downloading'||r==='preparing'||r==='no-update')&&d.push(l('收起','close'));let f=(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'});return(0,Zr.jsxs)('div',{className:'cru-popover '+r,role:'dialog','aria-label':'更新状态',onPointerDown:e=>e.stopPropagation(),children:[(0,Zr.jsx)('div',{className:'cru-live','aria-live':'polite',children:o}),(0,Zr.jsxs)('div',{className:'cru-head',children:[(0,Zr.jsx)('div',{className:'cru-badge','aria-hidden':'true',children:f}),(0,Zr.jsxs)('div',{children:[(0,Zr.jsx)('div',{className:'cru-title',children:o}),(0,Zr.jsx)('p',{className:'cru-body',children:s})]})]}),(r==='downloading'||r==='preparing')&&(0,Zr.jsx)('div',{className:'cru-meter','aria-label':'下载进度 '+a+'%',children:(0,Zr.jsx)('span',{style:{width:a+'%'}})}),(0,Zr.jsx)('div',{className:'cru-grid',children:u}),r==='error'&&(0,Zr.jsx)('div',{className:'cru-error',role:'alert',children:n.error||'未知错误'}),(0,Zr.jsx)('div',{className:'cru-actions',children:d})]})}
-function Yr(){let e=D(),[t,n]=(0,Xr.useState)(null),[r,i]=(0,Xr.useState)({status:'idle'}),[a,o]=(0,Xr.useState)(false),s=(0,Xr.useRef)(0),c=(0,Xr.useRef)(null);(0,Xr.useEffect)(()=>{codexRebuildUpdaterEnsureTitlebarStyle();let e=window.codexRebuildUpdater;if(!e)return;let t=e=>{i(e||{status:'idle'})};e.getState?.().then(t).catch(()=>{});let n=e.onState?.(t);return typeof n==='function'?n:void 0},[]),(0,Xr.useEffect)(()=>{if(!a)return;let e=e=>{c.current?.contains?.(e.target)||o(!1)},t=e=>{e.key==='Escape'&&o(!1)};return document.addEventListener('pointerdown',e,!0),document.addEventListener('keydown',t,!0),()=>{document.removeEventListener('pointerdown',e,!0),document.removeEventListener('keydown',t,!0)}},[a]);if(!qr())return null;let l=async(e,t)=>{let r=window.electronBridge?.showApplicationMenu;if(!r)return;let i=s.current+1;s.current=i,n(e);let a=t.currentTarget.getBoundingClientRect();try{await r(e,Math.round(a.left),Math.round(a.bottom))}finally{s.current===i&&n(null)}},u=(e,t={})=>i(n=>({...n,...t,status:e})),d=e=>{let t=window.codexRebuildUpdater;if(e==='close'){o(!1);return}if(e==='clear'){o(!1),t?.clearUpdateState?.().then(i).catch(()=>{});return}if(e==='check'||e==='retry'){o(!0),u('checking',{error:null}),t?.checkForUpdates?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='download'){o(!0),u('downloading',{error:null,downloadedBytes:0,elapsedMs:0}),t?.downloadUpdate?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='install'){t?.installUpdate?.().catch(e=>u('error',{error:e&&e.message?e.message:String(e)}))}},f=e=>{let t=r?.status||'idle';if(t==='idle'){d('check');return}o(e=>!e)},p=codexRebuildUpdaterMenuBarLabel(r),m=codexRebuildUpdaterMenuBarProgress(r),h=m==null?0:Math.floor(m);return(0,Zr.jsx)('div',{className:'flex items-center gap-0.5 pr-2 pl-1',children:$r.map(({id:s,message:u})=>{if(s==='${WEBVIEW_UPDATER_MENU_ID}')return(0,Zr.jsxs)('div',{ref:c,className:'cru-anchor',children:[(0,Zr.jsxs)('button',{type:'button','aria-expanded':a,'aria-haspopup':'dialog','aria-label':p,className:'cru-trigger '+(r?.status||'idle')+(a?' open':''),style:{'--cru-progress':h+'%'},onClick:f,children:[(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'}),(0,Zr.jsx)('span',{className:'cru-label',children:p})]}),a&&codexRebuildUpdaterBuildPanel(r,d)]},s);return(0,Zr.jsx)('button',{type:'button','aria-expanded':t===s,'aria-haspopup':'menu','aria-label':e.formatMessage(u),className:M('no-drag rounded-md border border-transparent px-2.5 py-1 text-base font-normal leading-none outline-none transition-colors',t===s?'bg-[var(--color-token-menubar-selection-background)] text-[var(--color-token-menubar-selection-foreground)]':'text-token-text-tertiary hover:bg-token-foreground/5 hover:text-token-description-foreground focus-visible:bg-token-foreground/5 focus-visible:text-token-description-foreground'),onClick:e=>{l(s,e)},children:(0,Zr.jsx)(w,{...u})},s)})})}`;
+function codexRebuildUpdaterMenuBarLabel(e){let t=e?.status||'idle';if(t==='checking')return'检查中...';if(t==='available')return'有新版本';if(t==='downloading'){let n=codexRebuildUpdaterMenuBarProgress(e);return n==null?'下载中':'下载中 '+Math.floor(n)+'%'}if(t==='preparing')return'准备中';if(t==='ready')return'重启安装';if(t==='no-update')return'已是最新';if(t==='error')return e?.resumedBytes>0?'下载中断':'检查失败';return'检查更新'}
+function codexRebuildUpdaterStatusText(e){let t=e?.status||'idle';if(t==='checking')return'正在检查更新';if(t==='available')return'发现新版本';if(t==='downloading')return e?.resumedBytes>0?'正在续传更新':'正在下载更新';if(t==='preparing')return'正在校验并准备安装';if(t==='ready')return'更新已下载';if(t==='no-update')return'当前已是最新版本';if(t==='error')return e?.resumedBytes>0?'下载中断，进度已保留':'检查更新失败';return'检查更新'}
+function codexRebuildUpdaterDescription(e){let t=e?.status||'idle';if(t==='checking')return'正在连接更新源，请稍候。';if(t==='available')return'确认后开始下载，下载完成后可重启安装。';if(t==='downloading')return e?.resumedBytes>0?'将从已保留的进度继续下载。':'下载会在后台继续，点击按钮可随时查看进度。';if(t==='preparing')return'下载已完成，正在校验安装包。';if(t==='ready')return'重启 Codex 后会自动完成安装。';if(t==='no-update')return'当前安装版本已经是最新。';if(t==='error')return e?.resumedBytes>0?'点击继续下载，不会从头开始。':'请重试，或取消后稍后再检查。';return'点击后立即检查是否有新版本。'}
+function codexRebuildUpdaterBuildPanel(e,t){let n=e||{status:'idle'},r=n.status||'idle',i=codexRebuildUpdaterMenuBarProgress(n),a=i==null?0:Math.floor(i),o=codexRebuildUpdaterStatusText(n),s=codexRebuildUpdaterDescription(n),c=(e,t)=>(0,Zr.jsxs)('div',{className:'cru-row',children:[(0,Zr.jsx)('span',{children:e}),(0,Zr.jsx)('strong',{children:t})]}),p=()=>{try{return window.localStorage?.getItem('codexRebuildUpdateProxyPrefix')||''}catch{return''}},m=e=>{try{window.localStorage?.setItem('codexRebuildUpdateProxyPrefix',e.target.value)}catch{}},l=(e,n,r='')=>(0,Zr.jsx)('button',{type:'button',className:'cru-action '+r,onClick:e=>{e.stopPropagation();if(n==='download'||n==='retry'){let e=window.codexRebuildUpdater,o={proxyPrefix:p()},s=n==='retry'?e?.retryUpdate?.(o):e?.downloadUpdate?.(o);s?.catch?.(()=>{});return}t(n)},children:e}),u=[c('当前版本',codexRebuildUpdaterFormatVersion(n.version||n.appVersion))];n.updateVersion&&u.push(c('新版本',codexRebuildUpdaterFormatVersion(n.updateVersion)));(n.updateSize||n.activeDownloadSize)&&u.push(c('更新包',codexRebuildUpdaterFormatBytes(n.updateSize||n.activeDownloadSize)));(r==='downloading'||r==='preparing')&&u.push(c('已下载',codexRebuildUpdaterFormatBytes(n.downloadedBytes)+' / '+codexRebuildUpdaterFormatBytes(n.activeDownloadSize||n.updateSize)));(r==='downloading'||r==='preparing')&&u.push(c('耗时',codexRebuildUpdaterFormatElapsed(n.elapsedMs)));let d=[];r==='idle'&&d.push(l('立即检查','check','primary'));r==='available'&&d.push(l('下载更新','download','primary'),l('稍后','close'));r==='ready'&&d.push(l('重启安装','install','primary'),l('稍后','close'));r==='error'&&d.push(l(n.resumedBytes>0?'继续下载':'重试','retry','primary'),l('取消','clear','danger'));(r==='checking'||r==='downloading'||r==='preparing'||r==='no-update')&&d.push(l('收起','close'));let f=(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'}),h=(r==='available'||r==='error'&&n.updateFile)&&(0,Zr.jsxs)('label',{className:'cru-proxy',children:[(0,Zr.jsx)('span',{className:'cru-proxy-label',children:'加速地址前缀（可选）'}),(0,Zr.jsx)('input',{type:'text',className:'cru-proxy-input',defaultValue:p(),placeholder:'https://ghfast.top/',onChange:m,'aria-label':'加速地址前缀'}),(0,Zr.jsx)('span',{className:'cru-proxy-help',children:'可填多个，使用分号或逗号分隔；留空自动选择线路。'})]});return(0,Zr.jsxs)('div',{className:'cru-popover '+r,role:'dialog','aria-label':'更新状态',onPointerDown:e=>e.stopPropagation(),children:[(0,Zr.jsx)('div',{className:'cru-live','aria-live':'polite',children:o}),(0,Zr.jsxs)('div',{className:'cru-head',children:[(0,Zr.jsx)('div',{className:'cru-badge','aria-hidden':'true',children:f}),(0,Zr.jsxs)('div',{children:[(0,Zr.jsx)('div',{className:'cru-title',children:o}),(0,Zr.jsx)('p',{className:'cru-body',children:s})]})]}),(r==='downloading'||r==='preparing')&&(0,Zr.jsx)('div',{className:'cru-meter','aria-label':'下载进度 '+a+'%',children:(0,Zr.jsx)('span',{style:{width:a+'%'}})}),(0,Zr.jsx)('div',{className:'cru-grid',children:u}),h,r==='error'&&(0,Zr.jsx)('div',{className:'cru-error',role:'alert',children:n.error||'未知错误'}),(0,Zr.jsx)('div',{className:'cru-actions',children:d})]})}
+function Yr(){let e=D(),[t,n]=(0,Xr.useState)(null),[r,i]=(0,Xr.useState)({status:'idle'}),[a,o]=(0,Xr.useState)(false),s=(0,Xr.useRef)(0),c=(0,Xr.useRef)(null);(0,Xr.useEffect)(()=>{codexRebuildUpdaterEnsureTitlebarStyle();let e=window.codexRebuildUpdater;if(!e)return;let t=e=>{i(e||{status:'idle'})};e.getState?.().then(t).catch(()=>{});let n=e.onState?.(t);return typeof n==='function'?n:void 0},[]),(0,Xr.useEffect)(()=>{if(!a)return;let e=e=>{c.current?.contains?.(e.target)||o(!1)},t=e=>{e.key==='Escape'&&o(!1)};return document.addEventListener('pointerdown',e,!0),document.addEventListener('keydown',t,!0),()=>{document.removeEventListener('pointerdown',e,!0),document.removeEventListener('keydown',t,!0)}},[a]);if(!qr())return null;let l=async(e,t)=>{let r=window.electronBridge?.showApplicationMenu;if(!r)return;let i=s.current+1;s.current=i,n(e);let a=t.currentTarget.getBoundingClientRect();try{await r(e,Math.round(a.left),Math.round(a.bottom))}finally{s.current===i&&n(null)}},u=(e,t={})=>i(n=>({...n,...t,status:e})),d=e=>{let t=window.codexRebuildUpdater;if(e==='close'){o(!1);return}if(e==='clear'){o(!1),t?.clearUpdateState?.().then(i).catch(()=>{});return}if(e==='check'){o(!0),u('checking',{error:null}),t?.checkForUpdates?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='retry'){o(!0),u('downloading',{error:null}),t?.retryUpdate?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='download'){o(!0),u('downloading',{error:null,downloadedBytes:r?.downloadedBytes||0,elapsedMs:0}),t?.downloadUpdate?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='install'){t?.installUpdate?.().catch(e=>u('error',{error:e&&e.message?e.message:String(e)}))}},f=e=>{let t=r?.status||'idle';if(t==='idle'){d('check');return}o(e=>!e)},p=codexRebuildUpdaterMenuBarLabel(r),m=codexRebuildUpdaterMenuBarProgress(r),h=m==null?0:Math.floor(m);return(0,Zr.jsx)('div',{className:'flex items-center gap-0.5 pr-2 pl-1',children:$r.map(({id:s,message:u})=>{if(s==='${WEBVIEW_UPDATER_MENU_ID}')return(0,Zr.jsxs)('div',{ref:c,className:'cru-anchor',children:[(0,Zr.jsxs)('button',{type:'button','aria-expanded':a,'aria-haspopup':'dialog','aria-label':p,className:'cru-trigger '+(r?.status||'idle')+(a?' open':''),style:{'--cru-progress':h+'%'},onClick:f,children:[(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'}),(0,Zr.jsx)('span',{className:'cru-label',children:p})]}),a&&codexRebuildUpdaterBuildPanel(r,d)]},s);return(0,Zr.jsx)('button',{type:'button','aria-expanded':t===s,'aria-haspopup':'menu','aria-label':e.formatMessage(u),className:M('no-drag rounded-md border border-transparent px-2.5 py-1 text-base font-normal leading-none outline-none transition-colors',t===s?'bg-[var(--color-token-menubar-selection-background)] text-[var(--color-token-menubar-selection-foreground)]':'text-token-text-tertiary hover:bg-token-foreground/5 hover:text-token-description-foreground focus-visible:bg-token-foreground/5 focus-visible:text-token-description-foreground'),onClick:e=>{l(s,e)},children:(0,Zr.jsx)(w,{...u})},s)})})}`;
 }
 
 function makeWebviewMenuBarFunctionPatch(version = LOCAL_UPDATER_CONTRACT_VERSION) {
@@ -1567,12 +1780,31 @@ function inspectUpdaterTitlebarSource(code, { allowLegacy = false } = {}) {
   ) {
     throw new Error("Windows webview updater descriptor canonical block is detached");
   }
-  const candidate = candidates.find(
+  let candidate = candidates.find(
     (item) =>
       item.component === componentRange.code &&
       item.descriptor === descriptorRange.code &&
       item.descriptorItem === code.slice(descriptorElement.start, descriptorElement.end),
   );
+  const existingVersions = updaterVersionSignatures(code);
+  if (
+    !candidate &&
+    allowLegacy &&
+    existingVersions.length === 2 &&
+    [
+      layerVersionMarker("titlebar-component", 1),
+      layerVersionMarker("titlebar-descriptor", 1),
+    ].every((marker) => existingVersions.includes(marker))
+  ) {
+    candidate = {
+      dialect: "structural-v1",
+      version: 1,
+      versionMarkers: [
+        layerVersionMarker("titlebar-component", 1),
+        layerVersionMarker("titlebar-descriptor", 1),
+      ],
+    };
+  }
   if (!candidate) {
     const expected = candidates[0];
     throw new Error(
@@ -1581,7 +1813,7 @@ function inspectUpdaterTitlebarSource(code, { allowLegacy = false } = {}) {
         `descriptor diff ${firstDifferenceIndex(descriptorRange.code, expected.descriptor)})`,
     );
   }
-  const versions = updaterVersionSignatures(code);
+  const versions = existingVersions;
   const sortedVersions = [...versions].sort();
   const sortedExpectedVersions = [...candidate.versionMarkers].sort();
   if (
@@ -1916,6 +2148,32 @@ function inspectUpdaterBackendSource(code, { allowLegacy = false } = {}) {
       canonicalSource: `${makeBootstrapPrefix()}${originalSource}${suffix}`,
     };
   }
+  if (allowLegacy) {
+    const versions = updaterVersionSignatures(code);
+    if (
+      versions.length === 1 &&
+      versions[0] === layerVersionMarker("backend", 1)
+    ) {
+      assertBackendProgramAttachment(code);
+      const ast = parseJavaScript(code, "Windows runtime bootstrap", "script");
+      const guardedRuntime = ast.body[2];
+      let originalSource = code.slice(
+        guardedRuntime.consequent.start + 1,
+        guardedRuntime.consequent.end - 1,
+      );
+      if (originalSource.startsWith("\n")) originalSource = originalSource.slice(1);
+      if (originalSource.endsWith("\n")) originalSource = originalSource.slice(0, -1);
+      const canonicalSource = `${makeBootstrapPrefix()}${originalSource}${suffix}`;
+      validateUpdaterBackendSource(canonicalSource);
+      return {
+        layer: "backend",
+        version: 1,
+        dialect: "bounded-v1",
+        originalSource,
+        canonicalSource,
+      };
+    }
+  }
   throw new Error("Windows runtime bootstrap canonical backend postcondition failed");
 }
 
@@ -2064,11 +2322,23 @@ function inspectUpdaterPreloadSource(code, { allowLegacy = false } = {}) {
       },
     );
   }
-  const candidate = candidates.find((item) => item.block === range.code);
+  let candidate = candidates.find((item) => item.block === range.code);
+  const versions = updaterVersionSignatures(code);
+  if (
+    !candidate &&
+    allowLegacy &&
+    versions.length === 1 &&
+    versions[0] === layerVersionMarker("preload", 1)
+  ) {
+    candidate = {
+      dialect: "structural-v1",
+      version: 1,
+      versionMarker: layerVersionMarker("preload", 1),
+    };
+  }
   if (!candidate) {
     throw new Error("Windows preload canonical bridge bytes or version do not match");
   }
-  const versions = updaterVersionSignatures(code);
   const expectedVersions = candidate.versionMarker ? [candidate.versionMarker] : [];
   if (
     versions.length !== expectedVersions.length ||
@@ -2076,7 +2346,10 @@ function inspectUpdaterPreloadSource(code, { allowLegacy = false } = {}) {
   ) {
     throw new Error("Windows preload canonical bridge version is stale or mismatched");
   }
-  if (code !== makePatchedPreloadSource(baseSource, electronAlias, candidate.version)) {
+  if (
+    candidate.dialect !== "structural-v1" &&
+    code !== makePatchedPreloadSource(baseSource, electronAlias, candidate.version)
+  ) {
     throw new Error("Windows preload canonical bridge placement postcondition failed");
   }
   assertPreloadProgramAttachment(code, range, electronAlias);
@@ -2120,7 +2393,11 @@ function patchPreloadCode(code) {
   return { code: next, status: "patched", counts: localLayerCount("patched") };
 }
 
-function patchPackageMetadataSource(packageSource, updateUrl = DEFAULT_WINDOWS_UPDATE_URL) {
+function patchPackageMetadataSource(
+  packageSource,
+  updateUrl = DEFAULT_WINDOWS_UPDATE_URL,
+  proxyPrefixes = DEFAULT_WINDOWS_UPDATE_PROXY_PREFIXES,
+) {
   let metadata;
   try {
     metadata = JSON.parse(packageSource);
@@ -2129,10 +2406,16 @@ function patchPackageMetadataSource(packageSource, updateUrl = DEFAULT_WINDOWS_U
   }
   const normalizedUrl = String(updateUrl || "").trim();
   if (!normalizedUrl) throw new Error("Windows update URL is empty");
-  if (metadata.codexRebuildWindowsUpdateUrl === normalizedUrl) {
+  const normalizedProxies = normalizeUpdateProxyPrefixes(proxyPrefixes);
+  if (
+    metadata.codexRebuildWindowsUpdateUrl === normalizedUrl &&
+    JSON.stringify(metadata.codexRebuildWindowsUpdateProxyPrefixes) ===
+      JSON.stringify(normalizedProxies)
+  ) {
     return { code: packageSource, status: "already", counts: localLayerCount("already") };
   }
   metadata.codexRebuildWindowsUpdateUrl = normalizedUrl;
+  metadata.codexRebuildWindowsUpdateProxyPrefixes = normalizedProxies;
   return {
     code: JSON.stringify(metadata, null, 2) + "\n",
     status: "patched",
@@ -2150,12 +2433,23 @@ function inspectUpdaterMetadataSource(packageSource, expectedUpdateUrl) {
   const updateUrl = String(metadata?.codexRebuildWindowsUpdateUrl || "").trim();
   if (!updateUrl) throw new Error("Windows package metadata updater URL is missing");
   if (
+    !Array.isArray(metadata.codexRebuildWindowsUpdateProxyPrefixes) ||
+    metadata.codexRebuildWindowsUpdateProxyPrefixes.some(
+      (prefix) => typeof prefix !== "string" || !prefix.trim(),
+    )
+  ) throw new Error("Windows package metadata updater proxy prefixes are invalid");
+  if (
     expectedUpdateUrl !== undefined &&
     updateUrl !== String(expectedUpdateUrl || "").trim()
   ) {
     throw new Error("Windows package metadata updater URL does not match the planned URL");
   }
-  return { layer: "metadata", version: LOCAL_UPDATER_CONTRACT_VERSION, updateUrl };
+  return {
+    layer: "metadata",
+    version: LOCAL_UPDATER_CONTRACT_VERSION,
+    updateUrl,
+    proxyPrefixes: metadata.codexRebuildWindowsUpdateProxyPrefixes,
+  };
 }
 
 function normalizeUpdaterFiles(files) {
@@ -2508,6 +2802,11 @@ if (require.main === module) main();
 
 module.exports = {
   LOCAL_UPDATER_CONTRACT_VERSION,
+  DEFAULT_WINDOWS_UPDATE_PROXY_PREFIXES,
+  normalizeUpdateProxyPrefixes,
+  validateUpdateProxyPrefixes,
+  buildPackageDownloadUrls,
+  parseReleaseManifestEntries,
   makeBootstrapPrefix,
   makePreloadPatch,
   makeMainMenuPatch,

@@ -1,22 +1,11 @@
 #!/usr/bin/env node
 /**
- * Post-build patch: Force-enable Fast mode (speed selector)
+ * Post-build patch: expose Fast mode according to the selected model.
  *
- * The speed selector and request-time service_tier plumbing are gated by
- * authMethod === "chatgpt" checks. API-key users never see/use it because
- * their auth method differs.
- *
- * This patch handles the old negative gate:
- *   X.authMethod !== "chatgpt"
- * inside functions that also reference "fast_mode", and replaces
- * the comparison with !1 (always false).
- *
- * It also handles the newer positive gate:
- *   X.authMethod === "chatgpt"
- *   authMethod === "chatgpt"
- * inside fast_mode functions, and expands it to also allow "apikey".
- *
- * Target: chunks containing "fast_mode" + "chatgpt".
+ * API-key auth is accepted alongside ChatGPT auth, while the remote
+ * featureRequirements.fast_mode flag (derived from requires_openai_auth) is
+ * removed as an authorization gate. The existing built-in model/service-tier
+ * options remain responsible for whether Fast is shown for a selected model.
  */
 const fs = require("fs");
 const path = require("path");
@@ -29,8 +18,8 @@ const {
 
 const CHATGPT_AUTH = "chatgpt";
 const APIKEY_AUTH = "apikey";
-const ALWAYS_FALSE = "!1";
 const REQUEST_AUTH_MARKER = "/* CodexRebuildFastModeRequestAuth */";
+const MODEL_CAPABILITY_MARKER = "/* CodexRebuildFastModeModelCapabilityOnly */";
 const FAST_MODE_CONTRACT_IDS = [
   "fast_mode_settings_auth_gate",
   "fast_mode_request_auth_gate",
@@ -211,7 +200,9 @@ function collectPatches(ast, source) {
 
     const fnSrc = sourceFor(source, node);
     if (!fnSrc.includes("fast_mode") || !fnSrc.includes(CHATGPT_AUTH)) return;
+    const patchStartIndex = patches.length;
 
+    let roleId = null;
     walk(node, (child, parent) => {
       if (child.type !== "BinaryExpression") return;
 
@@ -222,9 +213,11 @@ function collectPatches(ast, source) {
         if (isPatchedRequestAuthGate(parent, source)) return;
         const operand = expressionSourceForChatGptSide(child, source);
         if (operand == null) return;
+        roleId = "fast_mode_request_auth_gate";
 
         addPatch(patches, {
-          id: "fast_mode_request_auth_gate",
+          id: roleId,
+          targetStart: node.start,
           start: child.start,
           end: child.end,
           replacement:
@@ -239,16 +232,72 @@ function collectPatches(ast, source) {
       if (child.operator === "===") {
         const operand = expressionSourceForChatGptSide(child, source);
         if (operand == null) return;
+        roleId = "fast_mode_settings_auth_gate";
         if (isAlreadyExpandedToApiKey(parent, source, operand)) return;
 
         addPatch(patches, {
-          id: "fast_mode_settings_auth_gate",
+          id: roleId,
+          targetStart: node.start,
           start: child.start,
           end: child.end,
           replacement: `(${childSrc}||${operand}===\`${APIKEY_AUTH}\`)`,
           original: childSrc,
         });
       }
+    });
+
+    if (roleId == null) {
+      // A first-generation patch may already have expanded the auth pair while
+      // leaving the remote featureRequirements.fast_mode gate intact.
+      walkFunctionContract(node, (child) => {
+        if (
+          child.type === "LogicalExpression" &&
+          exactAuthPair(child, source, "||", "===") != null
+        ) roleId = "fast_mode_settings_auth_gate";
+        if (
+          child.type === "IfStatement" &&
+          exactAuthPair(child.test, source, "&&", "!==") != null &&
+          isRejectingConsequent(child.consequent)
+        ) roleId = "fast_mode_request_auth_gate";
+      });
+    }
+    if (roleId == null) return;
+
+    const authPatches = patches
+      .slice(patchStartIndex)
+      .filter((patch) => patch.id === roleId);
+    if (authPatches.length > 1) {
+      throw new Error(
+        `fast_mode ${roleId} auth gate expected exactly 1 target, found ${authPatches.length}`,
+      );
+    }
+
+    const featureGates = [];
+    walkFunctionContract(node, (child) => {
+      if (child.type !== "BinaryExpression" || !sourceFor(source, child).includes("fast_mode")) return;
+      let hasFeatureAccess = false;
+      walk(child, (nested) => {
+        if (isFastModeFeatureAccess(nested)) hasFeatureAccess = true;
+      });
+      if (hasFeatureAccess) featureGates.push(child);
+    });
+    if (featureGates.length === 0) {
+      patches.splice(patchStartIndex);
+      return;
+    }
+    if (featureGates.length !== 1) {
+      throw new Error(
+        `fast_mode ${roleId} capability gate expected exactly 1 target, found ${featureGates.length}`,
+      );
+    }
+    const featureGate = featureGates[0];
+    addPatch(patches, {
+      id: roleId,
+      targetStart: node.start,
+      start: featureGate.start,
+      end: featureGate.end,
+      replacement: `!0${MODEL_CAPABILITY_MARKER}`,
+      original: sourceFor(source, featureGate),
     });
   });
 
@@ -260,7 +309,19 @@ function collectAlreadyPatchedGates(ast, source, comments) {
   walk(ast, (node, parent) => {
     if (!isFunctionNode(node)) return;
     const fnSrc = sourceFor(source, node);
-    if (!fnSrc.includes("fast_mode")) return;
+    if (!fnSrc.includes("CodexRebuildFastModeModelCapabilityOnly")) return;
+    const capabilityComments = comments.filter(
+      (comment) =>
+        comment.start >= node.start &&
+        comment.end <= node.end &&
+        comment.type === "Block" &&
+        comment.value.trim() === "CodexRebuildFastModeModelCapabilityOnly",
+    );
+    let hasFeatureAccess = false;
+    walkFunctionContract(node, (child) => {
+      if (isFastModeFeatureAccess(child)) hasFeatureAccess = true;
+    });
+    if (capabilityComments.length !== 1 || hasFeatureAccess) return;
     walk(node, (child, childParent) => {
       if (
         child.type === "LogicalExpression" &&
@@ -270,6 +331,7 @@ function collectAlreadyPatchedGates(ast, source, comments) {
         if (exactAuthPair(child, source, "||", "===") == null) return;
         addPatch(already, {
           id: "fast_mode_settings_auth_gate",
+          targetStart: node.start,
           start: child.start,
         });
         return;
@@ -282,6 +344,7 @@ function collectAlreadyPatchedGates(ast, source, comments) {
       ) {
         addPatch(already, {
           id: "fast_mode_request_auth_gate",
+          targetStart: node.start,
           start: child.test.start,
         });
       }
@@ -318,6 +381,20 @@ function analyzeFastModeSource(source) {
   ) {
     throw new Error("fast_mode request auth marker postcondition is malformed");
   }
+  const capabilityComments = comments.filter((comment) =>
+    comment.value.includes("CodexRebuildFastModeModelCapabilityOnly"),
+  );
+  const exactCapabilityComments = capabilityComments.filter(
+    (comment) =>
+      comment.type === "Block" &&
+      comment.value.trim() === "CodexRebuildFastModeModelCapabilityOnly",
+  );
+  if (
+    capabilityComments.length !== exactCapabilityComments.length ||
+    exactCapabilityComments.length > FAST_MODE_CONTRACT_IDS.length
+  ) {
+    throw new Error("fast_mode model capability marker postcondition is malformed");
+  }
   let malformedAuthAlternative = false;
   walk(ast, (node, parent) => {
     if (!isFunctionNode(node) || !sourceFor(source, node).includes("fast_mode")) return;
@@ -346,13 +423,19 @@ function analyzeFastModeSource(source) {
   if (malformedAuthAlternative) {
     throw new Error("fast_mode settings auth postcondition has extra alternatives");
   }
-  const total = patches.length + already.length;
+  const patchTargets = new Map(
+    patches.map((target) => [`${target.id}:${target.targetStart}`, target]),
+  );
+  const alreadyTargets = new Map(
+    already.map((target) => [`${target.id}:${target.targetStart}`, target]),
+  );
+  const targets = [...patchTargets.values(), ...alreadyTargets.values()];
+  const total = targets.length;
 
   let code = source;
   for (const patch of [...patches].sort((left, right) => right.start - left.start)) {
     code = code.slice(0, patch.start) + patch.replacement + code.slice(patch.end);
   }
-  const targets = [...patches, ...already];
   const targetCounts = Object.fromEntries(
     FAST_MODE_CONTRACT_IDS.map((id) => [
       id,
@@ -362,7 +445,7 @@ function analyzeFastModeSource(source) {
   return {
     code,
     status: patches.length > 0 ? "patched" : "already",
-    counts: { patchable: patches.length, already: already.length, total },
+    counts: { patchable: patchTargets.size, already: alreadyTargets.size, total },
     patches,
     targetIds: [...new Set(targets.map((target) => target.id))],
     targetCounts,
@@ -478,7 +561,10 @@ function roleMarkerEvidence(source, targetId) {
         hasRoleAuthGate = true;
       }
     });
-    if (hasFastModeFeatureAccess && hasRoleAuthGate) markerCount += 1;
+    const hasCapabilityMarker = sourceFor(source, node).includes(
+      "CodexRebuildFastModeModelCapabilityOnly",
+    );
+    if ((hasFastModeFeatureAccess || hasCapabilityMarker) && hasRoleAuthGate) markerCount += 1;
   });
   return markerCount > 0
     ? [`${targetId}: exact marker count=${markerCount}`]
