@@ -25,12 +25,36 @@ function resolvePrimaryExecutableNameFromManifest(manifestSource) {
   return exeName;
 }
 
+function resolveWindowsMsixVersionFromManifest(manifestSource) {
+  const parsed = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" }).parse(manifestSource);
+  const version = parsed?.Package?.Identity?.Version;
+  if (typeof version !== "string" || !/^\d+\.\d+\.\d+\.\d+$/.test(version)) {
+    throw new Error("AppxManifest.xml does not declare a valid package identity version");
+  }
+  return version;
+}
+
 function getExpectedWindowsMsixVersion() {
   const version = upstreamVersions?.platforms?.Windows?.version;
   if (typeof version !== "string" || version.length === 0) {
     throw new Error("upstream-versions.json does not declare a Windows version");
   }
   return version;
+}
+
+function getPreparedWindowsMsixVersion(cacheDirs) {
+  const versions = new Set();
+  for (const cacheDir of [...new Set(cacheDirs)]) {
+    const manifestPath = path.join(cacheDir, "win-extract", "AppxManifest.xml");
+    if (!fs.existsSync(manifestPath)) continue;
+    versions.add(resolveWindowsMsixVersionFromManifest(fs.readFileSync(manifestPath, "utf8")));
+  }
+  if (versions.size > 1) {
+    throw new Error(
+      `Prepared Windows MSIX manifests disagree on version: ${[...versions].join(", ")}`,
+    );
+  }
+  return versions.size === 1 ? [...versions][0] : getExpectedWindowsMsixVersion();
 }
 
 function assertWindowsMsixVersion(msixPath, expectedVersion = getExpectedWindowsMsixVersion()) {
@@ -71,5 +95,7 @@ module.exports = {
   assertWindowsMsixVersion,
   findCachedWindowsMsix,
   getExpectedWindowsMsixVersion,
+  getPreparedWindowsMsixVersion,
   resolvePrimaryExecutableNameFromManifest,
+  resolveWindowsMsixVersionFromManifest,
 };

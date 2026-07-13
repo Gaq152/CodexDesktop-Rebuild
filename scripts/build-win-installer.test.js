@@ -7,7 +7,11 @@ const vm = require("vm");
 const { createRequire } = require("module");
 const test = require("node:test");
 const ResEdit = require("resedit");
-const { findCachedWindowsMsix } = require("./windows-app-entry");
+const {
+  findCachedWindowsMsix,
+  getPreparedWindowsMsixVersion,
+  resolveWindowsMsixVersionFromManifest,
+} = require("./windows-app-entry");
 
 const source = fs.readFileSync(path.join(__dirname, "build-win-installer.js"), "utf-8");
 const tempAssignmentIndex = source.indexOf("process.env.TEMP = shortTemp");
@@ -58,6 +62,51 @@ test("rejects Appx primary executables outside the app directory", () => {
       `<Package><Applications><Application Executable="tools/ChatGPT.exe" /></Applications></Package>`,
     ),
     /primary executable.*app/i,
+  );
+});
+
+test("resolves the exact freshly synced Windows MSIX identity version", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-msix-manifest-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const manifestDir = path.join(root, "win-extract");
+  fs.mkdirSync(manifestDir, { recursive: true });
+  const manifest =
+    `<Package><Identity Name="OpenAI.Codex" Version="26.707.8479.0" />` +
+    `<Applications /></Package>`;
+  fs.writeFileSync(path.join(manifestDir, "AppxManifest.xml"), manifest);
+
+  assert.equal(resolveWindowsMsixVersionFromManifest(manifest), "26.707.8479.0");
+  assert.equal(getPreparedWindowsMsixVersion([root]), "26.707.8479.0");
+});
+
+test("rejects malformed or conflicting freshly synced Windows versions", (t) => {
+  const first = fs.mkdtempSync(path.join(os.tmpdir(), "codex-msix-manifest-first-"));
+  const second = fs.mkdtempSync(path.join(os.tmpdir(), "codex-msix-manifest-second-"));
+  t.after(() => {
+    fs.rmSync(first, { recursive: true, force: true });
+    fs.rmSync(second, { recursive: true, force: true });
+  });
+  for (const [root, version] of [
+    [first, "26.707.8479.0"],
+    [second, "26.707.8480.0"],
+  ]) {
+    const dir = path.join(root, "win-extract");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "AppxManifest.xml"),
+      `<Package><Identity Version="${version}" /></Package>`,
+    );
+  }
+
+  assert.throws(
+    () => resolveWindowsMsixVersionFromManifest(
+      `<Package><Identity Version="26.707.bad.0" /></Package>`,
+    ),
+    /valid package identity version/i,
+  );
+  assert.throws(
+    () => getPreparedWindowsMsixVersion([first, second]),
+    /manifests disagree.*26\.707\.8479\.0.*26\.707\.8480\.0/i,
   );
 });
 

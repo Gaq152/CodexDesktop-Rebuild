@@ -14,7 +14,7 @@ const { execFileSync } = require("child_process");
 const {
   assertWindowsMsixVersion,
   findCachedWindowsMsix,
-  getExpectedWindowsMsixVersion,
+  getPreparedWindowsMsixVersion,
   resolvePrimaryExecutableNameFromManifest,
 } = require("./windows-app-entry");
 
@@ -131,7 +131,7 @@ function patchExeHash(exePath, oldHash, newHash) {
 
 function stageUpstreamApp(shortWorkspace) {
   const cacheDirs = [INITIAL_TMPDIR, os.tmpdir()].map((dir) => path.join(dir, "codex-sync"));
-  const expectedVersion = getExpectedWindowsMsixVersion();
+  const expectedVersion = getPreparedWindowsMsixVersion(cacheDirs);
   const msixPath = process.env.CODEX_REBUILD_WIN_MSIX
     ? assertWindowsMsixVersion(process.env.CODEX_REBUILD_WIN_MSIX, expectedVersion)
     : findCachedWindowsMsix(cacheDirs, expectedVersion);

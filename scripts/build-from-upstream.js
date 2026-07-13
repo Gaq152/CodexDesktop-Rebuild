@@ -22,7 +22,7 @@ const {
 } = require("./codex-vendor");
 const {
   findCachedWindowsMsix,
-  getExpectedWindowsMsixVersion,
+  getPreparedWindowsMsixVersion,
   resolvePrimaryExecutableNameFromManifest,
 } = require("./windows-app-entry");
 const { resolveMacAppBundle } = require("./mac-app-bundle");
@@ -144,7 +144,10 @@ function buildWin(platform) {
   // Windows: extract the same cached MSIX used by the installer. The shared
   // win-extract directory can be incomplete after interrupted syncs.
   const tempDir = path.join(require("os").tmpdir(), "codex-sync");
-  const msixPath = findCachedWindowsMsix([tempDir], getExpectedWindowsMsixVersion());
+  const msixPath = findCachedWindowsMsix(
+    [tempDir],
+    getPreparedWindowsMsixVersion([tempDir]),
+  );
   const extractDir = path.join(OUT_DIR, ".windows-msix");
   clearDir(extractDir);
   execFileSync("tar", ["-xf", msixPath, "-C", extractDir], { stdio: "inherit" });
