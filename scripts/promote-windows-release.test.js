@@ -72,11 +72,12 @@ test("promotion workflow downloads only the exact Windows artifacts from the sel
   assert.match(workflow, /uses: actions\/checkout@v\d+/);
 
   const downloads = [...workflow.matchAll(/uses: actions\/download-artifact@v7\n\s+with:\n(?<with>[\s\S]*?)(?=\n\s+- name:)/g)];
-  assert.equal(downloads.length, 3, "workflow should have exactly three artifact downloads");
+  assert.equal(downloads.length, 4, "workflow should have exactly four artifact downloads");
   const expectedNames = [
     "Codex-Windows-Installer-x64-${{ inputs.release_version }}",
     "Codex-Windows-Portable-x64-${{ inputs.release_version }}",
     "Codex-Windows-UpdateFeed-x64",
+    "Codex-Windows-Release-Metadata-x64-${{ inputs.release_version }}",
   ];
   for (const [index, expectedName] of expectedNames.entries()) {
     assert.ok(
@@ -107,27 +108,32 @@ test("promotion workflow validates installer portable and full package versions"
     workflow,
     /validate-windows-release-feed\.js --root artifacts\/update-feed --version "\$RELEASE_VERSION"/,
   );
+  assert.match(workflow, /windows-release-metadata\.js/);
+  assert.match(workflow, /--validate-promotion/);
+  assert.match(workflow, /actions\/runs\/\$\{SOURCE_RUN_ID\}/);
+  assert.match(workflow, /configure-windows-release-version\.js/);
 });
 
 test("promotion workflow publishes the exact Windows-only release contract", () => {
   const workflow = readWorkflow();
 
-  assert.match(workflow, /tag_name: v\$\{\{ inputs\.release_version \}\}/);
+  assert.match(workflow, /tag_name: codex-win-\$\{\{ inputs\.release_version \}\}/);
   assert.doesNotMatch(workflow, /tag_name:.*\|\||tag_name:.*mac/i);
-  assert.match(workflow, /name: Codex \$\{\{ inputs\.release_version \}\}/);
+  assert.match(workflow, /name: Codex Win \$\{\{ inputs\.release_version \}\}/);
   assert.match(workflow, /Windows-only/i);
-  assert.match(workflow, /App 26\.707\.31428/);
-  assert.match(workflow, /CLI 0\.144\.1/);
-  assert.match(workflow, /full package.*guaranteed/i);
-  assert.match(workflow, /delta package.*optional.*10-minute/i);
-  assert.match(workflow, /artifacts\/installer\/CodexSetup-win-x64-\$\{\{ inputs\.release_version \}\}\.exe/);
+  assert.match(workflow, /installer executable is inside the ZIP/i);
+  assert.match(workflow, /artifacts\/installer\/CodexSetup-win-x64-\$\{\{ inputs\.release_version \}\}\.zip/);
   assert.match(workflow, /artifacts\/portable\/Codex-win-x64-\$\{\{ inputs\.release_version \}\}\.zip/);
-  assert.match(workflow, /artifacts\/update-feed\/\*\.nupkg/);
-  assert.match(workflow, /artifacts\/update-feed\/RELEASES/);
+  const files = workflow.match(
+    /tag_name: codex-win-[\s\S]*?\n\s+files: \|(?<files>[\s\S]*?)\n\s+fail_on_unmatched_files:/,
+  )?.groups.files || "";
+  assert.doesNotMatch(files, /\.exe|\.nupkg|RELEASES/);
   assert.match(workflow, /make_latest: true/);
+  assert.match(workflow, /gh release upload "\$tag" artifacts\/update-feed\/\*\.nupkg --clobber/);
+  assert.match(workflow, /gh release upload "\$tag" artifacts\/update-feed\/RELEASES --clobber/);
 });
 
-test("promotion workflow reconciles four required Windows assets plus an optional delta", () => {
+test("promotion workflow reconciles exactly the portable and installer ZIP assets", () => {
   const workflow = readWorkflow();
   const step = workflow.match(
     /      - name: Reconcile exact release assets\n(?<body>[\s\S]*?)$/,
@@ -140,14 +146,24 @@ test("promotion workflow reconciles four required Windows assets plus an optiona
   assert.match(step, /cmp -s "\$desired_assets" "\$actual_assets"/);
 
   const expectedAssets = [
-    "CodexSetup-win-x64-${RELEASE_VERSION}.exe",
+    "CodexSetup-win-x64-${RELEASE_VERSION}.zip",
     "Codex-win-x64-${RELEASE_VERSION}.zip",
-    "Codex-${RELEASE_VERSION}-full.nupkg",
-    "RELEASES",
   ];
   for (const asset of expectedAssets) assert.ok(step.includes(`"${asset}"`));
-  assert.match(step, /Codex-\$\{RELEASE_VERSION\}-delta\.nupkg/);
-  assert.match(step, /\[ -f "\$delta_path" \]/);
-  assert.match(step, /printf '%s\\n' "\$\(basename "\$delta_path"\)"/);
-  assert.doesNotMatch(step, /\.dmg|\*\.nupkg|\*\.zip|\*\.exe/i);
+  assert.doesNotMatch(step, /\.dmg|\.nupkg|RELEASES|\.exe|delta_path/i);
+});
+
+test("promotion serializes release state and rejects rollback before publishing", () => {
+  const workflow = readWorkflow();
+  assert.match(
+    workflow,
+    /concurrency:\n\s+group: codex-windows-release-state\n\s+cancel-in-progress: false/,
+  );
+  const validationIndex = workflow.indexOf("name: Validate promotion metadata and monotonic state");
+  const recordIndex = workflow.indexOf("name: Record promoted Windows versions");
+  const releaseIndex = workflow.indexOf("name: Create or update Windows-only release");
+  const feedIndex = workflow.indexOf("name: Publish Windows update feed");
+  assert.ok(validationIndex < recordIndex && recordIndex < releaseIndex && releaseIndex < feedIndex);
+  assert.match(workflow, /remote-releases "\$remote_releases"/);
+  assert.match(workflow, /target_commitish: master/);
 });

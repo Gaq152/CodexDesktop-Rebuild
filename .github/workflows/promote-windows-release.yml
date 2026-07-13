@@ -16,6 +16,14 @@ permissions:
   actions: read
   contents: write
 
+env:
+  WINDOWS_UPDATE_TAG: windows-update-feed
+  WINDOWS_UPDATE_FEED: "https://github.com/Gaq152/CodexDesktop-Rebuild/releases/download/windows-update-feed"
+
+concurrency:
+  group: codex-windows-release-state
+  cancel-in-progress: false
+
 jobs:
   promote:
     name: Promote Windows artifacts
@@ -39,6 +47,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Download Windows installer
         uses: actions/download-artifact@v7
         with:
@@ -60,6 +77,14 @@ jobs:
         with:
           name: Codex-Windows-UpdateFeed-x64
           path: artifacts/update-feed
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download Windows release metadata
+        uses: actions/download-artifact@v7
+        with:
+          name: Codex-Windows-Release-Metadata-x64-${{ inputs.release_version }}
+          path: artifacts/metadata
           run-id: ${{ inputs.source_run_id }}
           github-token: ${{ github.token }}
 
@@ -101,32 +126,107 @@ jobs:
           RELEASE_VERSION: ${{ inputs.release_version }}
         run: node scripts/validate-windows-release-feed.js --root artifacts/update-feed --version "$RELEASE_VERSION"
 
+      - name: Validate promotion metadata and monotonic state
+        id: metadata
+        env:
+          EXPECTED_VERSION: ${{ inputs.release_version }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          remote_releases="$(mktemp)"
+          trap 'rm -f "$remote_releases"' EXIT
+          status="$(curl --silent --show-error --location --output "$remote_releases" --write-out '%{http_code}' "${WINDOWS_UPDATE_FEED}/RELEASES?verify=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")"
+          case "$status" in
+            200) ;;
+            404) : > "$remote_releases" ;;
+            *) echo "Unable to read current Windows update feed: HTTP $status" >&2; exit 1 ;;
+          esac
+          node scripts/windows-release-metadata.js \
+            --metadata artifacts/metadata/windows-release-metadata.json \
+            --validate-promotion \
+            --expected-release-version "$EXPECTED_VERSION" \
+            --package package.json \
+            --tracked scripts/upstream-versions.json \
+            --local-releases artifacts/update-feed/RELEASES \
+            --remote-releases "$remote_releases" \
+            --github-output
+          run_sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" --jq '.head_sha')"
+          metadata_sha="$(node -e "console.log(require('./artifacts/metadata/windows-release-metadata.json').sourceSha)")"
+          if [ "$run_sha" != "$metadata_sha" ]; then
+            echo "Metadata source SHA $metadata_sha does not match run $SOURCE_RUN_ID head SHA $run_sha" >&2
+            exit 1
+          fi
+
+      - name: Record promoted Windows versions
+        env:
+          WINDOWS_RELEASE_VERSION: ${{ steps.metadata.outputs.windows_release_version }}
+          WINDOWS_UPSTREAM_VERSION: ${{ steps.metadata.outputs.windows_upstream_version }}
+        run: |
+          set -euo pipefail
+          node scripts/configure-windows-release-version.js \
+            --upstream-version "$WINDOWS_UPSTREAM_VERSION" \
+            --release-version "$WINDOWS_RELEASE_VERSION" \
+            --write-package package.json \
+            --write-tracked scripts/upstream-versions.json
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json scripts/upstream-versions.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Bump Windows version to $WINDOWS_UPSTREAM_VERSION"
+            git push origin HEAD
+          else
+            echo "No Windows version metadata change"
+          fi
+
       - name: Create or update Windows-only release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v${{ inputs.release_version }}
-          name: Codex ${{ inputs.release_version }}
+          tag_name: codex-win-${{ inputs.release_version }}
+          name: Codex Win ${{ inputs.release_version }}
+          target_commitish: master
           body: |
             Windows-only release promoted from GitHub Actions run `${{ inputs.source_run_id }}`.
 
-            - App 26.707.31428
-            - CLI 0.144.1
-            - Windows full package is guaranteed; delta package is optional with a 10-minute generation budget
+            - Portable ZIP: `Codex-win-x64-${{ inputs.release_version }}.zip`
+            - Installer ZIP: `CodexSetup-win-x64-${{ inputs.release_version }}.zip`
+            - The installer executable is inside the ZIP to avoid direct `.exe` browser download blocking.
+            - Squirrel update packages are published separately to `windows-update-feed`.
           files: |
-            artifacts/installer/CodexSetup-win-x64-${{ inputs.release_version }}.exe
+            artifacts/installer/CodexSetup-win-x64-${{ inputs.release_version }}.zip
             artifacts/portable/Codex-win-x64-${{ inputs.release_version }}.zip
-            artifacts/update-feed/*.nupkg
-            artifacts/update-feed/RELEASES
           fail_on_unmatched_files: true
           overwrite_files: true
           draft: false
           prerelease: false
           make_latest: true
 
+      - name: Publish Windows update feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$WINDOWS_UPDATE_TAG"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "Windows update feed" --notes "Squirrel.Windows update feed for CodexDesktop-Rebuild." --latest=false
+          fi
+          desired_assets="$(mktemp)"
+          (
+            find artifacts/update-feed -maxdepth 1 -type f -name '*.nupkg' -printf '%f\n'
+            printf 'RELEASES\n'
+          ) | sort > "$desired_assets"
+          gh release upload "$tag" artifacts/update-feed/*.nupkg --clobber
+          gh release upload "$tag" artifacts/update-feed/RELEASES --clobber
+          gh release view "$tag" --json assets --jq '.assets[].name' | while IFS= read -r asset; do
+            if ! grep -Fxq "$asset" "$desired_assets"; then
+              gh release delete-asset "$tag" "$asset" -y
+            fi
+          done
+
       - name: Reconcile exact release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: v${{ inputs.release_version }}
+          RELEASE_TAG: codex-win-${{ inputs.release_version }}
           RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
           set -euo pipefail
@@ -134,16 +234,9 @@ jobs:
           actual_assets="$(mktemp)"
           trap 'rm -f "$desired_assets" "$actual_assets"' EXIT
           printf '%s\n' \
-            "CodexSetup-win-x64-${RELEASE_VERSION}.exe" \
+            "CodexSetup-win-x64-${RELEASE_VERSION}.zip" \
             "Codex-win-x64-${RELEASE_VERSION}.zip" \
-            "Codex-${RELEASE_VERSION}-full.nupkg" \
-            "RELEASES" \
             > "$desired_assets"
-
-          delta_path="artifacts/update-feed/Codex-${RELEASE_VERSION}-delta.nupkg"
-          if [ -f "$delta_path" ]; then
-            printf '%s\n' "$(basename "$delta_path")" >> "$desired_assets"
-          fi
           sort -o "$desired_assets" "$desired_assets"
 
           gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' \

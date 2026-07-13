@@ -49,6 +49,7 @@ function collectReleaseArtifactMetadata(root) {
   const macX64Version = latestVersion(files, /^Codex-mac-x64-(.+)\.dmg$/);
   const windowsPortableVersion = latestVersion(files, /^Codex-win-x64-(.+)\.zip$/);
   const windowsInstallerVersion =
+    latestVersion(files, /^CodexSetup-win-x64-(.+)\.zip$/) ||
     latestVersion(files, /^Codex-(.+)-full\.nupkg$/) ||
     latestVersion(files, /^CodexSetup-win-x64-(.+)\.exe$/);
   const releaseVersion = macArm64Version || macX64Version || windowsPortableVersion || windowsInstallerVersion;

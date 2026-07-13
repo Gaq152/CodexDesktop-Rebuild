@@ -46,6 +46,12 @@ try {
     windows_portable_version: "26.623.101652",
     windows_installer_version: "26.623.101658",
   });
+
+  touch(path.join(tmp, "installer", "CodexSetup-win-x64-26.707.8479.zip"));
+  assert.strictEqual(
+    collectReleaseArtifactMetadata(tmp).windowsInstallerVersion,
+    "26.707.8479",
+  );
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

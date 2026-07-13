@@ -1,23 +1,17 @@
-name: Build & Release (Manual)
+name: Build & Release Windows (Manual)
 
 on:
   workflow_dispatch:
     inputs:
-      platform:
-        description: "Target platform"
+      publish_release:
+        description: "Publish a codex-win-* GitHub Release"
         required: false
-        default: "all"
-        type: choice
-        options: [all, mac, windows]
-      installer_version:
-        description: "Optional Windows Squirrel package version override, for update testing"
-        required: false
-        default: ""
-        type: string
+        default: true
+        type: boolean
       publish_update_feed:
-        description: "For Windows-only builds, deploy RELEASES and nupkg to the update feed"
+        description: "When publishing a Release, also deploy RELEASES and nupkg to the Windows update feed"
         required: false
-        default: false
+        default: true
         type: boolean
       skip_windows_delta:
         description: "Build full Windows packages only, without delta packages"
@@ -33,41 +27,16 @@ env:
 permissions:
   contents: read
 
-jobs:
-  build-mac:
-    if: inputs.platform == 'all' || inputs.platform == 'mac'
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            runner: macos-15-intel
-          - arch: arm64
-            runner: macos-26
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-      - run: |
-          npm ci
-      - run: |
-          brew install --quiet sevenzip
-      - run: node scripts/sync-upstream.js --force --skip-win
-      - run: node scripts/patch-all.js mac-${{ matrix.arch }}
-      - run: npm run build:mac-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v7
-        with:
-          name: Codex-macOS-${{ matrix.arch }}
-          path: out/*.dmg
-          if-no-files-found: error
+concurrency:
+  group: codex-windows-release-state
+  cancel-in-progress: false
 
+jobs:
   build-windows:
-    if: inputs.platform == 'all' || inputs.platform == 'windows'
     runs-on: windows-latest
     outputs:
+      windows_upstream_version: ${{ steps.windows_version.outputs.windows_upstream_version }}
+      windows_release_version: ${{ steps.windows_version.outputs.windows_release_version }}
       windows_portable_version: ${{ steps.windows_artifacts.outputs.windows_portable_version }}
       windows_installer_version: ${{ steps.windows_artifacts.outputs.windows_installer_version }}
     steps:
@@ -76,30 +45,34 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-      - run: |
-          npm ci
-      - run: |
-          choco install 7zip -y
+      - run: npm ci
+      - run: choco install 7zip -y
       - name: Add 7zz alias
         run: |
           Copy-Item "C:\Program Files\7-Zip\7z.exe" "C:\Program Files\7-Zip\7zz.exe"
           echo "C:\Program Files\7-Zip" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-      - run: node scripts/sync-upstream.js --force --skip-mac
+
+      - name: Sync upstream Windows package
+        run: node scripts/sync-upstream.js --force --skip-mac
+
+      - name: Resolve actual Windows release version
+        id: windows_version
+        run: node scripts/configure-windows-release-version.js --previous scripts/upstream-versions.json --write-package package.json --write-package src/win/_asar/package.json --github-output
+
       - name: Configure Windows update feed
         shell: pwsh
         run: |
           $feed = "${{ env.WINDOWS_UPDATE_FEED }}"
+          $version = "${{ steps.windows_version.outputs.windows_release_version }}"
           "CODEX_REBUILD_UPDATE_URL=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "CODEX_REBUILD_REMOTE_RELEASES=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          Write-Host "Using Windows update feed URL: $feed"
-          Write-Host "Using Windows update feed as Squirrel remoteReleases for the optional delta attempt."
-      - name: Configure installer version override
-        if: inputs.installer_version != ''
-        shell: pwsh
-        run: |
-          "CODEX_REBUILD_INSTALLER_VERSION=${{ inputs.installer_version }}" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CODEX_REBUILD_INSTALLER_VERSION=$version" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "Windows MSIX: ${{ steps.windows_version.outputs.windows_upstream_version }}"
+          Write-Host "Windows release/Squirrel version: $version"
+
       - run: node scripts/patch-all.js win
       - run: npm run build:win-x64
+
       - name: Build guaranteed full Windows installer
         id: windows_full
         timeout-minutes: 30
@@ -107,6 +80,7 @@ jobs:
           CODEX_REBUILD_NO_DELTA: "1"
           DEBUG: electron-windows-installer:*
         run: npm run build:win-installer
+
       - name: Back up guaranteed full Windows installer
         shell: pwsh
         run: |
@@ -120,6 +94,7 @@ jobs:
           }
           Move-Item -LiteralPath $source -Destination $backup
           Write-Host "Backed up guaranteed full installer output to $backup"
+
       - name: Attempt Windows delta package
         id: windows_delta
         if: inputs.skip_windows_delta != true
@@ -128,6 +103,7 @@ jobs:
         env:
           DEBUG: electron-windows-installer:*
         run: npm run build:win-installer
+
       - name: Finalize Windows installer output
         if: always() && steps.windows_full.outcome == 'success'
         env:
@@ -152,32 +128,67 @@ jobs:
               throw "Delta attempt reported success but installer output is missing: $output"
             }
             Remove-Item -LiteralPath $backup -Recurse -Force
-            Write-Host "Delta attempt completed within the 10-minute budget; keeping its output."
+            $delta = Get-ChildItem -LiteralPath $output -Filter "*-delta.nupkg" -File
+            if ($delta) {
+              Write-Host "Delta package generated: $($delta.Name)"
+            } else {
+              Write-Host "Delta command completed but no delta package was produced; keeping full output."
+            }
           }
 
           Get-ChildItem -LiteralPath $output -File |
             Where-Object { $_.Extension -in '.exe', '.nupkg' -or $_.Name -eq 'RELEASES' } |
             Sort-Object Name |
             ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) bytes)" }
+
       - name: Resolve Windows artifact versions
         id: windows_artifacts
         run: node scripts/resolve-release-artifacts.js --root out --rename-windows-setup --github-output
+
+      - name: Package Windows installer zip
+        shell: pwsh
+        run: |
+          $version = "${{ steps.windows_artifacts.outputs.windows_installer_version }}"
+          $sourceDir = Join-Path $PWD.Path "out/make/squirrel.windows/x64"
+          $exe = Join-Path $sourceDir "CodexSetup-win-x64-$version.exe"
+          $zip = Join-Path $PWD.Path "out/CodexSetup-win-x64-$version.zip"
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "Renamed Windows installer is missing: $exe"
+          }
+          Push-Location $sourceDir
+          try {
+            & 7zz a -tzip -mx=1 $zip (Split-Path -Leaf $exe)
+            if ($LASTEXITCODE -ne 0) { throw "7zz failed with exit code $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+          if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) {
+            throw "Windows installer zip was not created: $zip"
+          }
+
       - name: Prepare Windows update feed artifact
         run: node scripts/prepare-windows-update-feed.js --source out/make/squirrel.windows/x64 --dest out/update-feed
+
+      - name: Validate Windows update feed artifact
+        run: node scripts/validate-windows-release-feed.js --root out/update-feed --version "${{ steps.windows_artifacts.outputs.windows_installer_version }}"
+
+      - name: Write Windows release metadata
+        run: node scripts/windows-release-metadata.js --write out/windows-release-metadata.json --upstream-version "${{ steps.windows_version.outputs.windows_upstream_version }}" --release-version "${{ steps.windows_version.outputs.windows_release_version }}" --source-sha "${{ github.sha }}"
+
       - name: Upload Windows portable zip
         uses: actions/upload-artifact@v7
         with:
           name: Codex-Windows-Portable-x64-${{ steps.windows_artifacts.outputs.windows_portable_version }}
-          path: |
-            out/*.zip
-            out/make/zip/win32/x64/*.zip
+          path: out/Codex-win-x64-${{ steps.windows_artifacts.outputs.windows_portable_version }}.zip
           if-no-files-found: error
-      - name: Upload Windows installer
+
+      - name: Upload Windows installer zip
         uses: actions/upload-artifact@v7
         with:
           name: Codex-Windows-Installer-x64-${{ steps.windows_artifacts.outputs.windows_installer_version }}
-          path: out/make/squirrel.windows/x64/*.exe
+          path: out/CodexSetup-win-x64-${{ steps.windows_artifacts.outputs.windows_installer_version }}.zip
           if-no-files-found: error
+
       - name: Upload Windows update feed
         uses: actions/upload-artifact@v7
         with:
@@ -185,166 +196,124 @@ jobs:
           path: out/update-feed/*
           if-no-files-found: error
 
+      - name: Upload Windows release metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: Codex-Windows-Release-Metadata-x64-${{ steps.windows_artifacts.outputs.windows_installer_version }}
+          path: out/windows-release-metadata.json
+          if-no-files-found: error
+
   release:
-    needs: [build-mac, build-windows]
-    if: always() && inputs.platform == 'all' && needs.build-mac.result == 'success' && needs.build-windows.result == 'success'
+    needs: [build-windows]
+    if: needs.build-windows.result == 'success' && inputs.publish_release == true
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
-
+        with:
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-
       - run: npm ci
-
-      - name: Get upstream version
-        id: version
-        run: |
-          set -euo pipefail
-          node scripts/check-update.js --json --force > upstream.json
-
-          node <<'NODE'
-          const fs = require("fs");
-          const upstream = JSON.parse(fs.readFileSync("upstream.json", "utf8"));
-          const platforms = upstream.platforms || {};
-          const macArm64 = platforms["macOS-arm64"]?.version || "";
-          const macX64 = platforms["macOS-x64"]?.version || "";
-          const windows = platforms.Windows?.version || "";
-          const version = macArm64 || macX64 || windows;
-
-          if (!version) {
-            console.error("No upstream version detected.");
-            process.exit(1);
-          }
-
-          fs.appendFileSync(
-            process.env.GITHUB_OUTPUT,
-            [
-              `version=${version}`,
-              `mac_arm64=${macArm64}`,
-              `mac_x64=${macX64}`,
-              `windows=${windows}`,
-            ].join("\n") + "\n",
-          );
-
-          console.log(`Release version: ${version}`);
-          NODE
-
-      - name: Update tracked upstream versions
-        run: |
-          set -euo pipefail
-          PACKAGE_VERSION="${{ steps.version.outputs.mac_arm64 || steps.version.outputs.mac_x64 || steps.version.outputs.windows }}"
-          PACKAGE_VERSION=$(node -e "const v=process.argv[1]||''; const m=v.match(/^(\d+\.\d+\.\d+)\.\d+$/); console.log(m ? m[1] : v)" "$PACKAGE_VERSION")
-          node scripts/resolve-sync-plan.js \
-            --upstream upstream.json \
-            --previous scripts/upstream-versions.json \
-            --write-current scripts/upstream-versions.json \
-            --json
-          node -e "
-            const fs=require('fs'), p=JSON.parse(fs.readFileSync('package.json','utf8'));
-            p.version='$PACKAGE_VERSION';
-            fs.writeFileSync('package.json', JSON.stringify(p,null,2)+'\n');
-          "
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json scripts/upstream-versions.json
-          if ! git diff --cached --quiet; then
-            git commit -m "Bump upstream versions to ${{ steps.version.outputs.version }}"
-            git push origin HEAD
-          else
-            echo "No version metadata change"
-          fi
 
       - uses: actions/download-artifact@v7
         with:
           path: artifacts
 
-      - name: Display artifact structure
-        run: find artifacts -maxdepth 4 -type f -print
+      - name: Validate release metadata and monotonic state
+        env:
+          EXPECTED_VERSION: ${{ needs.build-windows.outputs.windows_release_version }}
+        run: |
+          set -euo pipefail
+          metadata_file="$(find artifacts -type f -name windows-release-metadata.json -print -quit)"
+          local_releases="$(find artifacts -type f -name RELEASES -print -quit)"
+          remote_releases="$(mktemp)"
+          trap 'rm -f "$remote_releases"' EXIT
+          status="$(curl --silent --show-error --location --output "$remote_releases" --write-out '%{http_code}' "${WINDOWS_UPDATE_FEED}/RELEASES?verify=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")"
+          case "$status" in
+            200) ;;
+            404) : > "$remote_releases" ;;
+            *) echo "Unable to read current Windows update feed: HTTP $status" >&2; exit 1 ;;
+          esac
+          node scripts/windows-release-metadata.js \
+            --metadata "$metadata_file" \
+            --validate-promotion \
+            --expected-release-version "$EXPECTED_VERSION" \
+            --package package.json \
+            --tracked scripts/upstream-versions.json \
+            --local-releases "$local_releases" \
+            --remote-releases "$remote_releases"
+          metadata_sha="$(node -e "console.log(require('./' + process.argv[1]).sourceSha)" "$metadata_file")"
+          test "$metadata_sha" = "$GITHUB_SHA"
+
+      - name: Record built Windows versions
+        env:
+          WINDOWS_UPSTREAM_VERSION: ${{ needs.build-windows.outputs.windows_upstream_version }}
+        run: |
+          set -euo pipefail
+          node scripts/configure-windows-release-version.js \
+            --upstream-version "$WINDOWS_UPSTREAM_VERSION" \
+            --release-version "${{ needs.build-windows.outputs.windows_release_version }}" \
+            --write-package package.json \
+            --write-tracked scripts/upstream-versions.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json scripts/upstream-versions.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Bump Windows version to $WINDOWS_UPSTREAM_VERSION"
+            git push origin HEAD
+          else
+            echo "No Windows version metadata change"
+          fi
 
       - name: Resolve release artifact versions
         id: artifacts
         run: node scripts/resolve-release-artifacts.js --root artifacts --github-output
 
-      - name: Create GitHub Release
+      - name: Validate exact Windows release assets
+        env:
+          EXPECTED_VERSION: ${{ needs.build-windows.outputs.windows_release_version }}
+          PORTABLE_VERSION: ${{ steps.artifacts.outputs.windows_portable_version }}
+          INSTALLER_VERSION: ${{ steps.artifacts.outputs.windows_installer_version }}
+        run: |
+          set -euo pipefail
+          test "$PORTABLE_VERSION" = "$EXPECTED_VERSION"
+          test "$INSTALLER_VERSION" = "$EXPECTED_VERSION"
+
+      - name: Create Windows GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v${{ steps.artifacts.outputs.release_version }}
-          name: Codex ${{ steps.artifacts.outputs.release_version }}
+          tag_name: codex-win-${{ steps.artifacts.outputs.windows_installer_version }}
+          name: Codex Win ${{ steps.artifacts.outputs.windows_installer_version }}
+          target_commitish: master
           body: |
-            Manual macOS and Windows rebuild from upstream Codex.
+            Windows-only rebuild from official Codex MSIX `${{ needs.build-windows.outputs.windows_upstream_version }}`.
 
-            | Platform / artifact | Version |
-            | --- | --- |
-            | macOS arm64 | `${{ steps.artifacts.outputs.mac_arm64_version || 'N/A' }}` |
-            | macOS x64 | `${{ steps.artifacts.outputs.mac_x64_version || 'N/A' }}` |
-            | Windows x64 portable | `${{ steps.artifacts.outputs.windows_portable_version || 'N/A' }}` |
-            | Windows x64 installer | `${{ steps.artifacts.outputs.windows_installer_version || 'N/A' }}` |
+            - Portable: `Codex-win-x64-${{ steps.artifacts.outputs.windows_portable_version }}.zip`
+            - Installer: `CodexSetup-win-x64-${{ steps.artifacts.outputs.windows_installer_version }}.zip`
+            - The installer executable is inside the ZIP to avoid direct `.exe` browser download blocking.
+            - Squirrel update packages are published separately to `windows-update-feed`.
           files: |
-            artifacts/**/*.dmg
-            artifacts/**/*.zip
-            artifacts/**/*.exe
-            artifacts/**/*.nupkg
-            artifacts/**/RELEASES
+            artifacts/Codex-Windows-Portable-x64-*/Codex-win-x64-*.zip
+            artifacts/Codex-Windows-Installer-x64-*/CodexSetup-win-x64-*.zip
           fail_on_unmatched_files: true
+          overwrite_files: true
           draft: false
+          prerelease: false
           make_latest: true
 
       - name: Prepare Windows update feed
+        if: inputs.publish_update_feed == true
         run: |
           set -euo pipefail
           node scripts/prepare-windows-update-feed.js --source artifacts --dest update-feed/updates/win32/x64
-          find update-feed -type f -print
 
       - name: Publish Windows update feed
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="${{ env.WINDOWS_UPDATE_TAG }}"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --title "Windows update feed" --notes "Squirrel.Windows update feed for CodexDesktop-Rebuild." --latest=false
-          fi
-          feed_dir="update-feed/updates/win32/x64"
-          desired_assets="$(mktemp)"
-          (
-            find "$feed_dir" -maxdepth 1 -type f -name '*.nupkg' -printf '%f\n'
-            printf 'RELEASES\n'
-          ) | sort > "$desired_assets"
-          gh release upload "$tag" "$feed_dir"/*.nupkg --clobber
-          gh release upload "$tag" "$feed_dir/RELEASES" --clobber
-          gh release view "$tag" --json assets --jq '.assets[].name' | while IFS= read -r asset; do
-            if ! grep -Fxq "$asset" "$desired_assets"; then
-              gh release delete-asset "$tag" "$asset" -y
-            fi
-          done
-
-  publish-windows-update-feed:
-    needs: [build-windows]
-    if: always() && inputs.platform == 'windows' && inputs.publish_update_feed == true && needs.build-windows.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/download-artifact@v7
-        with:
-          name: Codex-Windows-UpdateFeed-x64
-          path: artifacts/Codex-Windows-UpdateFeed-x64
-
-      - name: Prepare Windows update feed
-        run: |
-          set -euo pipefail
-          node scripts/prepare-windows-update-feed.js --source artifacts --dest update-feed/updates/win32/x64
-          find update-feed -type f -print
-
-      - name: Publish Windows update feed
+        if: inputs.publish_update_feed == true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
