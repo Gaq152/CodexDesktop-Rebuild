@@ -61,6 +61,7 @@ function validatePromotionState({
   trackedUpstreamVersion,
   localReleases,
   remoteReleases,
+  allowSameVersionReplacement = false,
 }) {
   const expected = validateReleaseVersion(expectedReleaseVersion);
   const current = validateReleaseVersion(currentReleaseVersion);
@@ -81,13 +82,24 @@ function validatePromotionState({
 
   const remoteVersions = releaseVersionsFromReleases(remoteReleases);
   const remoteVersion = remoteVersions.at(-1) || "";
+  if (allowSameVersionReplacement) {
+    if (!remoteVersion) {
+      throw new Error(`Cannot replace release ${expected}: the update feed is empty`);
+    }
+    if (expected !== current) {
+      throw new Error(`Replacement release ${expected} must equal master version ${current}`);
+    }
+    if (expected !== remoteVersion) {
+      throw new Error(`Replacement release ${expected} must equal update feed version ${remoteVersion}`);
+    }
+  }
   if (remoteVersion && compareNumericVersions(expected, remoteVersion) < 0) {
     throw new Error(`Refusing update feed rollback from ${remoteVersion} to ${expected}`);
   }
   if (remoteVersion && compareNumericVersions(expected, remoteVersion) === 0) {
     const localLines = normalizedReleaseLines(localReleases);
     const remoteLines = normalizedReleaseLines(remoteReleases);
-    if (JSON.stringify(localLines) !== JSON.stringify(remoteLines)) {
+    if (!allowSameVersionReplacement && JSON.stringify(localLines) !== JSON.stringify(remoteLines)) {
       throw new Error(`Release ${expected} already exists in the update feed with different hashes`);
     }
   }
@@ -141,6 +153,7 @@ function main() {
       trackedUpstreamVersion: tracked?.platforms?.Windows?.version || "",
       localReleases: fs.readFileSync(path.resolve(valueAfter(args, "--local-releases")), "utf8"),
       remoteReleases: fs.readFileSync(path.resolve(valueAfter(args, "--remote-releases")), "utf8"),
+      allowSameVersionReplacement: args.includes("--allow-same-version-replacement"),
     });
   }
   if (args.includes("--github-output")) writeGithubOutput(metadata);

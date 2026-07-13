@@ -249,6 +249,34 @@ test("Windows workflows guarantee full installers and bound optional delta gener
   assertFullFirstWindowsInstallerWorkflow(syncWorkflow, { supportsSkip: false });
 });
 
+test("manual Windows workflow can explicitly replace the same release version", () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, "..", ".github", "workflows", "build.yml"),
+    "utf-8",
+  );
+  assert.match(
+    workflow,
+    /replace_existing_release:\s*\n(?:\s+.*\n)*?\s+default: false\s*\n\s+type: boolean/,
+  );
+  assert.match(
+    workflow,
+    /release_version_override:\s*\n(?:\s+.*\n)*?\s+default: ""\s*\n\s+type: string/,
+  );
+  assert.match(workflow, /--release-version/);
+  assert.match(workflow, /--allow-same-version-replacement/);
+  assert.match(workflow, /replace_existing_release requires an exact release_version_override/);
+  assert.match(workflow, /release_version_override is only allowed with replace_existing_release/);
+  assert.match(workflow, /git ls-remote --exit-code --tags origin/);
+  assert.match(workflow, /gh release view "\$tag"/);
+  assert.match(workflow, /name: Retarget replacement release tag/);
+  assert.match(workflow, /git push origin "refs\/tags\/\$tag" --force/);
+  assert.match(workflow, /overwrite_files: true/);
+  const validateAssetsIndex = workflow.indexOf("name: Validate exact Windows release assets");
+  const publishFeedIndex = workflow.indexOf("name: Publish Windows update feed");
+  const retargetIndex = workflow.indexOf("name: Retarget replacement release tag");
+  assert.ok(validateAssetsIndex < publishFeedIndex && publishFeedIndex < retargetIndex);
+});
+
 function writePeWithoutVersionInfo(file) {
   const executable = ResEdit.NtExecutable.createEmpty(false, false);
   const resources = ResEdit.NtExecutableResource.from(executable);

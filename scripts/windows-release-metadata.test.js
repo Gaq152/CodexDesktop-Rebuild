@@ -41,6 +41,44 @@ test("promotion accepts a newer release and an identical same-version retry", ()
   assert.equal(validatePromotionState({ ...base, remoteReleases: local }), metadata);
 });
 
+test("promotion allows an explicit same-version replacement without allowing rollback", () => {
+  const base = {
+    metadata,
+    expectedReleaseVersion: "26.707.62120",
+    currentReleaseVersion: "26.707.62120",
+    trackedUpstreamVersion: "26.707.8479.0",
+    localReleases: local,
+    remoteReleases: "B".repeat(40) + " Codex-26.707.62120-full.nupkg 100\n",
+    allowSameVersionReplacement: true,
+  };
+  assert.equal(validatePromotionState(base), metadata);
+  assert.throws(
+    () => validatePromotionState({
+      ...base,
+      expectedReleaseVersion: "26.707.62119",
+      metadata: { ...metadata, releaseVersion: "26.707.62119" },
+    }),
+    /release rollback|feed rollback/i,
+  );
+  assert.throws(
+    () => validatePromotionState({ ...base, remoteReleases: "" }),
+    /update feed is empty/i,
+  );
+  assert.throws(
+    () => validatePromotionState({ ...base, currentReleaseVersion: "26.707.62119" }),
+    /must equal master version/i,
+  );
+  assert.throws(
+    () => validatePromotionState({
+      ...base,
+      expectedReleaseVersion: "26.707.62121",
+      currentReleaseVersion: "26.707.62121",
+      metadata: { ...metadata, releaseVersion: "26.707.62121" },
+    }),
+    /must equal update feed version/i,
+  );
+});
+
 test("promotion fails closed on release, feed, MSIX, and same-version hash rollback", () => {
   const base = {
     metadata,

@@ -9,6 +9,22 @@ const { EventEmitter } = require("events");
 const crypto = require("crypto");
 const http = require("http");
 
+function readHttpBody(target) {
+  return new Promise((resolve, reject) => {
+    http.get(target, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          reject(new Error(`HTTP ${response.statusCode}`));
+          return;
+        }
+        resolve(Buffer.concat(chunks));
+      });
+    }).on("error", reject);
+  });
+}
+
 function withRealQuotedKeys(source) {
   return source
     .replaceAll("`aria-expanded`", "'aria-expanded'")
@@ -148,6 +164,9 @@ function snapshotLocalUpdaterTargets(asarRoot, relativePaths) {
   assert.ok(bootstrap.includes("Range:'bytes='+offset+'-'"));
   assert.ok(bootstrap.includes("package size or SHA1 mismatch"));
   assert.ok(bootstrap.includes("bytes retained for resume"));
+  assert.ok(bootstrap.includes("startLocalHandoff(item,result.filePath,generation)"));
+  assert.ok(bootstrap.includes("autoUpdater.setFeedURL({url:feedUrl})"));
+  assert.ok(bootstrap.includes("http.createServer((request,response)=>"));
   assert.ok(bootstrap.includes("CODEX_REBUILD_UPDATE_CANCELLED"));
   assert.ok(bootstrap.includes("cancel:cancelDownload"));
   assert.ok(bootstrap.includes("if(command==='cancel')return cancelDownload()"));
@@ -313,8 +332,34 @@ test("runtime downloader adopts a legacy incomplete package, resumes it, and ver
 
   const autoUpdater = new EventEmitter();
   let updaterChecks = 0;
-  autoUpdater.setFeedURL = () => {};
-  autoUpdater.checkForUpdates = () => { updaterChecks += 1; };
+  let activeFeedUrl = null;
+  const feedUrls = [];
+  const localFeedRequests = [];
+  let localCopyResolve;
+  const localCopyFinished = new Promise((resolve) => { localCopyResolve = resolve; });
+  autoUpdater.setFeedURL = ({ url }) => {
+    activeFeedUrl = url;
+    feedUrls.push(url);
+  };
+  autoUpdater.checkForUpdates = () => {
+    updaterChecks += 1;
+    const handoffFeed = activeFeedUrl;
+    (async () => {
+      // Squirrel may delete its managed packages directory while recovering
+      // from a missing or corrupt local RELEASES file. The verified source
+      // must remain available from our sibling update-cache directory.
+      fs.rmSync(packagesDir, { recursive: true, force: true });
+      fs.mkdirSync(packagesDir, { recursive: true });
+      localFeedRequests.push(`${handoffFeed}/RELEASES`);
+      const releases = (await readHttpBody(`${handoffFeed}/RELEASES?id=Codex`)).toString("utf8");
+      const handoffFile = releases.trim().split(/\s+/)[1];
+      localFeedRequests.push(`${handoffFeed}/${handoffFile}`);
+      const localPackage = await readHttpBody(`${handoffFeed}/${handoffFile}`);
+      fs.writeFileSync(path.join(packagesDir, handoffFile), localPackage);
+      autoUpdater.emit("update-downloaded");
+      localCopyResolve();
+    })().catch((error) => autoUpdater.emit("error", error));
+  };
   autoUpdater.quitAndInstall = () => {};
   const context = {
     Buffer,
@@ -365,6 +410,7 @@ test("runtime downloader adopts a legacy incomplete package, resumes it, and ver
   await context.__CodexRebuildUpdaterCommand.retry({
     proxyPrefix: updateUrl + "/proxy/",
   });
+  await localCopyFinished;
 
   assert.deepEqual(ranges, ["bytes=9-"]);
   assert.equal(packageRequests.length, 2);
@@ -372,8 +418,18 @@ test("runtime downloader adopts a legacy incomplete package, resumes it, and ver
   assert.equal(packageRequests[1], `/${fileName}`);
   assert.deepEqual(fs.readFileSync(path.join(packagesDir, fileName)), body);
   assert.equal(fs.existsSync(path.join(packagesDir, `${fileName}.partial`)), false);
+  assert.equal(fs.existsSync(path.join(root, "update-cache", `${fileName}.partial`)), false);
   assert.equal(updaterChecks, 1);
-  assert.equal(context.__CodexRebuildUpdaterLastState.status, "preparing");
+  assert.equal(localFeedRequests.length, 2);
+  assert.match(localFeedRequests[0], /^http:\/\/127\.0\.0\.1:\d+\/[a-f0-9]{32}\/RELEASES$/);
+  assert.match(localFeedRequests[1], new RegExp(`^http://127\\.0\\.0\\.1:\\d+/[a-f0-9]{32}/${fileName}$`));
+  assert.equal(feedUrls[0], updateUrl);
+  assert.equal(
+    feedUrls.filter((url) => /^http:\/\/127\.0\.0\.1:\d+\/[a-f0-9]{32}$/.test(url)).length,
+    1,
+  );
+  assert.equal(feedUrls.at(-1), updateUrl);
+  assert.equal(context.__CodexRebuildUpdaterLastState.status, "ready");
   assert.equal(context.__CodexRebuildUpdaterLastState.resumedBytes, 9);
 
   const failedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "updater-adopt-failure-"));
@@ -381,7 +437,7 @@ test("runtime downloader adopts a legacy incomplete package, resumes it, and ver
   const failedAppDir = path.join(failedRoot, "app-1.0.0");
   const failedPackagesDir = path.join(failedRoot, "packages");
   const failedFinalPath = path.join(failedPackagesDir, fileName);
-  const failedPartialPath = `${failedFinalPath}.partial`;
+  const failedPartialPath = path.join(failedRoot, "update-cache", `${fileName}.partial`);
   fs.mkdirSync(failedAppDir, { recursive: true });
   fs.mkdirSync(failedPackagesDir, { recursive: true });
   fs.writeFileSync(path.join(failedRoot, "Update.exe"), "fixture");
@@ -398,8 +454,21 @@ test("runtime downloader adopts a legacy incomplete package, resumes it, and ver
     return fs.renameSync(source, destination);
   };
   const failedAutoUpdater = new EventEmitter();
-  failedAutoUpdater.setFeedURL = () => {};
-  failedAutoUpdater.checkForUpdates = () => {};
+  let failedFeedUrl = null;
+  let failedCopyResolve;
+  const failedCopyFinished = new Promise((resolve) => { failedCopyResolve = resolve; });
+  failedAutoUpdater.setFeedURL = ({ url }) => { failedFeedUrl = url; };
+  failedAutoUpdater.checkForUpdates = () => {
+    const handoffFeed = failedFeedUrl;
+    (async () => {
+      const releases = (await readHttpBody(`${handoffFeed}/RELEASES`)).toString("utf8");
+      const handoffFile = releases.trim().split(/\s+/)[1];
+      const localPackage = await readHttpBody(`${handoffFeed}/${handoffFile}`);
+      fs.writeFileSync(path.join(failedPackagesDir, handoffFile), localPackage);
+      failedAutoUpdater.emit("update-downloaded");
+      failedCopyResolve();
+    })().catch((error) => failedAutoUpdater.emit("error", error));
+  };
   failedAutoUpdater.quitAndInstall = () => {};
   const failedContext = {
     Buffer,
@@ -444,6 +513,7 @@ test("runtime downloader adopts a legacy incomplete package, resumes it, and ver
   await new Promise((resolve) => setImmediate(resolve));
   await failedContext.__CodexRebuildUpdaterCommand.check();
   await failedContext.__CodexRebuildUpdaterCommand.download();
+  await failedCopyFinished;
 
   assert.equal(adoptionRenameAttempts, 1);
   assert.equal(legacyFinalObserved, true);
@@ -498,7 +568,7 @@ test("runtime downloader cancels in flight, retains bytes, and resumes through a
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const appDir = path.join(root, "app-1.0.0");
   const packagesDir = path.join(root, "packages");
-  const partialPath = path.join(packagesDir, `${fileName}.partial`);
+  const partialPath = path.join(root, "update-cache", `${fileName}.partial`);
   fs.mkdirSync(appDir, { recursive: true });
   fs.mkdirSync(packagesDir, { recursive: true });
   fs.writeFileSync(path.join(root, "Update.exe"), "fixture");
@@ -507,10 +577,19 @@ test("runtime downloader cancels in flight, retains bytes, and resumes through a
   const destroyRequested = new Promise((resolve) => { destroyRequestedResolve = resolve; });
   let releaseDestroyResolve;
   const releaseDestroy = new Promise((resolve) => { releaseDestroyResolve = resolve; });
+  let partialDataWrittenResolve;
+  const partialDataWritten = new Promise((resolve) => { partialDataWrittenResolve = resolve; });
   t.after(() => releaseDestroyResolve());
   const delayedFs = Object.create(fs);
   delayedFs.createWriteStream = (...args) => {
     const stream = fs.createWriteStream(...args);
+    const write = stream._write.bind(stream);
+    stream._write = (chunk, encoding, callback) => {
+      write(chunk, encoding, (error) => {
+        if (!error) partialDataWrittenResolve();
+        callback(error);
+      });
+    };
     const destroy = stream.destroy.bind(stream);
     let requested = false;
     stream.destroy = (...destroyArgs) => {
@@ -526,8 +605,22 @@ test("runtime downloader cancels in flight, retains bytes, and resumes through a
 
   const autoUpdater = new EventEmitter();
   let updaterChecks = 0;
-  autoUpdater.setFeedURL = () => {};
-  autoUpdater.checkForUpdates = () => { updaterChecks += 1; };
+  let activeFeedUrl = null;
+  let localCopyResolve;
+  const localCopyFinished = new Promise((resolve) => { localCopyResolve = resolve; });
+  autoUpdater.setFeedURL = ({ url }) => { activeFeedUrl = url; };
+  autoUpdater.checkForUpdates = () => {
+    updaterChecks += 1;
+    const handoffFeed = activeFeedUrl;
+    (async () => {
+      const releases = (await readHttpBody(`${handoffFeed}/RELEASES`)).toString("utf8");
+      const handoffFile = releases.trim().split(/\s+/)[1];
+      const localPackage = await readHttpBody(`${handoffFeed}/${handoffFile}`);
+      fs.writeFileSync(path.join(packagesDir, handoffFile), localPackage);
+      autoUpdater.emit("update-downloaded");
+      localCopyResolve();
+    })().catch((error) => autoUpdater.emit("error", error));
+  };
   autoUpdater.quitAndInstall = () => {};
   const context = {
     Buffer,
@@ -574,9 +667,7 @@ test("runtime downloader cancels in flight, retains bytes, and resumes through a
 
   const firstDownload = context.__CodexRebuildUpdaterCommand.download();
   await firstChunkSent;
-  for (let attempt = 0; attempt < 100 && !fs.existsSync(partialPath); attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  await partialDataWritten;
   const bytesBeforeCancel = fs.statSync(partialPath).size;
   assert.ok(bytesBeforeCancel > 0 && bytesBeforeCancel < body.length);
 
@@ -606,10 +697,11 @@ test("runtime downloader cancels in flight, retains bytes, and resumes through a
   await context.__CodexRebuildUpdaterCommand.retry({
     proxyPrefix: updateUrl + "/proxy/",
   });
+  await localCopyFinished;
   assert.deepEqual(proxyRanges, [`bytes=${retainedBytes}-`]);
   assert.deepEqual(fs.readFileSync(path.join(packagesDir, fileName)), body);
   assert.equal(fs.existsSync(partialPath), false);
-  assert.equal(context.__CodexRebuildUpdaterLastState.status, "preparing");
+  assert.equal(context.__CodexRebuildUpdaterLastState.status, "ready");
   assert.equal(context.__CodexRebuildUpdaterLastState.resumedBytes, retainedBytes);
   assert.equal(updaterChecks, 1);
 });
@@ -882,15 +974,15 @@ test("rejects stale or mismatched canonical updater block versions", () => {
   );
 });
 
-test("migrates the v2 updater layers to the cancellable download contract", () => {
-  assert.equal(LOCAL_UPDATER_CONTRACT_VERSION, 3);
+test("migrates the v4 updater layers to the isolated local Squirrel handoff contract", () => {
+  assert.equal(LOCAL_UPDATER_CONTRACT_VERSION, 5);
   const current = applyLocalUpdaterPlan(makeCleanLocalUpdaterSources());
   const legacy = {
     packageSource: current.packageSource,
     files: Object.fromEntries(
       Object.entries(current.files).map(([file, source]) => [
         file,
-        source.replaceAll(":v3 */", ":v2 */"),
+        source.replaceAll(":v5 */", ":v4 */"),
       ]),
     ),
   };
@@ -899,11 +991,11 @@ test("migrates the v2 updater layers to the cancellable download contract", () =
   assert.equal(migrated.plan.status, "patched");
   assert.ok(migrated.plan.changes.length >= 4);
   assert.ok(
-    Object.values(migrated.files).some((source) => source.includes("cancelDownload")),
+    Object.values(migrated.files).some((source) => source.includes("startLocalHandoff")),
   );
   assert.ok(
     Object.values(migrated.files).every(
-      (source) => !source.includes(":v2 */"),
+      (source) => !source.includes(":v4 */"),
     ),
   );
   assert.equal(planLocalUpdaterSources(migrated).status, "already");

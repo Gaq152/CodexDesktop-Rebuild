@@ -19,8 +19,8 @@ const DEFAULT_WINDOWS_UPDATE_PROXY_PREFIXES = [
   "https://gh-proxy.com/",
   "https://ghproxy.net/",
 ];
-const LOCAL_UPDATER_CONTRACT_VERSION = 3;
-const STRUCTURAL_LOCAL_UPDATER_VERSIONS = [1, 2];
+const LOCAL_UPDATER_CONTRACT_VERSION = 5;
+const STRUCTURAL_LOCAL_UPDATER_VERSIONS = [1, 2, 3, 4];
 const START_MARKER = "/* CodexRebuildLocalUpdater:start */";
 const END_MARKER = "/* CodexRebuildLocalUpdater:end */";
 const FILE_END_MARKER = "/* CodexRebuildLocalUpdater:file-end */";
@@ -265,6 +265,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
   let appDir=path.dirname(process.execPath);
   let rootDir=path.resolve(appDir,'..');
   let packagesDir=path.join(rootDir,'packages');
+  let stagingDir=path.join(rootDir,'update-cache');
   let updateExe=path.resolve(path.join(rootDir,'Update.exe'));
   if(!fs.existsSync(updateExe))return;
   let metadata={};
@@ -381,6 +382,80 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
       return await sha1File(filePath)===item.sha1;
     }catch{return!1}
   };
+  let localHandoff=null,cancelledLocalHandoff=!1;
+  let restoreRemoteFeed=()=>{try{autoUpdater.setFeedURL({url:updateUrl})}catch{}};
+  let closeLocalHandoff=(removeSource=!1)=>{
+    let handoff=localHandoff;
+    localHandoff=null;
+    if(!handoff)return;
+    try{handoff.server.close()}catch{}
+    for(let socket of handoff.sockets)try{socket.destroy()}catch{}
+    restoreRemoteFeed();
+    if(removeSource){
+      try{
+        let finalPath=path.join(packagesDir,handoff.item.fileName);
+        if(fs.existsSync(finalPath)&&fs.statSync(finalPath).size===handoff.item.size){
+          fs.rmSync(handoff.sourcePath,{force:!0});
+        }
+      }catch{}
+    }
+  };
+  let startLocalHandoff=(item,sourcePath,generation)=>new Promise((resolve,reject)=>{
+    if(generation!==downloadGeneration){reject(cancellationError());return}
+    closeLocalHandoff();
+    let token=crypto.randomBytes(16).toString('hex');
+    let basePath='/'+token+'/';
+    let manifest=item.sha1+' '+item.fileName+' '+item.size+'\\n';
+    let sockets=new Set,settled=!1;
+    let finish=(error,value)=>{if(settled)return;settled=!0;error?reject(error):resolve(value)};
+    let server=http.createServer((request,response)=>{
+      let pathname;
+      try{pathname=new urlMod.URL(request.url,'http://127.0.0.1').pathname}catch{response.writeHead(400).end();return}
+      if(pathname===basePath+'RELEASES'){
+        let body=Buffer.from(manifest,'utf8');
+        response.writeHead(200,{'Content-Type':'text/plain; charset=utf-8','Content-Length':body.length,'Cache-Control':'no-store'});
+        response.end(body);
+        return;
+      }
+      let requestedName;
+      try{requestedName=decodeURIComponent(pathname.slice(basePath.length))}catch{requestedName=''}
+      if(!pathname.startsWith(basePath)||requestedName!==item.fileName){response.writeHead(404).end();return}
+      let start=0,end=item.size-1,status=200;
+      let range=String(request.headers.range||'').match(/^bytes=(\d+)-(\d*)$/i);
+      if(range){
+        start=Number(range[1]);
+        if(range[2])end=Math.min(Number(range[2]),end);
+        if(!Number.isFinite(start)||start<0||start>=item.size||end<start){
+          response.writeHead(416,{'Content-Range':'bytes */'+item.size});
+          response.end();
+          return;
+        }
+        status=206;
+      }
+      let headers={'Content-Type':'application/octet-stream','Content-Length':end-start+1,'Cache-Control':'no-store','Accept-Ranges':'bytes'};
+      if(status===206)headers['Content-Range']='bytes '+start+'-'+end+'/'+item.size;
+      response.writeHead(status,headers);
+      let input=fs.createReadStream(sourcePath,{start,end});
+      input.on('error',error=>response.destroy(error));
+      input.pipe(response);
+    });
+    server.on('connection',socket=>{sockets.add(socket);socket.once('close',()=>sockets.delete(socket))});
+    server.once('error',error=>{try{server.close()}catch{}finish(error)});
+    server.listen(0,'127.0.0.1',()=>{
+      if(generation!==downloadGeneration){try{server.close()}catch{}finish(cancellationError());return}
+      let address=server.address();
+      if(!address||typeof address==='string'){try{server.close()}catch{}finish(Error('local update feed failed to bind'));return}
+      let feedUrl='http://127.0.0.1:'+address.port+basePath.slice(0,-1);
+      localHandoff={server,sockets,item,sourcePath,generation,feedUrl};
+      cancelledLocalHandoff=!1;
+      try{
+        autoUpdater.setFeedURL({url:feedUrl});
+        autoUpdater.checkForUpdates();
+        server.unref?.();
+        finish(null,{feedUrl});
+      }catch(error){closeLocalHandoff();finish(error)}
+    });
+  });
   let activeDownloadAttempt=null,activeDownloadSettlement=Promise.resolve(),downloadGeneration=0;
   let cancellationError=()=>{let error=Error('update download cancelled');error.code='CODEX_REBUILD_UPDATE_CANCELLED';return error};
   let isCancellationError=error=>error?.code==='CODEX_REBUILD_UPDATE_CANCELLED';
@@ -442,11 +517,17 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
   });
   let downloadPackage=async(item,requestedProxyPrefixes,generation)=>{
     fs.mkdirSync(packagesDir,{recursive:!0});
-    let finalPath=path.join(packagesDir,item.fileName),partialPath=finalPath+'.partial';
+    fs.mkdirSync(stagingDir,{recursive:!0});
+    let finalPath=path.join(packagesDir,item.fileName),legacyPartialPath=finalPath+'.partial',partialPath=path.join(stagingDir,item.fileName+'.partial');
     if(generation!==downloadGeneration)throw cancellationError();
+    if(!fs.existsSync(partialPath)&&fs.existsSync(legacyPartialPath)){
+      try{fs.renameSync(legacyPartialPath,partialPath)}catch{try{fs.copyFileSync(legacyPartialPath,partialPath);fs.rmSync(legacyPartialPath,{force:!0})}catch{}}
+    }
     if(await verifyPackage(finalPath,item)){
       if(generation!==downloadGeneration)throw cancellationError();
-      return{source:'cache',resumedFrom:item.size};
+      try{if(fs.existsSync(partialPath))fs.rmSync(partialPath,{force:!0})}catch{}
+      try{fs.renameSync(finalPath,partialPath)}catch{fs.copyFileSync(finalPath,partialPath)}
+      return{source:'cache',resumedFrom:item.size,filePath:partialPath};
     }
     if(fs.existsSync(finalPath)){
       try{
@@ -459,9 +540,8 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     if(existing>item.size){try{fs.rmSync(partialPath,{force:!0})}catch{}existing=0}
     if(existing===item.size&&await verifyPackage(partialPath,item)){
       if(generation!==downloadGeneration)throw cancellationError();
-      if(fs.existsSync(finalPath))fs.rmSync(finalPath,{force:!0});
-      fs.renameSync(partialPath,finalPath);
-      return{source:'partial-cache',resumedFrom:existing};
+      try{if(fs.existsSync(finalPath))fs.rmSync(finalPath,{force:!0})}catch{}
+      return{source:'partial-cache',resumedFrom:existing,filePath:partialPath};
     }
     let errors=[];
     for(let target of packageUrls(item.fileName,requestedProxyPrefixes)){
@@ -477,9 +557,8 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
           existing=0;
           throw Error('package size or SHA1 mismatch');
         }
-        if(fs.existsSync(finalPath))fs.rmSync(finalPath,{force:!0});
-        fs.renameSync(partialPath,finalPath);
-        return result;
+        try{if(fs.existsSync(finalPath))fs.rmSync(finalPath,{force:!0})}catch{}
+        return{...result,filePath:partialPath};
       }catch(error){
         try{existing=fs.existsSync(partialPath)?fs.statSync(partialPath).size:0}catch{existing=0}
         if(isCancellationError(error)||generation!==downloadGeneration)throw cancellationError();
@@ -537,15 +616,21 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
   };
   let updateProgress=()=>{
     if(!downloading)return;
+    if(localHandoff){
+      let elapsedMs=state.downloadStartedAt?Date.now()-state.downloadStartedAt:null;
+      setStatus('preparing',{downloadedBytes:localHandoff.item.size,elapsedMs,activeDownloadFile:localHandoff.item.fileName,activeDownloadSize:localHandoff.item.size});
+      return;
+    }
     let file=state.activeDownloadFile||state.updateFile||(state.updateVersion?('Codex-'+state.updateVersion+'-full.nupkg'):null);
     let activeDownloadSize=state.activeDownloadSize||state.updateSize||null;
     let downloadedBytes=state.downloadedBytes||0;
     if(file){
       try{
         let p=path.join(packagesDir,file);
-        let partial=p+'.partial';
-        if(fs.existsSync(partial)||fs.existsSync(p)){
-          downloadedBytes=fs.statSync(fs.existsSync(partial)?partial:p).size;
+        let partial=path.join(stagingDir,file+'.partial');
+        let legacyPartial=p+'.partial';
+        if(fs.existsSync(partial)||fs.existsSync(legacyPartial)||fs.existsSync(p)){
+          downloadedBytes=fs.statSync(fs.existsSync(partial)?partial:fs.existsSync(legacyPartial)?legacyPartial:p).size;
           let known=state.updateFiles?.find?.(item=>item.fileName===file)?.size;
           if(Number.isFinite(known))activeDownloadSize=known;
         }else if(state.updateVersion&&fs.existsSync(packagesDir)){
@@ -651,13 +736,13 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     activeDownloadSettlement=new Promise(resolve=>{settleDownload=resolve});
     let started=Date.now();
     let retained=0;
-    try{retained=fs.statSync(path.join(packagesDir,item.fileName+'.partial')).size}catch{}
+    try{retained=fs.statSync(path.join(stagingDir,item.fileName+'.partial')).size}catch{}
     setStatus('downloading',{error:null,downloadStartedAt:started,downloadedBytes:retained,resumedBytes:retained,elapsedMs:0,version:getInstalledVersion(),activeDownloadFile:item.fileName,activeDownloadSize:item.size});
     startProgress();
     try{
       let result=await downloadPackage(item,requestedProxyPrefixes,generation);
       setStatus('preparing',{error:null,downloadedBytes:item.size,resumedBytes:result.resumedFrom||retained,downloadSource:result.source});
-      autoUpdater.checkForUpdates();
+      await startLocalHandoff(item,result.filePath,generation);
     }catch(e){
       if(isCancellationError(e)||generation!==downloadGeneration){
         return emit();
@@ -668,7 +753,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
       let message=e&&e.message?e.message:String(e);
       console.warn('[CodexRebuildUpdater] update download failed',message);
       let resumableBytes=0;
-      try{resumableBytes=fs.statSync(path.join(packagesDir,item.fileName+'.partial')).size}catch{}
+      try{resumableBytes=fs.statSync(path.join(stagingDir,item.fileName+'.partial')).size}catch{}
       setStatus('error',{error:message,lastCheckedAt:Date.now(),downloadedBytes:resumableBytes,resumedBytes:resumableBytes});
     }finally{
       settleDownload();
@@ -688,12 +773,12 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     }catch{}
     stopProgress();
     let resumableBytes=0;
-    if(state.activeDownloadFile)try{resumableBytes=fs.statSync(path.join(packagesDir,state.activeDownloadFile+'.partial')).size}catch{}
+    if(state.activeDownloadFile)try{resumableBytes=fs.statSync(path.join(stagingDir,state.activeDownloadFile+'.partial')).size}catch{}
     setStatus('cancelling',{error:null,lastCheckedAt:Date.now(),downloadedBytes:resumableBytes,resumedBytes:resumableBytes,downloadStartedAt:null});
     await settlement;
     downloading=!1;
     downloadRequested=!1;
-    if(state.activeDownloadFile)try{resumableBytes=fs.statSync(path.join(packagesDir,state.activeDownloadFile+'.partial')).size}catch{}
+    if(state.activeDownloadFile)try{resumableBytes=fs.statSync(path.join(stagingDir,state.activeDownloadFile+'.partial')).size}catch{}
     if(state.status==='cancelling')setStatus('paused',{downloadedBytes:resumableBytes,resumedBytes:resumableBytes});
     return emit();
   };
@@ -729,12 +814,12 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
       });
     }
   }catch(e){console.warn('[CodexRebuildUpdater] ipc setup failed',e&&e.message?e.message:e)}
-  autoUpdater.on('checking-for-update',()=>{if(downloadRequested)setStatus('downloading',{error:null});else setStatus('checking',{error:null})});
+  autoUpdater.on('checking-for-update',()=>{if(localHandoff)setStatus('preparing',{error:null});else if(downloadRequested)setStatus('downloading',{error:null});else setStatus('checking',{error:null})});
   autoUpdater.on('update-available',info=>{
     checking=!1;
     downloading=!0;
     downloadRequested=!0;
-    setStatus('downloading',{error:null,updateVersion:state.updateVersion||info?.version||null,downloadStartedAt:state.downloadStartedAt||Date.now()});
+    setStatus(localHandoff?'preparing':'downloading',{error:null,updateVersion:state.updateVersion||info?.version||null,downloadStartedAt:state.downloadStartedAt||Date.now()});
     startProgress();
   });
   autoUpdater.on('update-not-available',()=>{
@@ -742,6 +827,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     downloading=!1;
     downloadRequested=!1;
     stopProgress();
+    closeLocalHandoff();
     setStatus('no-update',{error:null,lastCheckedAt:Date.now()},6000);
   });
   autoUpdater.on('error',e=>{
@@ -749,6 +835,10 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     downloading=!1;
     downloadRequested=!1;
     stopProgress();
+    let wasCancelled=cancelledLocalHandoff;
+    cancelledLocalHandoff=!1;
+    closeLocalHandoff();
+    if(wasCancelled){setStatus('paused',{error:null,lastCheckedAt:Date.now()});return}
     let message=e&&e.message?e.message:String(e);
     console.warn('[CodexRebuildUpdater] update failed',message);
     setStatus('error',{error:message,lastCheckedAt:Date.now()});
@@ -760,6 +850,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     stopProgress();
     if(downloaded)return;
     downloaded=!0;
+    closeLocalHandoff(!0);
     setStatus('ready',{error:null,downloadedBytes:state.activeDownloadSize??state.updateSize??state.downloadedBytes,lastCheckedAt:Date.now()});
   });
   try{autoUpdater.setFeedURL({url:updateUrl})}catch(e){console.warn(\`[CodexRebuildUpdater] invalid update feed\`,e&&e.message?e.message:e);return}

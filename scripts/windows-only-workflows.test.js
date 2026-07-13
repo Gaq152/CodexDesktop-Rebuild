@@ -25,8 +25,12 @@ test("Windows releases use independent codex-win tags and ZIP-only public assets
   for (const { name, text } of workflows) {
     assert.match(
       text,
-      /configure-windows-release-version\.js --previous scripts\/upstream-versions\.json --write-package package\.json --write-package src\/win\/_asar\/package\.json --github-output/,
+      /configure-windows-release-version\.js/,
     );
+    assert.match(text, /--previous["', ]+scripts\/upstream-versions\.json/);
+    assert.match(text, /--write-package["', ]+package\.json/);
+    assert.match(text, /--write-package["', ]+src\/win\/_asar\/package\.json/);
+    assert.match(text, /--github-output/);
     assert.match(text, /tag_name: codex-win-/i, `${name} must use codex-win tags`);
     assert.match(text, /name: Codex Win /i, `${name} must use the Windows release title`);
     assert.match(text, /CodexSetup-win-x64-.*\.zip/);
@@ -49,6 +53,10 @@ test("the manual workflow publishes Windows by default", () => {
   assert.match(workflow, /publish_update_feed:\s*\n(?:\s+.*\n)*?\s+default: true\s*\n\s+type: boolean/);
   assert.doesNotMatch(workflow, /\n\s+platform:\s*\n/);
   assert.doesNotMatch(workflow, /^  publish-windows-update-feed:\s*$/m);
+  assert.match(workflow, /name: Validate replacement inputs/);
+  assert.ok(
+    workflow.indexOf("name: Validate replacement inputs") < workflow.indexOf("uses: actions\/setup-node@v6"),
+  );
 });
 
 test("manual and scheduled releases reject mutable or rollback feed state before committing", () => {

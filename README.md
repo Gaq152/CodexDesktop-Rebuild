@@ -38,10 +38,14 @@ npm run dev
 
 ## Windows updater
 
-Windows full-package downloads are written to `packages/<file>.partial` and
-resume with HTTP Range after a network failure or app restart. The completed
-package is checked against the size and SHA1 from `RELEASES` before Squirrel is
-allowed to install it.
+Windows full-package downloads are written to `update-cache/<file>.partial`
+beside Squirrel's managed `packages` directory and resume with HTTP Range after
+a network failure or app restart. Existing partial downloads from the former
+`packages` location are migrated automatically. The completed package is
+checked against the size and SHA1 from `RELEASES` before Squirrel is allowed to
+install it. The verified package is then served to Squirrel from a tokenized
+loopback-only feed, so the native updater does not download the same GitHub
+asset a second time even if Squirrel recreates its `packages` directory.
 
 The update popup also provides an optional acceleration-prefix field. Values
 entered there are saved locally, may contain multiple HTTP(S) prefixes separated

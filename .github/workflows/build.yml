@@ -18,6 +18,16 @@ on:
         required: false
         default: false
         type: boolean
+      replace_existing_release:
+        description: "Replace assets and retarget the existing release for the same Windows version"
+        required: false
+        default: false
+        type: boolean
+      release_version_override:
+        description: "Optional exact X.Y.Z release version (used with same-version replacement)"
+        required: false
+        default: ""
+        type: string
 
 env:
   NODE_VERSION: "24"
@@ -41,6 +51,23 @@ jobs:
       windows_installer_version: ${{ steps.windows_artifacts.outputs.windows_installer_version }}
     steps:
       - uses: actions/checkout@v6
+      - name: Validate replacement inputs
+        shell: pwsh
+        env:
+          REPLACE_EXISTING_RELEASE: ${{ inputs.replace_existing_release }}
+          RELEASE_VERSION_OVERRIDE: ${{ inputs.release_version_override }}
+        run: |
+          $replace = ([string]$env:REPLACE_EXISTING_RELEASE).ToLowerInvariant() -eq "true"
+          $override = ([string]$env:RELEASE_VERSION_OVERRIDE).Trim()
+          if ($replace -and -not $override) {
+            throw "replace_existing_release requires an exact release_version_override"
+          }
+          if (-not $replace -and $override) {
+            throw "release_version_override is only allowed with replace_existing_release"
+          }
+          if ($override -and $override -notmatch '^\d+\.\d+\.\d+$') {
+            throw "release_version_override must be numeric X.Y.Z"
+          }
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -57,7 +84,23 @@ jobs:
 
       - name: Resolve actual Windows release version
         id: windows_version
-        run: node scripts/configure-windows-release-version.js --previous scripts/upstream-versions.json --write-package package.json --write-package src/win/_asar/package.json --github-output
+        shell: pwsh
+        env:
+          RELEASE_VERSION_OVERRIDE: ${{ inputs.release_version_override }}
+        run: |
+          $args = @(
+            "scripts/configure-windows-release-version.js",
+            "--previous", "scripts/upstream-versions.json",
+            "--write-package", "package.json",
+            "--write-package", "src/win/_asar/package.json",
+            "--github-output"
+          )
+          $override = ([string]$env:RELEASE_VERSION_OVERRIDE).Trim()
+          if ($override) {
+            $args += @("--release-version", $override)
+          }
+          & node @args
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Configure Windows update feed
         shell: pwsh
@@ -226,6 +269,7 @@ jobs:
       - name: Validate release metadata and monotonic state
         env:
           EXPECTED_VERSION: ${{ needs.build-windows.outputs.windows_release_version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           metadata_file="$(find artifacts -type f -name windows-release-metadata.json -print -quit)"
@@ -238,6 +282,10 @@ jobs:
             404) : > "$remote_releases" ;;
             *) echo "Unable to read current Windows update feed: HTTP $status" >&2; exit 1 ;;
           esac
+          replacement_args=()
+          if [[ "${{ inputs.replace_existing_release }}" == "true" ]]; then
+            replacement_args+=(--allow-same-version-replacement)
+          fi
           node scripts/windows-release-metadata.js \
             --metadata "$metadata_file" \
             --validate-promotion \
@@ -245,9 +293,16 @@ jobs:
             --package package.json \
             --tracked scripts/upstream-versions.json \
             --local-releases "$local_releases" \
-            --remote-releases "$remote_releases"
+            --remote-releases "$remote_releases" \
+            "${replacement_args[@]}"
           metadata_sha="$(node -e "console.log(require('./' + process.argv[1]).sourceSha)" "$metadata_file")"
           test "$metadata_sha" = "$GITHUB_SHA"
+          if [[ "${{ inputs.replace_existing_release }}" == "true" ]]; then
+            test "${{ inputs.release_version_override }}" = "$EXPECTED_VERSION"
+            tag="codex-win-${EXPECTED_VERSION}"
+            git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null
+            gh release view "$tag" >/dev/null
+          fi
 
       - name: Record built Windows versions
         env:
@@ -297,6 +352,7 @@ jobs:
             - Installer: `CodexSetup-win-x64-${{ steps.artifacts.outputs.windows_installer_version }}.zip`
             - The installer executable is inside the ZIP to avoid direct `.exe` browser download blocking.
             - Squirrel update packages are published separately to `windows-update-feed`.
+            - Updater fix: verified packages are handed to Squirrel through a local loopback feed, avoiding a second GitHub download.
           files: |
             artifacts/Codex-Windows-Portable-x64-*/Codex-win-x64-*.zip
             artifacts/Codex-Windows-Installer-x64-*/CodexSetup-win-x64-*.zip
@@ -335,3 +391,13 @@ jobs:
               gh release delete-asset "$tag" "$asset" -y
             fi
           done
+
+      - name: Retarget replacement release tag
+        if: inputs.replace_existing_release == true
+        env:
+          RELEASE_VERSION: ${{ needs.build-windows.outputs.windows_release_version }}
+        run: |
+          set -euo pipefail
+          tag="codex-win-${RELEASE_VERSION}"
+          git tag --force "$tag" HEAD
+          git push origin "refs/tags/$tag" --force
