@@ -1,13 +1,13 @@
 {
-  "updatedAt": "2026-07-13T06:47:13.424Z",
+  "updatedAt": "2026-07-13T07:22:38.033Z",
   "platforms": {
     "macOS-arm64": {
-      "version": "26.707.61608",
-      "build": "5200"
+      "version": "26.707.62119",
+      "build": "5211"
     },
     "macOS-x64": {
-      "version": "26.707.61608",
-      "build": "5200"
+      "version": "26.707.62119",
+      "build": "5211"
     },
     "Windows": {
       "version": "26.707.8168.0",
