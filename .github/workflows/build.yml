@@ -353,6 +353,7 @@ jobs:
             - The installer executable is inside the ZIP to avoid direct `.exe` browser download blocking.
             - Squirrel update packages are published separately to `windows-update-feed`.
             - Updater fix: verified packages are handed to Squirrel through a local loopback feed, avoiding a second GitHub download.
+            - Localization: all 48 keyboard-shortcut command titles are localized in the command catalog, metadata, and settings search index.
           files: |
             artifacts/Codex-Windows-Portable-x64-*/Codex-win-x64-*.zip
             artifacts/Codex-Windows-Installer-x64-*/CodexSetup-win-x64-*.zip
