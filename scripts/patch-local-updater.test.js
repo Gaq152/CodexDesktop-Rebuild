@@ -33,6 +33,7 @@ const {
   validateUpdateProxyPrefixes,
   buildPackageDownloadUrls,
   parseReleaseManifestEntries,
+  LOCAL_UPDATER_CONTRACT_VERSION,
 } = require("./patch-local-updater");
 
 const LATEST_LOCAL_MAIN_SOURCE =
@@ -147,6 +148,10 @@ function snapshotLocalUpdaterTargets(asarRoot, relativePaths) {
   assert.ok(bootstrap.includes("Range:'bytes='+offset+'-'"));
   assert.ok(bootstrap.includes("package size or SHA1 mismatch"));
   assert.ok(bootstrap.includes("bytes retained for resume"));
+  assert.ok(bootstrap.includes("CODEX_REBUILD_UPDATE_CANCELLED"));
+  assert.ok(bootstrap.includes("cancel:cancelDownload"));
+  assert.ok(bootstrap.includes("if(command==='cancel')return cancelDownload()"));
+  assert.ok(bootstrap.includes("setStatus('paused'"));
   assert.ok(bootstrap.includes("CODEX_REBUILD_UPDATE_PROXY_PREFIXES"));
   assert.ok(!bootstrap.includes("99.999.999999"));
 }
@@ -158,6 +163,7 @@ function snapshotLocalUpdaterTargets(asarRoot, relativePaths) {
   assert.ok(preload.includes("{command,...options}"));
   assert.ok(preload.includes("downloadUpdate:options=>invoke('download',options)"));
   assert.ok(preload.includes("retryUpdate:options=>invoke('retry',options)"));
+  assert.ok(preload.includes("cancelDownload:()=>invoke('cancel')"));
   assert.ok(preload.includes("clearUpdateState:()=>invoke('clear')"));
   assert.ok(preload.includes("e.contextBridge.exposeInMainWorld('codexRebuildUpdater',updaterApi)"));
   assert.ok(!preload.includes("document.createElement('div')"));
@@ -228,6 +234,7 @@ test("preload forwards popup download options to updater IPC", async () => {
   await context.codexRebuildUpdater.retryUpdate({
     proxyPrefixes: ["https://one.invalid/", "https://two.invalid/"],
   });
+  await context.codexRebuildUpdater.cancelDownload();
   assert.deepEqual(
     JSON.parse(JSON.stringify(requests)),
     [
@@ -236,6 +243,7 @@ test("preload forwards popup download options to updater IPC", async () => {
         command: "retry",
         proxyPrefixes: ["https://one.invalid/", "https://two.invalid/"],
       },
+      { command: "cancel" },
     ],
   );
 });
@@ -249,12 +257,14 @@ test("retains RELEASES SHA1 and size for package verification", () => {
   assert.deepEqual(parseReleaseManifestEntries("not-a-sha package.nupkg 12"), []);
 });
 
-test("runtime downloader resumes a partial package with Range and verifies SHA1", async (t) => {
+test("runtime downloader adopts a legacy incomplete package, resumes it, and verifies SHA1", async (t) => {
   const body = Buffer.from("0123456789abcdefghijklmnopqrstuvwxyz");
   const sha1 = crypto.createHash("sha1").update(body).digest("hex");
   const fileName = "Codex-2.0.0-full.nupkg";
   const ranges = [];
   const packageRequests = [];
+  let legacyFinalToObserve = null;
+  let legacyFinalObserved = false;
   const server = http.createServer((request, response) => {
     if (request.url.startsWith("/RELEASES")) {
       response.end(`${sha1} ${fileName} ${body.length}\n`);
@@ -278,6 +288,10 @@ test("runtime downloader resumes a partial package with Range and verifies SHA1"
         });
         response.end(body.subarray(offset));
       } else {
+        if (legacyFinalToObserve) {
+          legacyFinalObserved =
+            fs.existsSync(legacyFinalToObserve) && fs.statSync(legacyFinalToObserve).size === 9;
+        }
         response.writeHead(200, { "Content-Length": body.length });
         response.end(body);
       }
@@ -295,7 +309,7 @@ test("runtime downloader resumes a partial package with Range and verifies SHA1"
   fs.mkdirSync(appDir, { recursive: true });
   fs.mkdirSync(packagesDir, { recursive: true });
   fs.writeFileSync(path.join(root, "Update.exe"), "fixture");
-  fs.writeFileSync(path.join(packagesDir, `${fileName}.partial`), body.subarray(0, 9));
+  fs.writeFileSync(path.join(packagesDir, fileName), body.subarray(0, 9));
 
   const autoUpdater = new EventEmitter();
   let updaterChecks = 0;
@@ -361,6 +375,243 @@ test("runtime downloader resumes a partial package with Range and verifies SHA1"
   assert.equal(updaterChecks, 1);
   assert.equal(context.__CodexRebuildUpdaterLastState.status, "preparing");
   assert.equal(context.__CodexRebuildUpdaterLastState.resumedBytes, 9);
+
+  const failedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "updater-adopt-failure-"));
+  t.after(() => fs.rmSync(failedRoot, { recursive: true, force: true }));
+  const failedAppDir = path.join(failedRoot, "app-1.0.0");
+  const failedPackagesDir = path.join(failedRoot, "packages");
+  const failedFinalPath = path.join(failedPackagesDir, fileName);
+  const failedPartialPath = `${failedFinalPath}.partial`;
+  fs.mkdirSync(failedAppDir, { recursive: true });
+  fs.mkdirSync(failedPackagesDir, { recursive: true });
+  fs.writeFileSync(path.join(failedRoot, "Update.exe"), "fixture");
+  fs.writeFileSync(failedFinalPath, body.subarray(0, 9));
+  legacyFinalToObserve = failedFinalPath;
+
+  const renameFailureFs = Object.create(fs);
+  let adoptionRenameAttempts = 0;
+  renameFailureFs.renameSync = (source, destination) => {
+    if (source === failedFinalPath && destination === failedPartialPath) {
+      adoptionRenameAttempts += 1;
+      throw new Error("simulated legacy adoption rename failure");
+    }
+    return fs.renameSync(source, destination);
+  };
+  const failedAutoUpdater = new EventEmitter();
+  failedAutoUpdater.setFeedURL = () => {};
+  failedAutoUpdater.checkForUpdates = () => {};
+  failedAutoUpdater.quitAndInstall = () => {};
+  const failedContext = {
+    Buffer,
+    URL,
+    clearInterval,
+    clearTimeout,
+    console,
+    globalThis: null,
+    process: {
+      platform: "win32",
+      arch: "x64",
+      argv: ["Codex.exe"],
+      execPath: path.join(failedAppDir, "Codex.exe"),
+      env: {
+        CODEX_REBUILD_UPDATE_URL: updateUrl,
+        CODEX_REBUILD_UPDATE_PROXY_PREFIXES: "",
+      },
+    },
+    require(id) {
+      if (id === "node:fs") return renameFailureFs;
+      if (id === "electron") {
+        return {
+          app: {
+            isPackaged: true,
+            getVersion: () => "1.0.0",
+            whenReady: () => Promise.resolve(),
+          },
+          autoUpdater: failedAutoUpdater,
+          dialog: {},
+          ipcMain: { handle() {} },
+          BrowserWindow: { getAllWindows: () => [] },
+        };
+      }
+      if (id === "../../package.json") return { codexRebuildWindowsUpdateUrl: updateUrl };
+      return require(id);
+    },
+    setInterval,
+    setTimeout,
+  };
+  failedContext.globalThis = failedContext;
+  vm.runInNewContext(`${makeBootstrapPrefix()}void 0;\n}\n`, failedContext);
+  await new Promise((resolve) => setImmediate(resolve));
+  await failedContext.__CodexRebuildUpdaterCommand.check();
+  await failedContext.__CodexRebuildUpdaterCommand.download();
+
+  assert.equal(adoptionRenameAttempts, 1);
+  assert.equal(legacyFinalObserved, true);
+  assert.equal(ranges.at(-1), null);
+  assert.deepEqual(fs.readFileSync(failedFinalPath), body);
+  assert.equal(fs.existsSync(failedPartialPath), false);
+});
+
+test("runtime downloader cancels in flight, retains bytes, and resumes through a proxy", async (t) => {
+  const body = Buffer.alloc(256 * 1024, "c");
+  const sha1 = crypto.createHash("sha1").update(body).digest("hex");
+  const fileName = "Codex-2.0.0-full.nupkg";
+  const proxyRanges = [];
+  let fallbackRequests = 0;
+  let firstChunkResolve;
+  const firstChunkSent = new Promise((resolve) => { firstChunkResolve = resolve; });
+  const server = http.createServer((request, response) => {
+    if (request.url.startsWith("/RELEASES")) {
+      response.end(`${sha1} ${fileName} ${body.length}\n`);
+      return;
+    }
+    if (request.url === `/${fileName}` && !request.headers.range) {
+      response.writeHead(200, { "Content-Length": body.length });
+      response.write(body.subarray(0, 64 * 1024));
+      firstChunkResolve();
+      return;
+    }
+    if (request.url.startsWith("/proxy/http://")) {
+      const range = request.headers.range;
+      proxyRanges.push(range ?? null);
+      const offset = Number(range?.match(/^bytes=(\d+)-$/)?.[1] ?? 0);
+      response.writeHead(offset > 0 ? 206 : 200, {
+        "Content-Length": body.length - offset,
+        ...(offset > 0
+          ? { "Content-Range": `bytes ${offset}-${body.length - 1}/${body.length}` }
+          : {}),
+      });
+      response.end(body.subarray(offset));
+      return;
+    }
+    if (request.url.startsWith("/fallback/http://")) {
+      fallbackRequests += 1;
+      response.writeHead(503).end("fallback should not be reached after cancellation");
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const updateUrl = `http://127.0.0.1:${server.address().port}`;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "updater-cancel-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const appDir = path.join(root, "app-1.0.0");
+  const packagesDir = path.join(root, "packages");
+  const partialPath = path.join(packagesDir, `${fileName}.partial`);
+  fs.mkdirSync(appDir, { recursive: true });
+  fs.mkdirSync(packagesDir, { recursive: true });
+  fs.writeFileSync(path.join(root, "Update.exe"), "fixture");
+
+  let destroyRequestedResolve;
+  const destroyRequested = new Promise((resolve) => { destroyRequestedResolve = resolve; });
+  let releaseDestroyResolve;
+  const releaseDestroy = new Promise((resolve) => { releaseDestroyResolve = resolve; });
+  t.after(() => releaseDestroyResolve());
+  const delayedFs = Object.create(fs);
+  delayedFs.createWriteStream = (...args) => {
+    const stream = fs.createWriteStream(...args);
+    const destroy = stream.destroy.bind(stream);
+    let requested = false;
+    stream.destroy = (...destroyArgs) => {
+      if (!requested) {
+        requested = true;
+        destroyRequestedResolve();
+        releaseDestroy.then(() => destroy(...destroyArgs));
+      }
+      return stream;
+    };
+    return stream;
+  };
+
+  const autoUpdater = new EventEmitter();
+  let updaterChecks = 0;
+  autoUpdater.setFeedURL = () => {};
+  autoUpdater.checkForUpdates = () => { updaterChecks += 1; };
+  autoUpdater.quitAndInstall = () => {};
+  const context = {
+    Buffer,
+    URL,
+    clearInterval,
+    clearTimeout,
+    console,
+    globalThis: null,
+    process: {
+      platform: "win32",
+      arch: "x64",
+      argv: ["Codex.exe"],
+      execPath: path.join(appDir, "Codex.exe"),
+      env: {
+        CODEX_REBUILD_UPDATE_URL: updateUrl,
+        CODEX_REBUILD_UPDATE_PROXY_PREFIXES: updateUrl + "/fallback/",
+      },
+    },
+    require(id) {
+      if (id === "node:fs") return delayedFs;
+      if (id === "electron") {
+        return {
+          app: {
+            isPackaged: true,
+            getVersion: () => "1.0.0",
+            whenReady: () => Promise.resolve(),
+          },
+          autoUpdater,
+          dialog: {},
+          ipcMain: { handle() {} },
+          BrowserWindow: { getAllWindows: () => [] },
+        };
+      }
+      if (id === "../../package.json") return { codexRebuildWindowsUpdateUrl: updateUrl };
+      return require(id);
+    },
+    setInterval,
+    setTimeout,
+  };
+  context.globalThis = context;
+  vm.runInNewContext(`${makeBootstrapPrefix()}void 0;\n}\n`, context);
+  await new Promise((resolve) => setImmediate(resolve));
+  await context.__CodexRebuildUpdaterCommand.check();
+
+  const firstDownload = context.__CodexRebuildUpdaterCommand.download();
+  await firstChunkSent;
+  for (let attempt = 0; attempt < 100 && !fs.existsSync(partialPath); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const bytesBeforeCancel = fs.statSync(partialPath).size;
+  assert.ok(bytesBeforeCancel > 0 && bytesBeforeCancel < body.length);
+
+  const cancelPromise = context.__CodexRebuildUpdaterCommand.cancel();
+  await destroyRequested;
+  let cancelSettled = false;
+  cancelPromise.then(() => { cancelSettled = true; });
+  const earlyRetryState = await context.__CodexRebuildUpdaterCommand.retry({
+    proxyPrefix: updateUrl + "/proxy/",
+  });
+  const earlyClearState = await context.__CodexRebuildUpdaterCommand.clear();
+  assert.equal(earlyRetryState.status, "cancelling");
+  assert.equal(earlyClearState.status, "cancelling");
+  assert.equal(cancelSettled, false);
+  assert.deepEqual(proxyRanges, []);
+  assert.equal(fallbackRequests, 0);
+  releaseDestroyResolve();
+  await cancelPromise;
+  await firstDownload;
+  const retainedBytes = fs.statSync(partialPath).size;
+  assert.equal(context.__CodexRebuildUpdaterLastState.status, "paused");
+  assert.equal(context.__CodexRebuildUpdaterLastState.error, null);
+  assert.equal(context.__CodexRebuildUpdaterLastState.resumedBytes, retainedBytes);
+  assert.ok(retainedBytes >= bytesBeforeCancel && retainedBytes < body.length);
+  assert.equal(updaterChecks, 0);
+
+  await context.__CodexRebuildUpdaterCommand.retry({
+    proxyPrefix: updateUrl + "/proxy/",
+  });
+  assert.deepEqual(proxyRanges, [`bytes=${retainedBytes}-`]);
+  assert.deepEqual(fs.readFileSync(path.join(packagesDir, fileName)), body);
+  assert.equal(fs.existsSync(partialPath), false);
+  assert.equal(context.__CodexRebuildUpdaterLastState.status, "preparing");
+  assert.equal(context.__CodexRebuildUpdaterLastState.resumedBytes, retainedBytes);
+  assert.equal(updaterChecks, 1);
 });
 
 {
@@ -378,6 +629,8 @@ test("runtime downloader resumes a partial package with Range and verifies SHA1"
   assert.ok(mainMenu.includes("let command=globalThis.__CodexRebuildUpdaterCommand?.[name];"));
   assert.ok(mainMenu.includes("codexRebuildRunUpdaterCommand('check','checking')"));
   assert.ok(mainMenu.includes("codexRebuildRunUpdaterCommand('download','downloading')"));
+  assert.ok(mainMenu.includes("codexRebuildRunUpdaterCommand('cancel',null)"));
+  assert.ok(mainMenu.includes("id:'codex-rebuild-updater-action-cancel'"));
   assert.ok(mainMenu.includes("codexRebuildRunUpdaterCommand('clear','idle')"));
   assert.ok(mainMenu.includes("codexRebuildUpdaterLabel"));
   assert.ok(mainMenu.includes("下载中 "));
@@ -432,6 +685,9 @@ test("runtime downloader resumes a partial package with Range and verifies SHA1"
   assert.ok(patched.includes("role:'dialog'"));
   assert.ok(patched.includes("'aria-live':'polite'"));
   assert.ok(patched.includes("downloadUpdate"));
+  assert.ok(patched.includes("cancelDownload"));
+  assert.ok(patched.includes("取消下载"));
+  assert.ok(patched.includes("r==='paused'"));
   assert.ok(patched.includes("codexRebuildUpdateProxyPrefix"));
   assert.ok(patched.includes("加速地址前缀（可选）"));
   assert.ok(patched.includes("proxyPrefix:p()"));
@@ -624,6 +880,33 @@ test("rejects stale or mismatched canonical updater block versions", () => {
     () => planLocalUpdaterSources(patched),
     /backend|bootstrap|canonical|version|postcondition/i,
   );
+});
+
+test("migrates the v2 updater layers to the cancellable download contract", () => {
+  assert.equal(LOCAL_UPDATER_CONTRACT_VERSION, 3);
+  const current = applyLocalUpdaterPlan(makeCleanLocalUpdaterSources());
+  const legacy = {
+    packageSource: current.packageSource,
+    files: Object.fromEntries(
+      Object.entries(current.files).map(([file, source]) => [
+        file,
+        source.replaceAll(":v3 */", ":v2 */"),
+      ]),
+    ),
+  };
+
+  const migrated = applyLocalUpdaterPlan(legacy);
+  assert.equal(migrated.plan.status, "patched");
+  assert.ok(migrated.plan.changes.length >= 4);
+  assert.ok(
+    Object.values(migrated.files).some((source) => source.includes("cancelDownload")),
+  );
+  assert.ok(
+    Object.values(migrated.files).every(
+      (source) => !source.includes(":v2 */"),
+    ),
+  );
+  assert.equal(planLocalUpdaterSources(migrated).status, "already");
 });
 
 test("migrates the exact v1 updater backend to the current shortcut lifecycle", () => {

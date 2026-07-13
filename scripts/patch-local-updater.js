@@ -19,7 +19,8 @@ const DEFAULT_WINDOWS_UPDATE_PROXY_PREFIXES = [
   "https://gh-proxy.com/",
   "https://ghproxy.net/",
 ];
-const LOCAL_UPDATER_CONTRACT_VERSION = 2;
+const LOCAL_UPDATER_CONTRACT_VERSION = 3;
+const STRUCTURAL_LOCAL_UPDATER_VERSIONS = [1, 2];
 const START_MARKER = "/* CodexRebuildLocalUpdater:start */";
 const END_MARKER = "/* CodexRebuildLocalUpdater:end */";
 const FILE_END_MARKER = "/* CodexRebuildLocalUpdater:file-end */";
@@ -380,18 +381,34 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
       return await sha1File(filePath)===item.sha1;
     }catch{return!1}
   };
-  let downloadAttempt=(target,filePath,expectedSize,redirects=0)=>new Promise((resolve,reject)=>{
+  let activeDownloadAttempt=null,activeDownloadSettlement=Promise.resolve(),downloadGeneration=0;
+  let cancellationError=()=>{let error=Error('update download cancelled');error.code='CODEX_REBUILD_UPDATE_CANCELLED';return error};
+  let isCancellationError=error=>error?.code==='CODEX_REBUILD_UPDATE_CANCELLED';
+  let downloadAttempt=(target,filePath,expectedSize,generation,redirects=0)=>new Promise((resolve,reject)=>{
+    if(generation!==downloadGeneration){reject(cancellationError());return}
     let offset=0;
     try{offset=fs.existsSync(filePath)?fs.statSync(filePath).size:0}catch{}
     if(offset>expectedSize){try{fs.rmSync(filePath,{force:!0})}catch{}offset=0}
     let headers=offset>0?{Range:'bytes='+offset+'-'}:{};
-    let client=target.startsWith('http:')?http:https,settled=!1,req,output=null;
-    let finish=(error,value)=>{if(settled)return;settled=!0;if(error)try{output?.destroy()}catch{}error?reject(error):resolve(value)};
+    let client=target.startsWith('http:')?http:https,settled=!1,pendingError=null,req,output=null,attempt={generation,req:null,response:null};
+    let complete=(error,value)=>{if(settled)return;settled=!0;if(activeDownloadAttempt===attempt)activeDownloadAttempt=null;error?reject(error):resolve(value)};
+    let finish=(error,value)=>{
+      if(settled||pendingError)return;
+      if(error&&output&&!output.closed){
+        pendingError=error;
+        output.once('close',()=>complete(pendingError));
+        try{output.destroy()}catch{complete(error)}
+        return;
+      }
+      complete(error,value);
+    };
     req=client.get(target,{headers},res=>{
+      attempt.response=res;
+      if(generation!==downloadGeneration){res.resume();finish(cancellationError());return}
       if(res.statusCode>=300&&res.statusCode<400&&res.headers.location&&redirects<5){
         res.resume();
         let next=new urlMod.URL(res.headers.location,target).toString();
-        downloadAttempt(next,filePath,expectedSize,redirects+1).then(value=>finish(null,value),finish);
+        downloadAttempt(next,filePath,expectedSize,generation,redirects+1).then(value=>finish(null,value),finish);
         return;
       }
       if(res.statusCode===416&&offset===expectedSize){res.resume();finish(null,{resumedFrom:offset,source:target});return}
@@ -415,21 +432,33 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
       });
       res.on('error',finish);
       output.on('error',finish);
-      output.on('close',()=>finish(null,{resumedFrom:append?offset:0,source:target}));
+      output.on('close',()=>generation===downloadGeneration?finish(null,{resumedFrom:append?offset:0,source:target}):finish(cancellationError()));
       res.pipe(output);
     });
+    attempt.req=req;
+    activeDownloadAttempt=attempt;
     req.setTimeout(45000,()=>req.destroy(Error('download inactivity timeout')));
     req.on('error',finish);
   });
-  let downloadPackage=async(item,requestedProxyPrefixes)=>{
+  let downloadPackage=async(item,requestedProxyPrefixes,generation)=>{
     fs.mkdirSync(packagesDir,{recursive:!0});
     let finalPath=path.join(packagesDir,item.fileName),partialPath=finalPath+'.partial';
-    if(await verifyPackage(finalPath,item))return{source:'cache',resumedFrom:item.size};
-    if(fs.existsSync(finalPath))try{fs.rmSync(finalPath,{force:!0})}catch{}
+    if(generation!==downloadGeneration)throw cancellationError();
+    if(await verifyPackage(finalPath,item)){
+      if(generation!==downloadGeneration)throw cancellationError();
+      return{source:'cache',resumedFrom:item.size};
+    }
+    if(fs.existsSync(finalPath)){
+      try{
+        let finalSize=fs.statSync(finalPath).size,partialSize=fs.existsSync(partialPath)?fs.statSync(partialPath).size:0;
+        if(finalSize>0&&finalSize<item.size&&partialSize===0)try{fs.renameSync(finalPath,partialPath)}catch{}
+      }catch{}
+    }
     let existing=0;
     try{existing=fs.existsSync(partialPath)?fs.statSync(partialPath).size:0}catch{}
     if(existing>item.size){try{fs.rmSync(partialPath,{force:!0})}catch{}existing=0}
     if(existing===item.size&&await verifyPackage(partialPath,item)){
+      if(generation!==downloadGeneration)throw cancellationError();
       if(fs.existsSync(finalPath))fs.rmSync(finalPath,{force:!0});
       fs.renameSync(partialPath,finalPath);
       return{source:'partial-cache',resumedFrom:existing};
@@ -437,9 +466,13 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     let errors=[];
     for(let target of packageUrls(item.fileName,requestedProxyPrefixes)){
       try{
+        if(generation!==downloadGeneration)throw cancellationError();
         setStatus('downloading',{error:null,activeDownloadFile:item.fileName,activeDownloadSize:item.size,downloadedBytes:existing,resumedBytes:existing,downloadSource:target});
-        let result=await downloadAttempt(target,partialPath,item.size);
-        if(!await verifyPackage(partialPath,item)){
+        let result=await downloadAttempt(target,partialPath,item.size,generation);
+        if(generation!==downloadGeneration)throw cancellationError();
+        let verified=await verifyPackage(partialPath,item);
+        if(generation!==downloadGeneration)throw cancellationError();
+        if(!verified){
           try{fs.rmSync(partialPath,{force:!0})}catch{}
           existing=0;
           throw Error('package size or SHA1 mismatch');
@@ -449,6 +482,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
         return result;
       }catch(error){
         try{existing=fs.existsSync(partialPath)?fs.statSync(partialPath).size:0}catch{existing=0}
+        if(isCancellationError(error)||generation!==downloadGeneration)throw cancellationError();
         errors.push(target+': '+(error&&error.message?error.message:String(error)));
         setStatus('downloading',{downloadedBytes:existing,resumedBytes:existing,downloadSource:target});
       }
@@ -612,16 +646,22 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     downloadRequested=!0;
     checking=!1;
     downloading=!0;
+    let generation=++downloadGeneration;
+    let settleDownload;
+    activeDownloadSettlement=new Promise(resolve=>{settleDownload=resolve});
     let started=Date.now();
     let retained=0;
     try{retained=fs.statSync(path.join(packagesDir,item.fileName+'.partial')).size}catch{}
     setStatus('downloading',{error:null,downloadStartedAt:started,downloadedBytes:retained,resumedBytes:retained,elapsedMs:0,version:getInstalledVersion(),activeDownloadFile:item.fileName,activeDownloadSize:item.size});
     startProgress();
     try{
-      let result=await downloadPackage(item,requestedProxyPrefixes);
+      let result=await downloadPackage(item,requestedProxyPrefixes,generation);
       setStatus('preparing',{error:null,downloadedBytes:item.size,resumedBytes:result.resumedFrom||retained,downloadSource:result.source});
       autoUpdater.checkForUpdates();
     }catch(e){
+      if(isCancellationError(e)||generation!==downloadGeneration){
+        return emit();
+      }
       downloading=!1;
       downloadRequested=!1;
       stopProgress();
@@ -630,7 +670,31 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
       let resumableBytes=0;
       try{resumableBytes=fs.statSync(path.join(packagesDir,item.fileName+'.partial')).size}catch{}
       setStatus('error',{error:message,lastCheckedAt:Date.now(),downloadedBytes:resumableBytes,resumedBytes:resumableBytes});
+    }finally{
+      settleDownload();
     }
+    return emit();
+  };
+  let cancelDownload=async()=>{
+    if(!downloading||state.status!=='downloading')return emit();
+    let settlement=activeDownloadSettlement;
+    downloadGeneration+=1;
+    let attempt=activeDownloadAttempt;
+    activeDownloadAttempt=null;
+    let error=cancellationError();
+    try{
+      if(attempt?.req&&!attempt.req.destroyed)attempt.req.destroy(error);
+      else if(attempt?.response&&!attempt.response.destroyed)attempt.response.destroy(error);
+    }catch{}
+    stopProgress();
+    let resumableBytes=0;
+    if(state.activeDownloadFile)try{resumableBytes=fs.statSync(path.join(packagesDir,state.activeDownloadFile+'.partial')).size}catch{}
+    setStatus('cancelling',{error:null,lastCheckedAt:Date.now(),downloadedBytes:resumableBytes,resumedBytes:resumableBytes,downloadStartedAt:null});
+    await settlement;
+    downloading=!1;
+    downloadRequested=!1;
+    if(state.activeDownloadFile)try{resumableBytes=fs.statSync(path.join(packagesDir,state.activeDownloadFile+'.partial')).size}catch{}
+    if(state.status==='cancelling')setStatus('paused',{downloadedBytes:resumableBytes,resumedBytes:resumableBytes});
     return emit();
   };
   let installUpdate=()=>{
@@ -638,6 +702,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     return startDownload();
   };
   let clearStatus=()=>{
+    if(downloading)return emit();
     checking=!1;
     downloading=!1;
     downloadRequested=!1;
@@ -645,7 +710,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
     setStatus('idle',{error:null,updateVersion:null,updateFile:null,updateFiles:null,updateSize:null,activeDownloadFile:null,activeDownloadSize:null,downloadedBytes:null,resumedBytes:null,downloadSource:null,downloadStartedAt:null,elapsedMs:null});
     return emit();
   };
-  globalThis.__CodexRebuildUpdaterCommand={check:()=>checkOnly(!0),download:startDownload,retry:options=>state.updateFile?startDownload(options):checkOnly(!0),install:installUpdate,clear:clearStatus};
+  globalThis.__CodexRebuildUpdaterCommand={check:()=>checkOnly(!0),download:startDownload,retry:options=>state.updateFile?startDownload(options):checkOnly(!0),cancel:cancelDownload,install:installUpdate,clear:clearStatus};
   try{
     if(ipcMain&&!globalThis.__CodexRebuildUpdaterIpcRegistered){
       globalThis.__CodexRebuildUpdaterIpcRegistered=!0;
@@ -655,6 +720,7 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
         if(command==='check')return checkOnly(!0);
         if(command==='download')return startDownload(request);
         if(command==='retry')return state.updateFile?startDownload(request):checkOnly(!0);
+        if(command==='cancel')return cancelDownload();
         if(command==='clear')return clearStatus();
         if(command==='install'){
           return installUpdate();
@@ -724,6 +790,7 @@ ${versionLine};(()=>{try{
     checkForUpdates:()=>invoke('check'),
     downloadUpdate:options=>invoke('download',options),
     retryUpdate:options=>invoke('retry',options),
+    cancelDownload:()=>invoke('cancel'),
     installUpdate:()=>invoke('install'),
     clearUpdateState:()=>invoke('clear'),
     onState:t=>{if(typeof t!=='function')return()=>{};listeners.add(t);return()=>listeners.delete(t)}
@@ -755,6 +822,7 @@ ${versionLine}(()=>{
     download:'codex-rebuild-updater-action-download',
     install:'codex-rebuild-updater-action-install',
     retry:'codex-rebuild-updater-action-retry',
+    cancel:'codex-rebuild-updater-action-cancel',
     clear:'codex-rebuild-updater-action-clear'
   };
   let codexRebuildUpdaterState=globalThis.__CodexRebuildUpdaterLastState||{status:'idle'};
@@ -787,8 +855,10 @@ ${versionLine}(()=>{
       let pct=codexRebuildUpdaterProgress(state);
       return pct==null?'下载中':'下载中 '+Math.floor(pct)+'%';
     }
+    if(status==='cancelling')return '取消中...';
     if(status==='preparing')return '准备中';
     if(status==='ready')return '重启安装';
+    if(status==='paused')return '已暂停';
     if(status==='no-update')return '已是最新';
     if(status==='error')return state.resumedBytes>0?'下载中断':'检查失败';
     return '检查更新';
@@ -798,8 +868,10 @@ ${versionLine}(()=>{
     if(status==='checking')return '正在检查更新';
     if(status==='available')return '发现新版本，确认后开始下载';
     if(status==='downloading')return '正在下载更新';
+    if(status==='cancelling')return '正在安全停止下载';
     if(status==='preparing')return '下载完成，正在准备安装';
     if(status==='ready')return '更新已下载，可以重启安装';
+    if(status==='paused')return '下载已暂停，进度已保留';
     if(status==='no-update')return '当前已是最新版本';
     if(status==='error')return state.resumedBytes>0?'下载中断，进度已保留':'检查更新失败';
     return '未检查更新';
@@ -822,8 +894,8 @@ ${versionLine}(()=>{
     let s=codexRebuildUpdaterState,status=s.status||'idle';
     globalThis.__CodexRebuildUpdaterLastState=s;
     let pct=codexRebuildUpdaterProgress(s);
-    let showVersion=status==='available'||status==='downloading'||status==='preparing'||status==='ready'||status==='checking';
-    let showDownload=status==='downloading'||status==='preparing';
+    let showVersion=status==='available'||status==='downloading'||status==='cancelling'||status==='preparing'||status==='ready'||status==='paused'||status==='checking';
+    let showDownload=status==='downloading'||status==='cancelling'||status==='preparing'||status==='paused';
     codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.top,{label:codexRebuildUpdaterLabel(s)});
     codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.status,{label:codexRebuildUpdaterStatusText(s)});
     codexRebuildUpdaterSetRow(codexRebuildUpdaterIds.current,showVersion,'当前版本: '+codexRebuildUpdaterFormatVersion(s.version||s.appVersion));
@@ -836,8 +908,9 @@ ${versionLine}(()=>{
     codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.check,{visible:status==='idle'||status==='no-update',enabled:status!=='checking'});
     codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.download,{visible:status==='available',enabled:status==='available'});
     codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.install,{visible:status==='ready',enabled:status==='ready'});
-    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.retry,{visible:status==='error',enabled:status==='error'});
-    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.clear,{visible:status==='error',enabled:status==='error'});
+    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.retry,{visible:status==='error'||status==='paused',enabled:status==='error'||status==='paused'});
+    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.cancel,{visible:status==='downloading',enabled:status==='downloading'});
+    codexRebuildUpdaterSetMenuItem(codexRebuildUpdaterIds.clear,{visible:status==='error'||status==='paused',enabled:status==='error'||status==='paused'});
     return s;
   };
   globalThis.__CodexRebuildUpdaterMenuSetState=codexRebuildUpdaterApplyState;
@@ -878,6 +951,7 @@ ${versionLine}(()=>{
         {id:'codex-rebuild-updater-action-download',label:'下载更新',visible:false,click:()=>{codexRebuildRunUpdaterCommand('download','downloading')}},
         {id:'codex-rebuild-updater-action-install',label:'重启安装',visible:false,click:()=>{codexRebuildRunUpdaterCommand('install',null)}},
         {id:'codex-rebuild-updater-action-retry',label:'继续下载',visible:false,click:()=>{codexRebuildRunUpdaterCommand('retry','downloading')}},
+        {id:'codex-rebuild-updater-action-cancel',label:'取消下载',visible:false,click:()=>{codexRebuildRunUpdaterCommand('cancel',null)}},
         {id:'codex-rebuild-updater-action-clear',label:'取消',visible:false,click:()=>{codexRebuildRunUpdaterCommand('clear','idle')}}
       ]}
     ]
@@ -1171,16 +1245,19 @@ function inspectUpdaterMainMenuSource(code, { allowLegacy = false } = {}) {
   }
   let candidate = candidates.find((item) => item.block === range.code);
   const versions = updaterVersionSignatures(code);
+  const structuralVersion = STRUCTURAL_LOCAL_UPDATER_VERSIONS.find(
+    (version) => versions[0] === layerVersionMarker("main-menu", version),
+  );
   if (
     !candidate &&
     allowLegacy &&
     versions.length === 1 &&
-    versions[0] === layerVersionMarker("main-menu", 1)
+    structuralVersion != null
   ) {
     candidate = {
-      dialect: "structural-v1",
-      version: 1,
-      versionMarker: layerVersionMarker("main-menu", 1),
+      dialect: `structural-v${structuralVersion}`,
+      version: structuralVersion,
+      versionMarker: layerVersionMarker("main-menu", structuralVersion),
     };
   }
   if (!candidate) {
@@ -1248,10 +1325,10 @@ function makeWebviewMenuBarFunctionBody() {
 '.cru-trigger.available{border-color:color-mix(in srgb,var(--cru-success) 50%,transparent);background:color-mix(in srgb,var(--cru-success) 11%,transparent);color:var(--cru-success)}',
 '.cru-trigger.ready{border-color:color-mix(in srgb,var(--cru-success) 58%,transparent);background:color-mix(in srgb,var(--cru-success) 14%,transparent);color:var(--cru-success)}',
 '.cru-trigger.error{border-color:color-mix(in srgb,var(--cru-error) 55%,transparent);background:color-mix(in srgb,var(--cru-error) 12%,transparent);color:var(--cru-error)}',
-'.cru-trigger.checking,.cru-trigger.downloading,.cru-trigger.preparing{border-color:color-mix(in srgb,var(--color-token-border-default) 70%,transparent);background:color-mix(in srgb,var(--color-token-foreground) 6%,transparent);color:var(--color-token-text-primary)}',
+'.cru-trigger.checking,.cru-trigger.downloading,.cru-trigger.cancelling,.cru-trigger.preparing{border-color:color-mix(in srgb,var(--color-token-border-default) 70%,transparent);background:color-mix(in srgb,var(--color-token-foreground) 6%,transparent);color:var(--color-token-text-primary)}',
 '.cru-trigger.downloading::after{content:"";position:absolute;left:8px;right:auto;bottom:1px;width:var(--cru-progress,0%);max-width:calc(100% - 16px);height:2px;border-radius:999px;background:var(--cru-success);transition:width .18s ease}',
 '.cru-mark{position:relative;width:7px;height:7px;flex:0 0 7px;border-radius:999px;background:currentColor;opacity:.82}',
-'.cru-trigger.checking .cru-mark,.cru-trigger.downloading .cru-mark,.cru-trigger.preparing .cru-mark{width:10px;height:10px;flex-basis:10px;border:2px solid currentColor;border-top-color:transparent;background:transparent;animation:cru-spin .85s linear infinite}',
+'.cru-trigger.checking .cru-mark,.cru-trigger.downloading .cru-mark,.cru-trigger.cancelling .cru-mark,.cru-trigger.preparing .cru-mark{width:10px;height:10px;flex-basis:10px;border:2px solid currentColor;border-top-color:transparent;background:transparent;animation:cru-spin .85s linear infinite}',
 '.cru-label{min-width:0;overflow:hidden;text-overflow:ellipsis}',
 '.cru-popover{-webkit-app-region:no-drag;position:absolute;top:31px;left:0;z-index:60;width:min(328px,calc(100vw - 24px));border:1px solid color-mix(in srgb,var(--color-token-border-default) 78%,transparent);border-radius:10px;background:color-mix(in srgb,var(--color-token-main-surface-primary) 96%,black 4%);color:var(--color-token-text-primary);box-shadow:0 18px 48px rgb(0 0 0 / .28);padding:12px;box-sizing:border-box;backdrop-filter:blur(18px);animation:cru-pop .14s ease-out;cursor:default}',
 '.cru-head{display:flex;align-items:flex-start;gap:10px;margin-bottom:10px}',
@@ -1282,17 +1359,48 @@ function makeWebviewMenuBarFunctionBody() {
 '@keyframes cru-spin{to{transform:rotate(360deg)}}',
 '@keyframes cru-pop{from{opacity:0;transform:translateY(-3px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}',
 '@media (max-width:600px){.cru-popover{position:fixed;top:42px;left:12px;right:12px;width:auto;max-height:calc(100vh - 54px);overflow:auto}}',
-'@media (prefers-reduced-motion: reduce){.cru-trigger,.cru-action,.cru-meter span,.cru-popover{transition:none;animation:none}.cru-trigger.checking .cru-mark,.cru-trigger.downloading .cru-mark,.cru-trigger.preparing .cru-mark{animation:none}}'
+'@media (prefers-reduced-motion: reduce){.cru-trigger,.cru-action,.cru-meter span,.cru-popover{transition:none;animation:none}.cru-trigger.checking .cru-mark,.cru-trigger.downloading .cru-mark,.cru-trigger.cancelling .cru-mark,.cru-trigger.preparing .cru-mark{animation:none}}'
 ].join('\\n'),document.head.appendChild(t)}
 function codexRebuildUpdaterFormatVersion(e){return e?String(e):'-'}
 function codexRebuildUpdaterFormatBytes(e){let t=Number(e);if(!Number.isFinite(t)||t<=0)return'-';let n=['B','KB','MB','GB'],r=t,i=0;for(;r>=1024&&i<n.length-1;)r/=1024,i+=1;let a=i===0?0:r>=100?0:r>=10?1:2;return r.toFixed(a)+' '+n[i]}
 function codexRebuildUpdaterFormatElapsed(e){let t=Number(e);if(!Number.isFinite(t)||t<0)return'-';let n=Math.floor(t/1000),r=Math.floor(n/60),i=n%60;return r>0?r+'分'+String(i).padStart(2,'0')+'秒':i+'秒'}
 function codexRebuildUpdaterMenuBarProgress(e){let t=Number(e?.activeDownloadSize||e?.updateSize),n=Number(e?.downloadedBytes);return!Number.isFinite(t)||t<=0||!Number.isFinite(n)||n<0?null:Math.max(0,Math.min(100,n/t*100))}
-function codexRebuildUpdaterMenuBarLabel(e){let t=e?.status||'idle';if(t==='checking')return'检查中...';if(t==='available')return'有新版本';if(t==='downloading'){let n=codexRebuildUpdaterMenuBarProgress(e);return n==null?'下载中':'下载中 '+Math.floor(n)+'%'}if(t==='preparing')return'准备中';if(t==='ready')return'重启安装';if(t==='no-update')return'已是最新';if(t==='error')return e?.resumedBytes>0?'下载中断':'检查失败';return'检查更新'}
-function codexRebuildUpdaterStatusText(e){let t=e?.status||'idle';if(t==='checking')return'正在检查更新';if(t==='available')return'发现新版本';if(t==='downloading')return e?.resumedBytes>0?'正在续传更新':'正在下载更新';if(t==='preparing')return'正在校验并准备安装';if(t==='ready')return'更新已下载';if(t==='no-update')return'当前已是最新版本';if(t==='error')return e?.resumedBytes>0?'下载中断，进度已保留':'检查更新失败';return'检查更新'}
-function codexRebuildUpdaterDescription(e){let t=e?.status||'idle';if(t==='checking')return'正在连接更新源，请稍候。';if(t==='available')return'确认后开始下载，下载完成后可重启安装。';if(t==='downloading')return e?.resumedBytes>0?'将从已保留的进度继续下载。':'下载会在后台继续，点击按钮可随时查看进度。';if(t==='preparing')return'下载已完成，正在校验安装包。';if(t==='ready')return'重启 Codex 后会自动完成安装。';if(t==='no-update')return'当前安装版本已经是最新。';if(t==='error')return e?.resumedBytes>0?'点击继续下载，不会从头开始。':'请重试，或取消后稍后再检查。';return'点击后立即检查是否有新版本。'}
-function codexRebuildUpdaterBuildPanel(e,t){let n=e||{status:'idle'},r=n.status||'idle',i=codexRebuildUpdaterMenuBarProgress(n),a=i==null?0:Math.floor(i),o=codexRebuildUpdaterStatusText(n),s=codexRebuildUpdaterDescription(n),c=(e,t)=>(0,Zr.jsxs)('div',{className:'cru-row',children:[(0,Zr.jsx)('span',{children:e}),(0,Zr.jsx)('strong',{children:t})]}),p=()=>{try{return window.localStorage?.getItem('codexRebuildUpdateProxyPrefix')||''}catch{return''}},m=e=>{try{window.localStorage?.setItem('codexRebuildUpdateProxyPrefix',e.target.value)}catch{}},l=(e,n,r='')=>(0,Zr.jsx)('button',{type:'button',className:'cru-action '+r,onClick:e=>{e.stopPropagation();if(n==='download'||n==='retry'){let e=window.codexRebuildUpdater,o={proxyPrefix:p()},s=n==='retry'?e?.retryUpdate?.(o):e?.downloadUpdate?.(o);s?.catch?.(()=>{});return}t(n)},children:e}),u=[c('当前版本',codexRebuildUpdaterFormatVersion(n.version||n.appVersion))];n.updateVersion&&u.push(c('新版本',codexRebuildUpdaterFormatVersion(n.updateVersion)));(n.updateSize||n.activeDownloadSize)&&u.push(c('更新包',codexRebuildUpdaterFormatBytes(n.updateSize||n.activeDownloadSize)));(r==='downloading'||r==='preparing')&&u.push(c('已下载',codexRebuildUpdaterFormatBytes(n.downloadedBytes)+' / '+codexRebuildUpdaterFormatBytes(n.activeDownloadSize||n.updateSize)));(r==='downloading'||r==='preparing')&&u.push(c('耗时',codexRebuildUpdaterFormatElapsed(n.elapsedMs)));let d=[];r==='idle'&&d.push(l('立即检查','check','primary'));r==='available'&&d.push(l('下载更新','download','primary'),l('稍后','close'));r==='ready'&&d.push(l('重启安装','install','primary'),l('稍后','close'));r==='error'&&d.push(l(n.resumedBytes>0?'继续下载':'重试','retry','primary'),l('取消','clear','danger'));(r==='checking'||r==='downloading'||r==='preparing'||r==='no-update')&&d.push(l('收起','close'));let f=(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'}),h=(r==='available'||r==='error'&&n.updateFile)&&(0,Zr.jsxs)('label',{className:'cru-proxy',children:[(0,Zr.jsx)('span',{className:'cru-proxy-label',children:'加速地址前缀（可选）'}),(0,Zr.jsx)('input',{type:'text',className:'cru-proxy-input',defaultValue:p(),placeholder:'https://ghfast.top/',onChange:m,'aria-label':'加速地址前缀'}),(0,Zr.jsx)('span',{className:'cru-proxy-help',children:'可填多个，使用分号或逗号分隔；留空自动选择线路。'})]});return(0,Zr.jsxs)('div',{className:'cru-popover '+r,role:'dialog','aria-label':'更新状态',onPointerDown:e=>e.stopPropagation(),children:[(0,Zr.jsx)('div',{className:'cru-live','aria-live':'polite',children:o}),(0,Zr.jsxs)('div',{className:'cru-head',children:[(0,Zr.jsx)('div',{className:'cru-badge','aria-hidden':'true',children:f}),(0,Zr.jsxs)('div',{children:[(0,Zr.jsx)('div',{className:'cru-title',children:o}),(0,Zr.jsx)('p',{className:'cru-body',children:s})]})]}),(r==='downloading'||r==='preparing')&&(0,Zr.jsx)('div',{className:'cru-meter','aria-label':'下载进度 '+a+'%',children:(0,Zr.jsx)('span',{style:{width:a+'%'}})}),(0,Zr.jsx)('div',{className:'cru-grid',children:u}),h,r==='error'&&(0,Zr.jsx)('div',{className:'cru-error',role:'alert',children:n.error||'未知错误'}),(0,Zr.jsx)('div',{className:'cru-actions',children:d})]})}
-function Yr(){let e=D(),[t,n]=(0,Xr.useState)(null),[r,i]=(0,Xr.useState)({status:'idle'}),[a,o]=(0,Xr.useState)(false),s=(0,Xr.useRef)(0),c=(0,Xr.useRef)(null);(0,Xr.useEffect)(()=>{codexRebuildUpdaterEnsureTitlebarStyle();let e=window.codexRebuildUpdater;if(!e)return;let t=e=>{i(e||{status:'idle'})};e.getState?.().then(t).catch(()=>{});let n=e.onState?.(t);return typeof n==='function'?n:void 0},[]),(0,Xr.useEffect)(()=>{if(!a)return;let e=e=>{c.current?.contains?.(e.target)||o(!1)},t=e=>{e.key==='Escape'&&o(!1)};return document.addEventListener('pointerdown',e,!0),document.addEventListener('keydown',t,!0),()=>{document.removeEventListener('pointerdown',e,!0),document.removeEventListener('keydown',t,!0)}},[a]);if(!qr())return null;let l=async(e,t)=>{let r=window.electronBridge?.showApplicationMenu;if(!r)return;let i=s.current+1;s.current=i,n(e);let a=t.currentTarget.getBoundingClientRect();try{await r(e,Math.round(a.left),Math.round(a.bottom))}finally{s.current===i&&n(null)}},u=(e,t={})=>i(n=>({...n,...t,status:e})),d=e=>{let t=window.codexRebuildUpdater;if(e==='close'){o(!1);return}if(e==='clear'){o(!1),t?.clearUpdateState?.().then(i).catch(()=>{});return}if(e==='check'){o(!0),u('checking',{error:null}),t?.checkForUpdates?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='retry'){o(!0),u('downloading',{error:null}),t?.retryUpdate?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='download'){o(!0),u('downloading',{error:null,downloadedBytes:r?.downloadedBytes||0,elapsedMs:0}),t?.downloadUpdate?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='install'){t?.installUpdate?.().catch(e=>u('error',{error:e&&e.message?e.message:String(e)}))}},f=e=>{let t=r?.status||'idle';if(t==='idle'){d('check');return}o(e=>!e)},p=codexRebuildUpdaterMenuBarLabel(r),m=codexRebuildUpdaterMenuBarProgress(r),h=m==null?0:Math.floor(m);return(0,Zr.jsx)('div',{className:'flex items-center gap-0.5 pr-2 pl-1',children:$r.map(({id:s,message:u})=>{if(s==='${WEBVIEW_UPDATER_MENU_ID}')return(0,Zr.jsxs)('div',{ref:c,className:'cru-anchor',children:[(0,Zr.jsxs)('button',{type:'button','aria-expanded':a,'aria-haspopup':'dialog','aria-label':p,className:'cru-trigger '+(r?.status||'idle')+(a?' open':''),style:{'--cru-progress':h+'%'},onClick:f,children:[(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'}),(0,Zr.jsx)('span',{className:'cru-label',children:p})]}),a&&codexRebuildUpdaterBuildPanel(r,d)]},s);return(0,Zr.jsx)('button',{type:'button','aria-expanded':t===s,'aria-haspopup':'menu','aria-label':e.formatMessage(u),className:M('no-drag rounded-md border border-transparent px-2.5 py-1 text-base font-normal leading-none outline-none transition-colors',t===s?'bg-[var(--color-token-menubar-selection-background)] text-[var(--color-token-menubar-selection-foreground)]':'text-token-text-tertiary hover:bg-token-foreground/5 hover:text-token-description-foreground focus-visible:bg-token-foreground/5 focus-visible:text-token-description-foreground'),onClick:e=>{l(s,e)},children:(0,Zr.jsx)(w,{...u})},s)})})}`;
+ function codexRebuildUpdaterMenuBarLabel(e){let t=e?.status||'idle';if(t==='checking')return'检查中...';if(t==='available')return'有新版本';if(t==='downloading'){let n=codexRebuildUpdaterMenuBarProgress(e);return n==null?'下载中':'下载中 '+Math.floor(n)+'%'}if(t==='cancelling')return'取消中...';if(t==='preparing')return'准备中';if(t==='ready')return'重启安装';if(t==='paused')return'已暂停';if(t==='no-update')return'已是最新';if(t==='error')return e?.resumedBytes>0?'下载中断':'检查失败';return'检查更新'}
+ function codexRebuildUpdaterStatusText(e){let t=e?.status||'idle';if(t==='checking')return'正在检查更新';if(t==='available')return'发现新版本';if(t==='downloading')return e?.resumedBytes>0?'正在续传更新':'正在下载更新';if(t==='cancelling')return'正在安全停止下载';if(t==='preparing')return'正在校验并准备安装';if(t==='ready')return'更新已下载';if(t==='paused')return'下载已暂停';if(t==='no-update')return'当前已是最新版本';if(t==='error')return e?.resumedBytes>0?'下载中断，进度已保留':'检查更新失败';return'检查更新'}
+ function codexRebuildUpdaterDescription(e){let t=e?.status||'idle';if(t==='checking')return'正在连接更新源，请稍候。';if(t==='available')return'确认后开始下载，下载完成后可重启安装。';if(t==='downloading')return e?.resumedBytes>0?'将从已保留的进度继续下载。':'下载会在后台继续，点击按钮可随时查看进度。';if(t==='cancelling')return'正在关闭文件并安全保存已下载进度。';if(t==='preparing')return'下载已完成，正在校验安装包。';if(t==='ready')return'重启 Codex 后会自动完成安装。';if(t==='paused')return'已保留下载进度，可填写加速地址后继续。';if(t==='no-update')return'当前安装版本已经是最新。';if(t==='error')return e?.resumedBytes>0?'点击继续下载，不会从头开始。':'请重试，或取消后稍后再检查。';return'点击后立即检查是否有新版本。'}
+function codexRebuildUpdaterBuildPanel(e,t){
+  let n=e||{status:'idle'},r=n.status||'idle',i=codexRebuildUpdaterMenuBarProgress(n),a=i==null?0:Math.floor(i),o=codexRebuildUpdaterStatusText(n),s=codexRebuildUpdaterDescription(n);
+  let c=(e,t)=>(0,Zr.jsxs)('div',{className:'cru-row',children:[(0,Zr.jsx)('span',{children:e}),(0,Zr.jsx)('strong',{children:t})]});
+  let p=()=>{try{return window.localStorage?.getItem('codexRebuildUpdateProxyPrefix')||''}catch{return''}};
+  let m=e=>{try{window.localStorage?.setItem('codexRebuildUpdateProxyPrefix',e.target.value)}catch{}};
+  let l=(e,n,r='')=>(0,Zr.jsx)('button',{type:'button',className:'cru-action '+r,onClick:e=>{e.stopPropagation();if(n==='download'||n==='retry'){let e=window.codexRebuildUpdater,o={proxyPrefix:p()},s=n==='retry'?e?.retryUpdate?.(o):e?.downloadUpdate?.(o);s?.catch?.(()=>{});return}t(n)},children:e});
+  let u=[c('当前版本',codexRebuildUpdaterFormatVersion(n.version||n.appVersion))];
+  n.updateVersion&&u.push(c('新版本',codexRebuildUpdaterFormatVersion(n.updateVersion)));
+  (n.updateSize||n.activeDownloadSize)&&u.push(c('更新包',codexRebuildUpdaterFormatBytes(n.updateSize||n.activeDownloadSize)));
+  (r==='downloading'||r==='cancelling'||r==='preparing'||r==='paused')&&u.push(c('已下载',codexRebuildUpdaterFormatBytes(n.downloadedBytes)+' / '+codexRebuildUpdaterFormatBytes(n.activeDownloadSize||n.updateSize)));
+  (r==='downloading'||r==='cancelling'||r==='preparing'||r==='paused')&&u.push(c('耗时',codexRebuildUpdaterFormatElapsed(n.elapsedMs)));
+  let d=[];
+  r==='idle'&&d.push(l('立即检查','check','primary'));
+  r==='available'&&d.push(l('下载更新','download','primary'),l('稍后','close'));
+  r==='ready'&&d.push(l('重启安装','install','primary'),l('稍后','close'));
+  r==='paused'&&d.push(l('继续下载','retry','primary'),l('取消','clear','danger'));
+  r==='error'&&d.push(l(n.resumedBytes>0?'继续下载':'重试','retry','primary'),l('取消','clear','danger'));
+  r==='downloading'&&d.push(l('取消下载','cancel','danger'),l('收起','close'));
+  (r==='checking'||r==='cancelling'||r==='preparing'||r==='no-update')&&d.push(l('收起','close'));
+  let f=(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'});
+  let h=(r==='available'||(r==='error'||r==='paused')&&n.updateFile)&&(0,Zr.jsxs)('label',{className:'cru-proxy',children:[(0,Zr.jsx)('span',{className:'cru-proxy-label',children:'加速地址前缀（可选）'}),(0,Zr.jsx)('input',{type:'text',className:'cru-proxy-input',defaultValue:p(),placeholder:'https://ghfast.top/',onChange:m,'aria-label':'加速地址前缀'}),(0,Zr.jsx)('span',{className:'cru-proxy-help',children:'可填多个，使用分号或逗号分隔；留空自动选择线路。'})]});
+  return(0,Zr.jsxs)('div',{className:'cru-popover '+r,role:'dialog','aria-label':'更新状态',onPointerDown:e=>e.stopPropagation(),children:[(0,Zr.jsx)('div',{className:'cru-live','aria-live':'polite',children:o}),(0,Zr.jsxs)('div',{className:'cru-head',children:[(0,Zr.jsx)('div',{className:'cru-badge','aria-hidden':'true',children:f}),(0,Zr.jsxs)('div',{children:[(0,Zr.jsx)('div',{className:'cru-title',children:o}),(0,Zr.jsx)('p',{className:'cru-body',children:s})]})]}),(r==='downloading'||r==='cancelling'||r==='preparing'||r==='paused')&&(0,Zr.jsx)('div',{className:'cru-meter','aria-label':'下载进度 '+a+'%',children:(0,Zr.jsx)('span',{style:{width:a+'%'}})}),(0,Zr.jsx)('div',{className:'cru-grid',children:u}),h,r==='error'&&(0,Zr.jsx)('div',{className:'cru-error',role:'alert',children:n.error||'未知错误'}),(0,Zr.jsx)('div',{className:'cru-actions',children:d})]})
+}
+function Yr(){let e=D(),[t,n]=(0,Xr.useState)(null),[r,i]=(0,Xr.useState)({status:'idle'}),[a,o]=(0,Xr.useState)(false),s=(0,Xr.useRef)(0),c=(0,Xr.useRef)(null);
+  (0,Xr.useEffect)(()=>{codexRebuildUpdaterEnsureTitlebarStyle();let e=window.codexRebuildUpdater;if(!e)return;let t=e=>{i(e||{status:'idle'})};e.getState?.().then(t).catch(()=>{});let n=e.onState?.(t);return typeof n==='function'?n:void 0},[]);
+  (0,Xr.useEffect)(()=>{if(!a)return;let e=e=>{c.current?.contains?.(e.target)||o(!1)},t=e=>{e.key==='Escape'&&o(!1)};return document.addEventListener('pointerdown',e,!0),document.addEventListener('keydown',t,!0),()=>{document.removeEventListener('pointerdown',e,!0),document.removeEventListener('keydown',t,!0)}},[a]);
+  if(!qr())return null;
+  let l=async(e,t)=>{let r=window.electronBridge?.showApplicationMenu;if(!r)return;let i=s.current+1;s.current=i,n(e);let a=t.currentTarget.getBoundingClientRect();try{await r(e,Math.round(a.left),Math.round(a.bottom))}finally{s.current===i&&n(null)}};
+  let u=(e,t={})=>i(n=>({...n,...t,status:e}));
+  let d=e=>{let t=window.codexRebuildUpdater;if(e==='close'){o(!1);return}if(e==='clear'){o(!1),t?.clearUpdateState?.().then(i).catch(()=>{});return}if(e==='cancel'){t?.cancelDownload?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='check'){o(!0),u('checking',{error:null}),t?.checkForUpdates?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='retry'){o(!0),u('downloading',{error:null}),t?.retryUpdate?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='download'){o(!0),u('downloading',{error:null,downloadedBytes:r?.downloadedBytes||0,elapsedMs:0}),t?.downloadUpdate?.().then(i).catch(e=>u('error',{error:e&&e.message?e.message:String(e)}));return}if(e==='install'){t?.installUpdate?.().catch(e=>u('error',{error:e&&e.message?e.message:String(e)}))}};
+  let f=e=>{let t=r?.status||'idle';if(t==='idle'){d('check');return}o(e=>!e)},p=codexRebuildUpdaterMenuBarLabel(r),m=codexRebuildUpdaterMenuBarProgress(r),h=m==null?0:Math.floor(m);
+  return(0,Zr.jsx)('div',{className:'flex items-center gap-0.5 pr-2 pl-1',children:$r.map(({id:s,message:u})=>{if(s==='${WEBVIEW_UPDATER_MENU_ID}')return(0,Zr.jsxs)('div',{ref:c,className:'cru-anchor',children:[(0,Zr.jsxs)('button',{type:'button','aria-expanded':a,'aria-haspopup':'dialog','aria-label':p,className:'cru-trigger '+(r?.status||'idle')+(a?' open':''),style:{'--cru-progress':h+'%'},onClick:f,children:[(0,Zr.jsx)('span',{className:'cru-mark','aria-hidden':'true'}),(0,Zr.jsx)('span',{className:'cru-label',children:p})]}),a&&codexRebuildUpdaterBuildPanel(r,d)]},s);return(0,Zr.jsx)('button',{type:'button','aria-expanded':t===s,'aria-haspopup':'menu','aria-label':e.formatMessage(u),className:M('no-drag rounded-md border border-transparent px-2.5 py-1 text-base font-normal leading-none outline-none transition-colors',t===s?'bg-[var(--color-token-menubar-selection-background)] text-[var(--color-token-menubar-selection-foreground)]':'text-token-text-tertiary hover:bg-token-foreground/5 hover:text-token-description-foreground focus-visible:bg-token-foreground/5 focus-visible:text-token-description-foreground'),onClick:e=>{l(s,e)},children:(0,Zr.jsx)(w,{...u})},s)})})
+}`;
 }
 
 function makeWebviewMenuBarFunctionPatch(version = LOCAL_UPDATER_CONTRACT_VERSION) {
@@ -1787,21 +1895,24 @@ function inspectUpdaterTitlebarSource(code, { allowLegacy = false } = {}) {
       item.descriptorItem === code.slice(descriptorElement.start, descriptorElement.end),
   );
   const existingVersions = updaterVersionSignatures(code);
+  const structuralVersion = STRUCTURAL_LOCAL_UPDATER_VERSIONS.find((version) =>
+    [
+      layerVersionMarker("titlebar-component", version),
+      layerVersionMarker("titlebar-descriptor", version),
+    ].every((marker) => existingVersions.includes(marker)),
+  );
   if (
     !candidate &&
     allowLegacy &&
     existingVersions.length === 2 &&
-    [
-      layerVersionMarker("titlebar-component", 1),
-      layerVersionMarker("titlebar-descriptor", 1),
-    ].every((marker) => existingVersions.includes(marker))
+    structuralVersion != null
   ) {
     candidate = {
-      dialect: "structural-v1",
-      version: 1,
+      dialect: `structural-v${structuralVersion}`,
+      version: structuralVersion,
       versionMarkers: [
-        layerVersionMarker("titlebar-component", 1),
-        layerVersionMarker("titlebar-descriptor", 1),
+        layerVersionMarker("titlebar-component", structuralVersion),
+        layerVersionMarker("titlebar-descriptor", structuralVersion),
       ],
     };
   }
@@ -2150,10 +2261,10 @@ function inspectUpdaterBackendSource(code, { allowLegacy = false } = {}) {
   }
   if (allowLegacy) {
     const versions = updaterVersionSignatures(code);
-    if (
-      versions.length === 1 &&
-      versions[0] === layerVersionMarker("backend", 1)
-    ) {
+    const structuralVersion = STRUCTURAL_LOCAL_UPDATER_VERSIONS.find(
+      (version) => versions[0] === layerVersionMarker("backend", version),
+    );
+    if (versions.length === 1 && structuralVersion != null) {
       assertBackendProgramAttachment(code);
       const ast = parseJavaScript(code, "Windows runtime bootstrap", "script");
       const guardedRuntime = ast.body[2];
@@ -2167,8 +2278,8 @@ function inspectUpdaterBackendSource(code, { allowLegacy = false } = {}) {
       validateUpdaterBackendSource(canonicalSource);
       return {
         layer: "backend",
-        version: 1,
-        dialect: "bounded-v1",
+        version: structuralVersion,
+        dialect: `bounded-v${structuralVersion}`,
         originalSource,
         canonicalSource,
       };
@@ -2324,16 +2435,19 @@ function inspectUpdaterPreloadSource(code, { allowLegacy = false } = {}) {
   }
   let candidate = candidates.find((item) => item.block === range.code);
   const versions = updaterVersionSignatures(code);
+  const structuralVersion = STRUCTURAL_LOCAL_UPDATER_VERSIONS.find(
+    (version) => versions[0] === layerVersionMarker("preload", version),
+  );
   if (
     !candidate &&
     allowLegacy &&
     versions.length === 1 &&
-    versions[0] === layerVersionMarker("preload", 1)
+    structuralVersion != null
   ) {
     candidate = {
-      dialect: "structural-v1",
-      version: 1,
-      versionMarker: layerVersionMarker("preload", 1),
+      dialect: `structural-v${structuralVersion}`,
+      version: structuralVersion,
+      versionMarker: layerVersionMarker("preload", structuralVersion),
     };
   }
   if (!candidate) {
@@ -2347,7 +2461,7 @@ function inspectUpdaterPreloadSource(code, { allowLegacy = false } = {}) {
     throw new Error("Windows preload canonical bridge version is stale or mismatched");
   }
   if (
-    candidate.dialect !== "structural-v1" &&
+    !candidate.dialect.startsWith("structural-v") &&
     code !== makePatchedPreloadSource(baseSource, electronAlias, candidate.version)
   ) {
     throw new Error("Windows preload canonical bridge placement postcondition failed");
