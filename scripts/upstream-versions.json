@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-07-13T15:12:42.149Z",
+  "updatedAt": "2026-07-14T10:20:20.164Z",
   "platforms": {
     "macOS-arm64": {
       "version": "26.707.62119",
@@ -10,7 +10,7 @@
       "build": "5211"
     },
     "Windows": {
-      "version": "26.707.8479.0",
+      "version": "26.707.9981.0",
       "build": ""
     }
   }
