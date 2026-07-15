@@ -1,7 +1,7 @@
 {
   "name": "codex-rebuild",
   "productName": "Codex",
-  "version": "26.707.62122",
+  "version": "26.707.72221",
   "description": "Codex Electron App - Cross-platform Build",
   "main": "src/.vite/build/bootstrap.js",
   "scripts": {
@@ -77,5 +77,10 @@
   ],
   "optionalDependencies": {
     "@openai/codex": "0.144.1"
-  }
+  },
+  "codexRebuildOfficialVersion": "26.707.72221",
+  "codexRebuildRevision": 0,
+  "codexRebuildReleaseVersion": "26.707.72221",
+  "codexRebuildPackageVersion": "26.707.72221",
+  "codexRebuildWindowsMsixVersion": "26.707.9981.0"
 }
