@@ -23,6 +23,10 @@ const fs = require("fs");
 const path = require("path");
 const { execFileSync, execSync } = require("child_process");
 const { selectWindowsMsixPackage } = require("./windows-package-utils");
+const {
+  readWindowsInternalAppVersionFromRemoteMsix,
+  validateWindowsInternalAppVersion,
+} = require("./windows-msix-internal-version");
 
 // TLS certs for MS delivery CDN
 const certsDir = path.join(__dirname, "certs");
@@ -165,7 +169,18 @@ async function getWindowsVersion() {
   const pkg = selectWindowsMsixPackage(pkgs, "x64");
   const url = await msstore.getDownloadUrl(pkg.updateID, pkg.revisionNumber, "Retail", pkg.digest);
   const verMatch = pkg.name.match(/_(\d+\.\d+\.\d+(?:\.\d+)?)_/);
-  return { version: verMatch?.[1] || "unknown", url, packageName: pkg.name };
+  const msixVersion = verMatch?.[1] || "unknown";
+  const size = Number(pkg.size || 0);
+  const internalAppVersion = await readWindowsInternalAppVersionFromRemoteMsix({ url, size });
+  return {
+    version: internalAppVersion,
+    internalAppVersion,
+    msixVersion,
+    build: "",
+    url,
+    size,
+    packageName: pkg.name,
+  };
 }
 
 // ─── Extract macOS ──────────────────────────────────────────────
@@ -199,13 +214,13 @@ async function syncMac(variant, appcastUrl, destDir) {
 
 // ─── Extract Windows ────────────────────────────────────────────
 
-async function syncWin(destDir) {
+async function syncWin(destDir, detectedInfo = null) {
   console.log("\n-- Windows");
 
-  const info = await getWindowsVersion();
-  console.log(`   version: ${info.version}`);
+  const info = detectedInfo || await getWindowsVersion();
+  console.log(`   version: ${info.internalAppVersion} (MSIX ${info.msixVersion})`);
 
-  const msixPath = path.join(TEMP_DIR, info.packageName || `codex-win-${info.version}.msix`);
+  const msixPath = path.join(TEMP_DIR, info.packageName || `codex-win-${info.msixVersion}.msix`);
   const extractDir = path.join(TEMP_DIR, "win-extract");
 
   if (!fs.existsSync(msixPath)) {
@@ -225,6 +240,15 @@ async function syncWin(destDir) {
   }
 
   await assembleOutput(resourcesDir, destDir, "Windows");
+  const extractedPackage = JSON.parse(
+    fs.readFileSync(path.join(destDir, "_asar", "package.json"), "utf8"),
+  );
+  const extractedInternalVersion = validateWindowsInternalAppVersion(extractedPackage.version);
+  if (extractedInternalVersion !== info.internalAppVersion) {
+    throw new Error(
+      `Windows internal app version changed during sync: inspected ${info.internalAppVersion}, extracted ${extractedInternalVersion}`,
+    );
+  }
   return info;
 }
 
@@ -376,7 +400,7 @@ async function main() {
   if (!SKIP_WIN) {
     try {
       const winInfo = await getWindowsVersion();
-      console.log(`   win:       ${winInfo.version}`);
+      console.log(`   win:       ${winInfo.internalAppVersion} (MSIX ${winInfo.msixVersion})`);
       results.win = winInfo;
     } catch (e) {
       failures.push(`win check: ${e.message}`);
@@ -411,7 +435,7 @@ async function main() {
   }
   if (!SKIP_WIN && results.win) {
     try {
-      results.win = await syncWin(path.join(SRC_DIR, "win"));
+      results.win = await syncWin(path.join(SRC_DIR, "win"), results.win);
     } catch (e) {
       failures.push(`win: ${e.message}`);
       console.error(`   [x] win: ${e.message}`);
@@ -424,7 +448,13 @@ async function main() {
 
   const saved = loadVersions();
   for (const [key, info] of Object.entries(results)) {
-    saved[key] = { version: info.version, build: info.build || "", checkedAt: new Date().toISOString() };
+    saved[key] = {
+      version: info.version,
+      internalAppVersion: info.internalAppVersion || undefined,
+      msixVersion: info.msixVersion || undefined,
+      build: info.build || "",
+      checkedAt: new Date().toISOString(),
+    };
   }
   saveVersions(saved);
 

@@ -51,7 +51,7 @@ test("promotion workflow validates dispatch inputs before every external action"
   assert.match(firstStep, /RELEASE_VERSION: \$\{\{ inputs\.release_version \}\}/);
   assert.match(firstStep, /SOURCE_RUN_ID: \$\{\{ inputs\.source_run_id \}\}/);
   assert.match(firstStep, /set -euo pipefail/);
-  assert.ok(firstStep.includes('[[ ! "$RELEASE_VERSION" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]'));
+  assert.ok(firstStep.includes('[[ ! "$RELEASE_VERSION" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+-r[1-9][0-9]*$ ]]'));
   assert.ok(firstStep.includes('[[ ! "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]'));
 
   for (const command of collectRunCommands(workflow)) {
@@ -98,20 +98,21 @@ test("promotion workflow validates installer portable and full package versions"
   assert.match(workflow, /resolve-release-artifacts\.js --root artifacts\/update-feed --github-output/);
   assert.match(workflow, /steps\.installer_artifacts\.outputs\.windows_installer_version/);
   assert.match(workflow, /steps\.portable_artifacts\.outputs\.windows_portable_version/);
-  assert.match(workflow, /steps\.package_artifacts\.outputs\.windows_installer_version/);
+  assert.match(workflow, /steps\.package_artifacts\.outputs\.windows_package_version/);
   assert.match(workflow, /EXPECTED_VERSION: \$\{\{ inputs\.release_version \}\}/);
   assert.match(workflow, /INSTALLER_VERSION: \$\{\{ steps\.installer_artifacts\.outputs\.windows_installer_version \}\}/);
   assert.match(workflow, /PORTABLE_VERSION: \$\{\{ steps\.portable_artifacts\.outputs\.windows_portable_version \}\}/);
-  assert.match(workflow, /PACKAGE_VERSION: \$\{\{ steps\.package_artifacts\.outputs\.windows_installer_version \}\}/);
+  assert.match(workflow, /PACKAGE_VERSION: \$\{\{ steps\.package_artifacts\.outputs\.windows_package_version \}\}/);
   assert.match(workflow, /\[ -z "\$actual" \] \|\| \[ "\$actual" != "\$EXPECTED_VERSION" \]/);
   assert.match(
     workflow,
-    /validate-windows-release-feed\.js --root artifacts\/update-feed --version "\$RELEASE_VERSION"/,
+    /validate-windows-release-feed\.js --root artifacts\/update-feed --version "\$PACKAGE_VERSION"/,
   );
   assert.match(workflow, /windows-release-metadata\.js/);
   assert.match(workflow, /--validate-promotion/);
   assert.match(workflow, /actions\/runs\/\$\{SOURCE_RUN_ID\}/);
   assert.match(workflow, /configure-windows-release-version\.js/);
+  assert.match(workflow, /--internal-version "\$WINDOWS_INTERNAL_APP_VERSION"/);
 });
 
 test("promotion workflow publishes the exact Windows-only release contract", () => {

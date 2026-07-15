@@ -13,6 +13,7 @@
  */
 const fs = require("fs");
 const path = require("path");
+const { compareWindowsReleaseVersions } = require("./configure-windows-release-version");
 
 function parseArgs(argv) {
   const args = {};
@@ -45,22 +46,12 @@ function walkFiles(dir) {
   return files;
 }
 
-function compareVersions(a, b) {
-  const left = a.split(".").map(Number);
-  const right = b.split(".").map(Number);
-  for (let i = 0; i < Math.max(left.length, right.length); i++) {
-    const delta = (left[i] ?? 0) - (right[i] ?? 0);
-    if (delta !== 0) return delta;
-  }
-  return 0;
-}
-
 function parseReleaseLine(line) {
   const match = line.trim().match(/^([A-Fa-f0-9]+)\s+(\S+)\s+(\d+)$/);
   if (!match) return null;
 
   const filename = match[2];
-  const packageMatch = filename.match(/^Codex-(\d+\.\d+\.\d+)-(full|delta)\.nupkg$/);
+  const packageMatch = filename.match(/^Codex-(\d+\.\d+\.\d+(?:-r\d+)?)-(full|delta)\.nupkg$/);
   if (!packageMatch) return null;
 
   return {
@@ -101,7 +92,7 @@ function main() {
 
   const latestVersion = entries
     .map((entry) => entry.version)
-    .sort(compareVersions)
+    .sort(compareWindowsReleaseVersions)
     .at(-1);
   const latestEntries = entries
     .filter((entry) => entry.version === latestVersion)

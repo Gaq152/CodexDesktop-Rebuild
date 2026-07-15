@@ -9,6 +9,7 @@
  *   node scripts/check-update.js              # 检查并对比
  *   node scripts/check-update.js --force      # 强制输出（即使无更新）
  *   node scripts/check-update.js --json       # JSON 输出
+ *   node scripts/check-update.js --windows-only # 仅检查 Windows（Windows CI 使用）
  *   node scripts/check-update.js --save       # 更新本地版本记录
  */
 
@@ -18,6 +19,9 @@ const { XMLParser } = require("fast-xml-parser");
 const fs = require("fs");
 const path = require("path");
 const { selectWindowsMsixPackage } = require("./windows-package-utils");
+const {
+  readWindowsInternalAppVersionFromRemoteMsix,
+} = require("./windows-msix-internal-version");
 
 // ─── 证书注入（复用 fetch-msstore 的 CA 补丁）─────────────────────
 const certsDir = path.join(__dirname, "certs");
@@ -117,7 +121,7 @@ async function checkWindowsVersion() {
   // 从包名提取版本: OpenAI.Codex_26.325.2171.0_x64__xxx.msix
   const pkg = selectWindowsMsixPackage(packages, "x64");
   const versionMatch = pkg.name.match(/_(\d+\.\d+\.\d+(?:\.\d+)?)_/);
-  const version = versionMatch ? versionMatch[1] : "unknown";
+  const msixVersion = versionMatch ? versionMatch[1] : "unknown";
 
   // 获取下载链接
   const url = await msstore.getDownloadUrl(
@@ -126,16 +130,33 @@ async function checkWindowsVersion() {
     "Retail",
     pkg.digest
   );
+  const size = Number(pkg.size || 0);
+  const internalAppVersion = await readWindowsInternalAppVersionFromRemoteMsix({
+    url,
+    size,
+  });
 
   return {
     platform: "Windows",
-    version,
+    version: internalAppVersion,
+    internalAppVersion,
+    msixVersion,
     build: "",
     pubDate: "",
     downloadUrl: url,
-    size: Number(pkg.size || 0),
+    size,
     packageName: pkg.name,
   };
+}
+
+function sameRecordedVersion(saved, info) {
+  if (!saved) return false;
+  if (info.platform === "Windows") {
+    const savedMsixVersion = saved.msixVersion || (/^\d+\.\d+\.\d+\.\d+$/.test(saved.version || "") ? saved.version : "");
+    return savedMsixVersion === info.msixVersion &&
+      (saved.internalAppVersion || saved.version || "") === info.internalAppVersion;
+  }
+  return saved.version === info.version && saved.build === info.build;
 }
 
 // ─── 版本记录读写 ────────────────────────────────────────────────
@@ -165,28 +186,33 @@ async function main() {
   const force = args.includes("--force");
   const jsonOutput = args.includes("--json");
   const doSave = args.includes("--save");
+  const windowsOnly = args.includes("--windows-only");
   const quiet = jsonOutput || args.includes("--quiet") || args.includes("-q");
 
   const saved = loadVersions();
   const results = [];
   const updates = [];
 
-  const checks = await Promise.allSettled([
-    checkMacArm64Version(),
-    checkMacX64Version(),
-    checkWindowsVersion(),
-  ]);
+  const checks = await Promise.allSettled(windowsOnly
+    ? [checkWindowsVersion()]
+    : [checkMacArm64Version(), checkMacX64Version(), checkWindowsVersion()]);
+  const failures = [];
 
   for (const r of checks) {
     if (r.status === "fulfilled") {
       const info = r.value;
       results.push(info);
       const key = info.platform;
-      const isNew = !saved[key] || saved[key].version !== info.version || saved[key].build !== info.build;
+      const isNew = !sameRecordedVersion(saved[key], info);
       if (isNew) updates.push(info);
-    } else if (!quiet) {
-      console.error(`  [!] ${r.reason.message}`);
+    } else {
+      failures.push(r.reason);
+      if (!quiet) console.error(`  [!] ${r.reason.message}`);
     }
+  }
+
+  if (windowsOnly && failures.length > 0) {
+    throw new Error(`Windows version check failed: ${failures[0].message}`);
   }
 
   // JSON 输出模式
@@ -212,6 +238,7 @@ async function main() {
 
         console.log(`${tag} [${info.platform}]`);
         console.log(`  版本: ${info.version}${info.build ? ` (build ${info.build})` : ""}`);
+        if (info.msixVersion) console.log(`  MSIX: ${info.msixVersion}`);
         if (isUpdate && prevVersion !== "无记录") {
           console.log(`  旧版: ${prevVersion}${saved[info.platform]?.build ? ` (build ${saved[info.platform].build})` : ""}`);
         }
@@ -232,6 +259,8 @@ async function main() {
     for (const r of results) {
       newSaved[r.platform] = {
         version: r.version,
+        internalAppVersion: r.internalAppVersion || undefined,
+        msixVersion: r.msixVersion || undefined,
         build: r.build || undefined,
         checkedAt: new Date().toISOString(),
       };

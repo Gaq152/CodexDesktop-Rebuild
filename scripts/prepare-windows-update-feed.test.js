@@ -20,14 +20,14 @@ try {
   const dest = path.join(tmp, "dest");
   fs.mkdirSync(source, { recursive: true });
 
-  writePackage(path.join(source, "Codex-26.623.101658-full.nupkg"));
-  writePackage(path.join(source, "Codex-26.623.101658-delta.nupkg"));
+  writePackage(path.join(source, "Codex-26.707.72221-r0010-full.nupkg"));
+  writePackage(path.join(source, "Codex-26.707.72221-r0010-delta.nupkg"));
   fs.writeFileSync(
     path.join(source, "RELEASES"),
     [
-      makeReleaseLine("ABCD", "Codex-26.623.101657-full.nupkg", 100),
-      makeReleaseLine("BCDE", "Codex-26.623.101658-delta.nupkg", 10),
-      makeReleaseLine("CDEF", "Codex-26.623.101658-full.nupkg", 200),
+      makeReleaseLine("ABCD", "Codex-26.707.72221-r0002-full.nupkg", 100),
+      makeReleaseLine("BCDE", "Codex-26.707.72221-r0010-delta.nupkg", 10),
+      makeReleaseLine("CDEF", "Codex-26.707.72221-r0010-full.nupkg", 200),
       "",
     ].join("\n"),
   );
@@ -45,11 +45,11 @@ try {
   );
 
   const releases = fs.readFileSync(path.join(dest, "RELEASES"), "utf8");
-  assert.ok(releases.includes("Codex-26.623.101658-full.nupkg"));
-  assert.ok(releases.includes("Codex-26.623.101658-delta.nupkg"));
-  assert.ok(!releases.includes("Codex-26.623.101657-full.nupkg"));
-  assert.ok(fs.existsSync(path.join(dest, "Codex-26.623.101658-full.nupkg")));
-  assert.ok(fs.existsSync(path.join(dest, "Codex-26.623.101658-delta.nupkg")));
+  assert.ok(releases.includes("Codex-26.707.72221-r0010-full.nupkg"));
+  assert.ok(releases.includes("Codex-26.707.72221-r0010-delta.nupkg"));
+  assert.ok(!releases.includes("Codex-26.707.72221-r0002-full.nupkg"));
+  assert.ok(fs.existsSync(path.join(dest, "Codex-26.707.72221-r0010-full.nupkg")));
+  assert.ok(fs.existsSync(path.join(dest, "Codex-26.707.72221-r0010-delta.nupkg")));
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

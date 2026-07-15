@@ -277,6 +277,15 @@ function CodexRebuildSetupLocalUpdater(app,autoUpdater,dialog,ipcMain,BrowserWin
   let proxyFirst=process.env.CODEX_REBUILD_UPDATE_PROXY_FIRST==='1';
   let getInstalledVersion=()=>path.basename(appDir).match(/^app-(.+)$/)?.[1]||app.getVersion?.()||null;
   let compareVersions=(a,b)=>{
+    let parse=value=>{
+      let match=String(value||'').match(/^(\\d+)\\.(\\d+)\\.(\\d+)(?:-r(\\d+))?$/i);
+      return match?[Number(match[1]),Number(match[2]),Number(match[3]),Number(match[4]||0)]:null;
+    };
+    let parsedA=parse(a),parsedB=parse(b);
+    if(parsedA&&parsedB){
+      for(let i=0;i<4;i++)if(parsedA[i]!==parsedB[i])return parsedA[i]-parsedB[i];
+      return 0;
+    }
     let aa=String(a||'').split(/[^0-9]+/).filter(Boolean).map(Number);
     let bb=String(b||'').split(/[^0-9]+/).filter(Boolean).map(Number);
     for(let i=0;i<Math.max(aa.length,bb.length);i++){
@@ -918,7 +927,7 @@ ${versionLine}(()=>{
   };
   let codexRebuildUpdaterState=globalThis.__CodexRebuildUpdaterLastState||{status:'idle'};
   let codexRebuildUpdaterUnknown='-';
-  let codexRebuildUpdaterFormatVersion=value=>value?String(value):codexRebuildUpdaterUnknown;
+  let codexRebuildUpdaterFormatVersion=value=>value?String(value).replace(/-r0*([1-9]\\d*)$/i,' (r$1)'):codexRebuildUpdaterUnknown;
   let codexRebuildUpdaterFormatBytes=value=>{
     let n=Number(value);
     if(!Number.isFinite(n)||n<=0)return codexRebuildUpdaterUnknown;
@@ -1452,7 +1461,7 @@ function makeWebviewMenuBarFunctionBody() {
 '@media (max-width:600px){.cru-popover{position:fixed;top:42px;left:12px;right:12px;width:auto;max-height:calc(100vh - 54px);overflow:auto}}',
 '@media (prefers-reduced-motion: reduce){.cru-trigger,.cru-action,.cru-meter span,.cru-popover{transition:none;animation:none}.cru-trigger.checking .cru-mark,.cru-trigger.downloading .cru-mark,.cru-trigger.cancelling .cru-mark,.cru-trigger.preparing .cru-mark{animation:none}}'
 ].join('\\n'),document.head.appendChild(t)}
-function codexRebuildUpdaterFormatVersion(e){return e?String(e):'-'}
+function codexRebuildUpdaterFormatVersion(e){return e?String(e).replace(/-r0*([1-9]\\d*)$/i,' (r$1)'):'-'}
 function codexRebuildUpdaterFormatBytes(e){let t=Number(e);if(!Number.isFinite(t)||t<=0)return'-';let n=['B','KB','MB','GB'],r=t,i=0;for(;r>=1024&&i<n.length-1;)r/=1024,i+=1;let a=i===0?0:r>=100?0:r>=10?1:2;return r.toFixed(a)+' '+n[i]}
 function codexRebuildUpdaterFormatElapsed(e){let t=Number(e);if(!Number.isFinite(t)||t<0)return'-';let n=Math.floor(t/1000),r=Math.floor(n/60),i=n%60;return r>0?r+'分'+String(i).padStart(2,'0')+'秒':i+'秒'}
 function codexRebuildUpdaterMenuBarProgress(e){let t=Number(e?.activeDownloadSize||e?.updateSize),n=Number(e?.downloadedBytes);return!Number.isFinite(t)||t<=0||!Number.isFinite(n)||n<0?null:Math.max(0,Math.min(100,n/t*100))}

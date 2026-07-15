@@ -340,7 +340,7 @@ function resolveSquirrelReleaseOptions(env) {
 function getPatchedAppVersion() {
   const packageJsonPath = path.join(PROJECT_ROOT, "src", "win", "_asar", "package.json");
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
-  return packageJson.version;
+  return packageJson.codexRebuildPackageVersion || packageJson.version;
 }
 
 async function main() {

@@ -23,6 +23,11 @@ assert.ok(
   winstallerRequireIndex > tempAssignmentIndex,
   "electron-winstaller must be required after TEMP/TMP/TMPDIR are set so it uses the short Squirrel temp path",
 );
+assert.match(
+  source,
+  /packageJson\.codexRebuildPackageVersion \|\| packageJson\.version/,
+  "Squirrel must prefer the zero-padded internal package version over the public rN version",
+);
 
 function loadInstallerInternals() {
   const filename = path.join(__dirname, "build-win-installer.js");
@@ -235,11 +240,11 @@ test("Windows workflows guarantee full installers and bound optional delta gener
   const buildWorkflow = fs.readFileSync(
     path.join(__dirname, "..", ".github", "workflows", "build.yml"),
     "utf-8",
-  );
+  ).replace(/\r\n/g, "\n");
   const syncWorkflow = fs.readFileSync(
     path.join(__dirname, "..", ".github", "workflows", "sync.yml"),
     "utf-8",
-  );
+  ).replace(/\r\n/g, "\n");
 
   assert.match(
     buildWorkflow,
@@ -253,7 +258,7 @@ test("manual Windows workflow can explicitly replace the same release version", 
   const workflow = fs.readFileSync(
     path.join(__dirname, "..", ".github", "workflows", "build.yml"),
     "utf-8",
-  );
+  ).replace(/\r\n/g, "\n");
   assert.match(
     workflow,
     /replace_existing_release:\s*\n(?:\s+.*\n)*?\s+default: false\s*\n\s+type: boolean/,
@@ -262,10 +267,16 @@ test("manual Windows workflow can explicitly replace the same release version", 
     workflow,
     /release_version_override:\s*\n(?:\s+.*\n)*?\s+default: ""\s*\n\s+type: string/,
   );
+  assert.match(
+    workflow,
+    /rebuild_revision:\s*\n(?:\s+.*\n)*?\s+default: ""\s*\n\s+type: string/,
+  );
   assert.match(workflow, /--release-version/);
+  assert.match(workflow, /--rebuild-revision/);
   assert.match(workflow, /--allow-same-version-replacement/);
   assert.match(workflow, /replace_existing_release requires an exact release_version_override/);
   assert.match(workflow, /release_version_override is only allowed with replace_existing_release/);
+  assert.match(workflow, /rebuild_revision must be a positive integer/);
   assert.match(workflow, /git ls-remote --exit-code --tags origin/);
   assert.match(workflow, /gh release view "\$tag"/);
   assert.match(workflow, /name: Retarget replacement release tag/);

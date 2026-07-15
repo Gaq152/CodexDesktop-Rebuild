@@ -276,6 +276,70 @@ test("retains RELEASES SHA1 and size for package verification", () => {
   assert.deepEqual(parseReleaseManifestEntries("not-a-sha package.nupkg 12"), []);
 });
 
+test("client updater compares rebuild revisions numerically and formats them separately", async (t) => {
+  const releaseVersion = "26.707.72221-r0010";
+  const fileName = `Codex-${releaseVersion}-full.nupkg`;
+  const server = http.createServer((request, response) => {
+    if (request.url.startsWith("/RELEASES")) {
+      response.end(`${"a".repeat(40)} ${fileName} 100\n`);
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const updateUrl = `http://127.0.0.1:${server.address().port}`;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "updater-rebuild-version-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const appDir = path.join(root, "app-26.707.72221-r0002");
+  fs.mkdirSync(appDir, { recursive: true });
+  fs.writeFileSync(path.join(root, "Update.exe"), "fixture");
+  const autoUpdater = new EventEmitter();
+  autoUpdater.setFeedURL = () => {};
+  autoUpdater.checkForUpdates = () => {};
+  const context = {
+    Buffer,
+    URL,
+    clearInterval,
+    clearTimeout,
+    console,
+    globalThis: null,
+    process: {
+      platform: "win32",
+      arch: "x64",
+      argv: ["Codex.exe"],
+      execPath: path.join(appDir, "Codex.exe"),
+      env: {
+        CODEX_REBUILD_UPDATE_URL: updateUrl,
+        CODEX_REBUILD_UPDATE_PROXY_PREFIXES: "",
+      },
+    },
+    require(id) {
+      if (id === "electron") {
+        return {
+          app: { isPackaged: true, getVersion: () => "26.707.72221-r0002", whenReady: () => Promise.resolve() },
+          autoUpdater,
+          dialog: {},
+          ipcMain: { handle() {} },
+          BrowserWindow: { getAllWindows: () => [] },
+        };
+      }
+      if (id === "../../package.json") return { codexRebuildWindowsUpdateUrl: updateUrl };
+      return require(id);
+    },
+    setInterval,
+    setTimeout,
+  };
+  context.globalThis = context;
+  vm.runInNewContext(`${makeBootstrapPrefix()}void 0;\n}\n`, context);
+  await new Promise((resolve) => setImmediate(resolve));
+  await context.__CodexRebuildUpdaterCommand.check();
+  assert.equal(context.__CodexRebuildUpdaterLastState.status, "available");
+  assert.equal(context.__CodexRebuildUpdaterLastState.version, "26.707.72221-r0002");
+  assert.equal(context.__CodexRebuildUpdaterLastState.updateVersion, releaseVersion);
+  assert.ok(makeMainMenuPatch().includes("replace(/-r0*([1-9]\\d*)$/i,' (r$1)')"));
+});
+
 test("runtime downloader adopts a legacy incomplete package, resumes it, and verifies SHA1", async (t) => {
   const body = Buffer.from("0123456789abcdefghijklmnopqrstuvwxyz");
   const sha1 = crypto.createHash("sha1").update(body).digest("hex");

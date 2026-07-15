@@ -39,7 +39,7 @@ jobs:
         id: detect
         run: |
           set -euo pipefail
-          node scripts/check-update.js --json --force > upstream.json
+          node scripts/check-update.js --windows-only --json --force > upstream.json
           args=(--upstream upstream.json --previous scripts/upstream-versions.json --github-output --json)
           if [ "${{ inputs.force }}" = "true" ]; then
             args+=(--force)
@@ -52,7 +52,10 @@ jobs:
     runs-on: windows-latest
     outputs:
       windows_upstream_version: ${{ steps.windows_version.outputs.windows_upstream_version }}
+      windows_internal_app_version: ${{ steps.windows_version.outputs.windows_internal_app_version }}
+      windows_rebuild_revision: ${{ steps.windows_version.outputs.windows_rebuild_revision }}
       windows_release_version: ${{ steps.windows_version.outputs.windows_release_version }}
+      windows_package_version: ${{ steps.windows_version.outputs.windows_package_version }}
       windows_portable_version: ${{ steps.windows_artifacts.outputs.windows_portable_version }}
       windows_installer_version: ${{ steps.windows_artifacts.outputs.windows_installer_version }}
     steps:
@@ -83,12 +86,14 @@ jobs:
         shell: pwsh
         run: |
           $feed = "${{ env.WINDOWS_UPDATE_FEED }}"
-          $version = "${{ steps.windows_version.outputs.windows_release_version }}"
+          $version = "${{ steps.windows_version.outputs.windows_package_version }}"
           "CODEX_REBUILD_UPDATE_URL=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "CODEX_REBUILD_REMOTE_RELEASES=$feed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "CODEX_REBUILD_INSTALLER_VERSION=$version" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           Write-Host "Windows MSIX: ${{ steps.windows_version.outputs.windows_upstream_version }}"
-          Write-Host "Windows release/Squirrel version: $version"
+          Write-Host "Windows official app: ${{ steps.windows_version.outputs.windows_internal_app_version }}"
+          Write-Host "Windows public release: ${{ steps.windows_version.outputs.windows_release_version }}"
+          Write-Host "Windows Squirrel package: $version"
 
       - name: Patch Windows app
         run: node scripts/patch-all.js win
@@ -157,7 +162,7 @@ jobs:
 
       - name: Resolve Windows artifact versions
         id: windows_artifacts
-        run: node scripts/resolve-release-artifacts.js --root out --rename-windows-setup --github-output
+        run: node scripts/resolve-release-artifacts.js --root out --rename-windows-setup --package-version "${{ steps.windows_version.outputs.windows_package_version }}" --release-version "${{ steps.windows_version.outputs.windows_release_version }}" --github-output
 
       - name: Package Windows installer zip
         shell: pwsh
@@ -184,10 +189,10 @@ jobs:
         run: node scripts/prepare-windows-update-feed.js --source out/make/squirrel.windows/x64 --dest out/update-feed
 
       - name: Validate Windows update feed artifact
-        run: node scripts/validate-windows-release-feed.js --root out/update-feed --version "${{ steps.windows_artifacts.outputs.windows_installer_version }}"
+        run: node scripts/validate-windows-release-feed.js --root out/update-feed --version "${{ steps.windows_artifacts.outputs.windows_package_version }}"
 
       - name: Write Windows release metadata
-        run: node scripts/windows-release-metadata.js --write out/windows-release-metadata.json --upstream-version "${{ steps.windows_version.outputs.windows_upstream_version }}" --release-version "${{ steps.windows_version.outputs.windows_release_version }}" --source-sha "${{ github.sha }}"
+        run: node scripts/windows-release-metadata.js --write out/windows-release-metadata.json --upstream-version "${{ steps.windows_version.outputs.windows_upstream_version }}" --internal-version "${{ steps.windows_version.outputs.windows_internal_app_version }}" --release-version "${{ steps.windows_version.outputs.windows_release_version }}" --source-sha "${{ github.sha }}"
 
       - name: Upload Windows portable zip
         uses: actions/upload-artifact@v7
@@ -267,10 +272,12 @@ jobs:
       - name: Record built Windows versions
         env:
           WINDOWS_UPSTREAM_VERSION: ${{ needs.build-windows.outputs.windows_upstream_version }}
+          WINDOWS_INTERNAL_APP_VERSION: ${{ needs.build-windows.outputs.windows_internal_app_version }}
         run: |
           set -euo pipefail
           node scripts/configure-windows-release-version.js \
             --upstream-version "$WINDOWS_UPSTREAM_VERSION" \
+            --internal-version "$WINDOWS_INTERNAL_APP_VERSION" \
             --release-version "${{ needs.build-windows.outputs.windows_release_version }}" \
             --write-package package.json \
             --write-tracked scripts/upstream-versions.json
@@ -290,12 +297,15 @@ jobs:
       - name: Validate exact Windows release assets
         env:
           EXPECTED_VERSION: ${{ needs.build-windows.outputs.windows_release_version }}
+          EXPECTED_PACKAGE_VERSION: ${{ needs.build-windows.outputs.windows_package_version }}
           PORTABLE_VERSION: ${{ steps.artifacts.outputs.windows_portable_version }}
           INSTALLER_VERSION: ${{ steps.artifacts.outputs.windows_installer_version }}
+          PACKAGE_VERSION: ${{ steps.artifacts.outputs.windows_package_version }}
         run: |
           set -euo pipefail
           test "$PORTABLE_VERSION" = "$EXPECTED_VERSION"
           test "$INSTALLER_VERSION" = "$EXPECTED_VERSION"
+          test "$PACKAGE_VERSION" = "$EXPECTED_PACKAGE_VERSION"
 
       - name: Create draft Windows Release
         uses: softprops/action-gh-release@v3
@@ -304,8 +314,7 @@ jobs:
           name: Codex Win ${{ steps.artifacts.outputs.windows_installer_version }}
           target_commitish: master
           body: |
-            Windows-only rebuild from official Codex MSIX `${{ needs.build-windows.outputs.windows_upstream_version }}`.
-
+            Windows-only rebuild from official Codex `${{ needs.build-windows.outputs.windows_internal_app_version }}` (MSIX `${{ needs.build-windows.outputs.windows_upstream_version }}`).
             - Portable ZIP and installer ZIP are attached below.
             - The installer executable is inside the ZIP to avoid direct `.exe` browser download blocking.
             - Squirrel update packages are published separately to `windows-update-feed`.

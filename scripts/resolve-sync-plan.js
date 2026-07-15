@@ -18,10 +18,13 @@ function platformsOf(data) {
 
 function versionRecord(info) {
   if (!info) return null;
-  return {
+  const record = {
     version: String(info.version || ""),
     build: String(info.build || ""),
   };
+  if (info.internalAppVersion) record.internalAppVersion = String(info.internalAppVersion);
+  if (info.msixVersion) record.msixVersion = String(info.msixVersion);
+  return record;
 }
 
 function sameVersion(a, b) {
@@ -30,8 +33,35 @@ function sameVersion(a, b) {
   return !!left && !!right && left.version === right.version && left.build === right.build;
 }
 
+function windowsMsixVersion(info) {
+  if (!info) return "";
+  if (info.msixVersion) return String(info.msixVersion);
+  return /^\d+\.\d+\.\d+\.\d+$/.test(String(info.version || ""))
+    ? String(info.version)
+    : "";
+}
+
+function windowsInternalAppVersion(info) {
+  if (!info) return "";
+  if (info.internalAppVersion) return String(info.internalAppVersion);
+  return /^\d+\.\d+\.\d+$/.test(String(info.version || ""))
+    ? String(info.version)
+    : "";
+}
+
 function platformChanged(key, upstreamPlatforms, previousPlatforms, force) {
   if (!upstreamPlatforms[key]) return false;
+  if (key === WINDOWS_KEY) {
+    const upstreamMsix = windowsMsixVersion(upstreamPlatforms[key]);
+    const previousMsix = windowsMsixVersion(previousPlatforms[key]);
+    const upstreamInternal = windowsInternalAppVersion(upstreamPlatforms[key]);
+    const previousInternal = windowsInternalAppVersion(previousPlatforms[key]);
+    return !!force ||
+      !upstreamMsix ||
+      !upstreamInternal ||
+      upstreamMsix !== previousMsix ||
+      upstreamInternal !== previousInternal;
+  }
   return !!force || !sameVersion(upstreamPlatforms[key], previousPlatforms[key]);
 }
 
@@ -51,7 +81,9 @@ function createSyncPlan(upstream, previous = {}, options = {}) {
     windowsChanged,
     macArm64Version: upstreamPlatforms["macOS-arm64"]?.version || "",
     macX64Version: upstreamPlatforms["macOS-x64"]?.version || "",
-    windowsVersion: upstreamPlatforms.Windows?.version || "",
+    windowsVersion: windowsInternalAppVersion(upstreamPlatforms.Windows),
+    windowsInternalAppVersion: windowsInternalAppVersion(upstreamPlatforms.Windows),
+    windowsMsixVersion: windowsMsixVersion(upstreamPlatforms.Windows),
   };
 }
 
@@ -76,6 +108,8 @@ function toOutputPairs(plan) {
     mac_arm64_version: plan.macArm64Version || "",
     mac_x64_version: plan.macX64Version || "",
     windows_version: plan.windowsVersion || "",
+    windows_internal_app_version: plan.windowsInternalAppVersion || "",
+    windows_msix_version: plan.windowsMsixVersion || "",
   };
 }
 

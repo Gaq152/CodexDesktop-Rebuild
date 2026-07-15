@@ -5,6 +5,7 @@ const os = require("os");
 const path = require("path");
 const {
   collectReleaseArtifactMetadata,
+  renameWindowsPublicArtifacts,
   renameWindowsSetup,
   toOutputPairs,
 } = require("./resolve-release-artifacts");
@@ -30,6 +31,7 @@ try {
     macX64Version: "26.623.101652",
     windowsPortableVersion: "26.623.101652",
     windowsInstallerVersion: "26.623.101658",
+    windowsPackageVersion: "26.623.101658",
   });
 
   const renamed = renameWindowsSetup(tmp, metadata.windowsInstallerVersion);
@@ -45,13 +47,23 @@ try {
     mac_x64_version: "26.623.101652",
     windows_portable_version: "26.623.101652",
     windows_installer_version: "26.623.101658",
+    windows_package_version: "26.623.101658",
   });
 
-  touch(path.join(tmp, "installer", "CodexSetup-win-x64-26.707.8479.zip"));
+  touch(path.join(tmp, "installer", "CodexSetup-win-x64-26.707.72221-r2.zip"));
+  touch(path.join(tmp, "installer", "CodexSetup-win-x64-26.707.72221-r10.zip"));
   assert.strictEqual(
     collectReleaseArtifactMetadata(tmp).windowsInstallerVersion,
-    "26.707.8479",
+    "26.707.72221-r10",
   );
+
+  const packageVersion = "26.707.72221-r0001";
+  const releaseVersion = "26.707.72221-r1";
+  touch(path.join(tmp, "public", `Codex-win-x64-${packageVersion}.zip`));
+  touch(path.join(tmp, "public", `CodexSetup-win-x64-${packageVersion}.exe`));
+  assert.equal(renameWindowsPublicArtifacts(tmp, packageVersion, releaseVersion).length, 2);
+  assert.ok(fs.existsSync(path.join(tmp, "public", `Codex-win-x64-${releaseVersion}.zip`)));
+  assert.ok(fs.existsSync(path.join(tmp, "public", `CodexSetup-win-x64-${releaseVersion}.exe`)));
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

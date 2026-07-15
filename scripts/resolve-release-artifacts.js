@@ -2,6 +2,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { compareWindowsReleaseVersions } = require("./configure-windows-release-version");
 
 function walkFiles(root) {
   if (!fs.existsSync(root)) return [];
@@ -18,6 +19,9 @@ function walkFiles(root) {
 }
 
 function compareVersionStrings(a, b) {
+  if (/^\d+\.\d+\.\d+(?:-r\d+)?$/.test(a) && /^\d+\.\d+\.\d+(?:-r\d+)?$/.test(b)) {
+    return compareWindowsReleaseVersions(a, b);
+  }
   const aParts = String(a).split(/[.-]/);
   const bParts = String(b).split(/[.-]/);
   const length = Math.max(aParts.length, bParts.length);
@@ -48,10 +52,11 @@ function collectReleaseArtifactMetadata(root) {
   const macArm64Version = latestVersion(files, /^Codex-mac-arm64-(.+)\.dmg$/);
   const macX64Version = latestVersion(files, /^Codex-mac-x64-(.+)\.dmg$/);
   const windowsPortableVersion = latestVersion(files, /^Codex-win-x64-(.+)\.zip$/);
+  const windowsPackageVersion = latestVersion(files, /^Codex-(.+)-full\.nupkg$/);
   const windowsInstallerVersion =
     latestVersion(files, /^CodexSetup-win-x64-(.+)\.zip$/) ||
-    latestVersion(files, /^Codex-(.+)-full\.nupkg$/) ||
-    latestVersion(files, /^CodexSetup-win-x64-(.+)\.exe$/);
+    latestVersion(files, /^CodexSetup-win-x64-(.+)\.exe$/) ||
+    windowsPackageVersion;
   const releaseVersion = macArm64Version || macX64Version || windowsPortableVersion || windowsInstallerVersion;
 
   return {
@@ -60,6 +65,7 @@ function collectReleaseArtifactMetadata(root) {
     macX64Version,
     windowsPortableVersion,
     windowsInstallerVersion,
+    windowsPackageVersion,
   };
 }
 
@@ -76,6 +82,24 @@ function renameWindowsSetup(root, version) {
   return renamed;
 }
 
+function renameWindowsPublicArtifacts(root, packageVersion, releaseVersion) {
+  if (!packageVersion || !releaseVersion || packageVersion === releaseVersion) return [];
+  const renamed = [];
+  const names = [
+    [`Codex-win-x64-${packageVersion}.zip`, `Codex-win-x64-${releaseVersion}.zip`],
+    [`CodexSetup-win-x64-${packageVersion}.exe`, `CodexSetup-win-x64-${releaseVersion}.exe`],
+  ];
+  for (const file of walkFiles(root)) {
+    const pair = names.find(([from]) => path.basename(file) === from);
+    if (!pair) continue;
+    const next = path.join(path.dirname(file), pair[1]);
+    if (fs.existsSync(next)) fs.rmSync(next, { force: true });
+    fs.renameSync(file, next);
+    renamed.push({ from: file, to: next });
+  }
+  return renamed;
+}
+
 function toOutputPairs(metadata) {
   return {
     release_version: metadata.releaseVersion,
@@ -83,6 +107,7 @@ function toOutputPairs(metadata) {
     mac_x64_version: metadata.macX64Version,
     windows_portable_version: metadata.windowsPortableVersion,
     windows_installer_version: metadata.windowsInstallerVersion,
+    windows_package_version: metadata.windowsPackageVersion,
   };
 }
 
@@ -96,11 +121,20 @@ function writeGithubOutput(metadata, outputPath = process.env.GITHUB_OUTPUT) {
 }
 
 function parseArgs(argv) {
-  const options = { root: ".", renameWindowsSetup: false, githubOutput: false, json: false };
+  const options = {
+    root: ".",
+    renameWindowsSetup: false,
+    packageVersion: "",
+    releaseVersion: "",
+    githubOutput: false,
+    json: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--root") options.root = argv[++i];
     else if (arg === "--rename-windows-setup") options.renameWindowsSetup = true;
+    else if (arg === "--package-version") options.packageVersion = argv[++i];
+    else if (arg === "--release-version") options.releaseVersion = argv[++i];
     else if (arg === "--github-output") options.githubOutput = true;
     else if (arg === "--json") options.json = true;
     else {
@@ -115,7 +149,8 @@ function main() {
   const root = path.resolve(options.root);
   let metadata = collectReleaseArtifactMetadata(root);
   if (options.renameWindowsSetup) {
-    renameWindowsSetup(root, metadata.windowsInstallerVersion);
+    renameWindowsSetup(root, options.packageVersion || metadata.windowsPackageVersion || metadata.windowsInstallerVersion);
+    renameWindowsPublicArtifacts(root, options.packageVersion, options.releaseVersion);
     metadata = collectReleaseArtifactMetadata(root);
   }
   if (options.githubOutput) writeGithubOutput(metadata);
@@ -126,6 +161,7 @@ function main() {
 
 module.exports = {
   collectReleaseArtifactMetadata,
+  renameWindowsPublicArtifacts,
   renameWindowsSetup,
   toOutputPairs,
   writeGithubOutput,

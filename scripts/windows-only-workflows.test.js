@@ -6,7 +6,10 @@ const test = require("node:test");
 
 const workflows = ["build.yml", "sync.yml"].map((name) => ({
   name,
-  text: fs.readFileSync(path.join(__dirname, "..", ".github", "workflows", name), "utf8"),
+  text: fs.readFileSync(
+    path.join(__dirname, "..", ".github", "workflows", name),
+    "utf8",
+  ).replace(/\r\n/g, "\n"),
 }));
 
 test("default and scheduled build workflows are Windows-only", () => {
@@ -19,9 +22,14 @@ test("default and scheduled build workflows are Windows-only", () => {
     assert.doesNotMatch(text, /^  build-mac:\s*$/m, `${name} must not contain a macOS build job`);
     assert.doesNotMatch(text, /macos-(?:latest|\d+)|build:mac|sync-upstream\.js --force --skip-win/);
   }
+  const scheduled = workflows.find(({ name }) => name === "sync.yml").text;
+  assert.match(
+    scheduled,
+    /node scripts\/check-update\.js --windows-only --json --force/,
+  );
 });
 
-test("Windows releases use independent codex-win tags and ZIP-only public assets", () => {
+test("Windows releases use official+rN codex-win tags and ZIP-only public assets", () => {
   for (const { name, text } of workflows) {
     assert.match(
       text,
@@ -31,14 +39,17 @@ test("Windows releases use independent codex-win tags and ZIP-only public assets
     assert.match(text, /--write-package["', ]+package\.json/);
     assert.match(text, /--write-package["', ]+src\/win\/_asar\/package\.json/);
     assert.match(text, /--github-output/);
+    assert.match(text, /windows_internal_app_version/);
+    assert.match(text, /windows_package_version/);
     assert.match(text, /tag_name: codex-win-/i, `${name} must use codex-win tags`);
     assert.match(text, /name: Codex Win /i, `${name} must use the Windows release title`);
     assert.match(text, /CodexSetup-win-x64-.*\.zip/);
     assert.match(
       text,
-      /validate-windows-release-feed\.js --root out\/update-feed --version "\$\{\{ steps\.windows_artifacts\.outputs\.windows_installer_version \}\}"/,
+      /validate-windows-release-feed\.js --root out\/update-feed --version "\$\{\{ steps\.windows_artifacts\.outputs\.windows_package_version \}\}"/,
     );
-    assert.match(text, /windows-release-metadata\.js --write out\/windows-release-metadata\.json/);
+    assert.match(text, /scripts\/windows-release-metadata\.js/);
+    assert.match(text, /--write["', ]+out\/windows-release-metadata\.json/);
     assert.match(text, /Codex-Windows-Release-Metadata-x64-/);
     const release = text.match(/uses: softprops\/action-gh-release@v3[\s\S]*?(?=\n\s+- name: Prepare Windows update feed|\n\s+- name: Publish Windows update feed)/)?.[0] || "";
     assert.match(release, /Codex-win-x64-.*\.zip/);

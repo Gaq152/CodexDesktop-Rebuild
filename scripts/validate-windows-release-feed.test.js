@@ -7,7 +7,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const validatorPath = path.join(__dirname, "validate-windows-release-feed.js");
-const VERSION = "26.707.31428";
+const VERSION = "26.707.72221-r0001";
 
 function loadValidator() {
   assert.ok(fs.existsSync(validatorPath), "Windows release feed validator should exist");
@@ -100,7 +100,7 @@ test("rejects missing full duplicate wrong-version and malformed RELEASES entrie
 
   await t.test("other version", async (t) => {
     const feed = createFeed(t);
-    const other = addPackage(feed, "full", "old package", "26.707.31427");
+    const other = addPackage(feed, "full", "old package", "26.707.72221-r0002");
     writeReleases(feed, [releaseLine(other)]);
     await assert.rejects(
       () => validateWindowsReleaseFeed({ root: feed.root, version: VERSION }),

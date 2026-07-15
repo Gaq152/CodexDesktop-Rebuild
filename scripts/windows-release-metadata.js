@@ -4,16 +4,21 @@ const os = require("node:os");
 const path = require("node:path");
 const {
   compareNumericVersions,
+  compareWindowsReleaseVersions,
+  formatWindowsPackageVersion,
+  formatWindowsReleaseVersion,
+  parseWindowsReleaseVersion,
   validateWindowsUpstreamVersion,
 } = require("./configure-windows-release-version");
+const { validateWindowsInternalAppVersion } = require("./windows-msix-internal-version");
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 function validateReleaseVersion(version) {
-  if (!/^\d+\.\d+\.\d+$/.test(String(version || ""))) {
-    throw new Error(`Windows release version must be numeric X.Y.Z: ${version || "missing"}`);
-  }
-  return String(version);
+  const parsed = parseWindowsReleaseVersion(version);
+  return parsed.revision > 0
+    ? formatWindowsReleaseVersion(parsed.officialVersion, parsed.revision)
+    : parsed.releaseVersion;
 }
 
 function validateSourceSha(sourceSha) {
@@ -23,13 +28,41 @@ function validateSourceSha(sourceSha) {
   return String(sourceSha).toLowerCase();
 }
 
-function createMetadata({ upstreamVersion, releaseVersion, sourceSha }) {
-  return {
+function createMetadata({
+  upstreamVersion,
+  internalAppVersion,
+  releaseVersion,
+  sourceSha,
+  allowLegacyRelease = false,
+}) {
+  const officialVersion = validateWindowsInternalAppVersion(internalAppVersion);
+  const release = parseWindowsReleaseVersion(releaseVersion);
+  const officialBaseRelease = release.revision === 0 &&
+    release.officialVersion === officialVersion;
+  const legacyRelease = release.revision === 0 && !officialBaseRelease;
+  if (legacyRelease && !allowLegacyRelease) {
+    throw new Error(
+      `Windows release ${releaseVersion} must include rN unless legacy replacement is explicit`,
+    );
+  }
+  if (release.revision > 0 && release.officialVersion !== officialVersion) {
+    throw new Error(
+      `Windows release ${releaseVersion} must match internal app ${officialVersion} and include rN`,
+    );
+  }
+  const metadata = {
     schemaVersion: SCHEMA_VERSION,
     upstreamVersion: validateWindowsUpstreamVersion(upstreamVersion),
+    internalAppVersion: officialVersion,
+    rebuildRevision: release.revision,
     releaseVersion: validateReleaseVersion(releaseVersion),
+    packageVersion: release.revision === 0
+      ? release.releaseVersion
+      : formatWindowsPackageVersion(officialVersion, release.revision),
     sourceSha: validateSourceSha(sourceSha),
   };
+  if (legacyRelease) metadata.legacyRelease = true;
+  return metadata;
 }
 
 function readMetadata(file) {
@@ -37,17 +70,25 @@ function readMetadata(file) {
   if (value?.schemaVersion !== SCHEMA_VERSION) {
     throw new Error(`Unsupported Windows release metadata schema: ${value?.schemaVersion}`);
   }
-  return createMetadata(value);
+  return createMetadata({
+    ...value,
+    allowLegacyRelease: value.legacyRelease === true,
+  });
 }
 
 function releaseVersionsFromReleases(text) {
   const versions = new Set();
   for (const line of String(text || "").split(/\r?\n/)) {
     const parts = line.trim().split(/\s+/);
-    const match = parts[1]?.match(/^Codex-(\d+\.\d+\.\d+)-(?:full|delta)\.nupkg$/i);
-    if (match) versions.add(match[1]);
+    const match = parts[1]?.match(/^Codex-(\d+\.\d+\.\d+(?:-r\d+)?)-(?:full|delta)\.nupkg$/i);
+    if (match) {
+      const parsed = parseWindowsReleaseVersion(match[1]);
+      versions.add(parsed.revision > 0
+        ? formatWindowsReleaseVersion(parsed.officialVersion, parsed.revision)
+        : parsed.releaseVersion);
+    }
   }
-  return [...versions].sort(compareNumericVersions);
+  return [...versions].sort(compareWindowsReleaseVersions);
 }
 
 function normalizedReleaseLines(text) {
@@ -68,7 +109,7 @@ function validatePromotionState({
   if (metadata.releaseVersion !== expected) {
     throw new Error(`Metadata release ${metadata.releaseVersion} does not match requested ${expected}`);
   }
-  if (compareNumericVersions(expected, current) < 0) {
+  if (compareWindowsReleaseVersions(expected, current) < 0) {
     throw new Error(`Refusing release rollback from master ${current} to ${expected}`);
   }
   if (trackedUpstreamVersion) {
@@ -92,11 +133,17 @@ function validatePromotionState({
     if (expected !== remoteVersion) {
       throw new Error(`Replacement release ${expected} must equal update feed version ${remoteVersion}`);
     }
+    if (!trackedUpstreamVersion || metadata.upstreamVersion !== trackedUpstreamVersion) {
+      throw new Error(
+        `Replacement release ${expected} must use tracked MSIX ${trackedUpstreamVersion || "missing"}, ` +
+        `not ${metadata.upstreamVersion}; publish a new rN revision instead`,
+      );
+    }
   }
-  if (remoteVersion && compareNumericVersions(expected, remoteVersion) < 0) {
+  if (remoteVersion && compareWindowsReleaseVersions(expected, remoteVersion) < 0) {
     throw new Error(`Refusing update feed rollback from ${remoteVersion} to ${expected}`);
   }
-  if (remoteVersion && compareNumericVersions(expected, remoteVersion) === 0) {
+  if (remoteVersion && compareWindowsReleaseVersions(expected, remoteVersion) === 0) {
     const localLines = normalizedReleaseLines(localReleases);
     const remoteLines = normalizedReleaseLines(remoteReleases);
     if (!allowSameVersionReplacement && JSON.stringify(localLines) !== JSON.stringify(remoteLines)) {
@@ -112,7 +159,11 @@ function writeGithubOutput(metadata, outputPath = process.env.GITHUB_OUTPUT) {
     outputPath,
     [
       `windows_upstream_version=${metadata.upstreamVersion}`,
+      `windows_msix_version=${metadata.upstreamVersion}`,
+      `windows_internal_app_version=${metadata.internalAppVersion}`,
+      `windows_rebuild_revision=${metadata.rebuildRevision}`,
       `windows_release_version=${metadata.releaseVersion}`,
+      `windows_package_version=${metadata.packageVersion}`,
       `source_sha=${metadata.sourceSha}`,
     ].join(os.EOL) + os.EOL,
   );
@@ -131,8 +182,10 @@ function main() {
   if (writeFile) {
     metadata = createMetadata({
       upstreamVersion: valueAfter(args, "--upstream-version"),
+      internalAppVersion: valueAfter(args, "--internal-version"),
       releaseVersion: valueAfter(args, "--release-version"),
       sourceSha: valueAfter(args, "--source-sha"),
+      allowLegacyRelease: args.includes("--allow-legacy-release"),
     });
     const target = path.resolve(writeFile);
     fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -150,7 +203,10 @@ function main() {
       metadata,
       expectedReleaseVersion: valueAfter(args, "--expected-release-version"),
       currentReleaseVersion: packageJson.version,
-      trackedUpstreamVersion: tracked?.platforms?.Windows?.version || "",
+      trackedUpstreamVersion: tracked?.platforms?.Windows?.msixVersion ||
+        (/^\d+\.\d+\.\d+\.\d+$/.test(tracked?.platforms?.Windows?.version || "")
+          ? tracked.platforms.Windows.version
+          : ""),
       localReleases: fs.readFileSync(path.resolve(valueAfter(args, "--local-releases")), "utf8"),
       remoteReleases: fs.readFileSync(path.resolve(valueAfter(args, "--remote-releases")), "utf8"),
       allowSameVersionReplacement: args.includes("--allow-same-version-replacement"),
