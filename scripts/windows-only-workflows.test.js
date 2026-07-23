@@ -70,6 +70,29 @@ test("the manual workflow publishes Windows by default", () => {
   );
 });
 
+test("scheduled sync publishes directly while manual sync stays isolated as a draft", () => {
+  const workflow = workflows.find(({ name }) => name === "sync.yml").text;
+  const release = workflow.match(
+    /- name: Create Windows Release[\s\S]*?(?=\n\s+- name: Prepare Windows update feed)/,
+  )?.[0] || "";
+
+  assert.match(release, /draft: \$\{\{ github\.event_name == 'workflow_dispatch' \}\}/);
+  assert.match(release, /make_latest: \$\{\{ github\.event_name == 'schedule' \}\}/);
+  assert.match(
+    workflow,
+    /- name: Record built Windows versions\n\s+if: github\.event_name == 'schedule'/,
+  );
+  assert.match(
+    workflow,
+    /- name: Prepare Windows update feed\n\s+if: github\.event_name == 'schedule'/,
+  );
+  assert.match(
+    workflow,
+    /- name: Publish Windows update feed\n\s+if: github\.event_name == 'schedule'/,
+  );
+  assert.doesNotMatch(workflow, /name: Create draft Windows Release/);
+});
+
 test("manual and scheduled releases reject mutable or rollback feed state before committing", () => {
   for (const { name, text } of workflows) {
     const validateIndex = text.indexOf("name: Validate release metadata and monotonic state");

@@ -270,6 +270,7 @@ jobs:
           test "$metadata_sha" = "$GITHUB_SHA"
 
       - name: Record built Windows versions
+        if: github.event_name == 'schedule'
         env:
           WINDOWS_UPSTREAM_VERSION: ${{ needs.build-windows.outputs.windows_upstream_version }}
           WINDOWS_INTERNAL_APP_VERSION: ${{ needs.build-windows.outputs.windows_internal_app_version }}
@@ -307,7 +308,7 @@ jobs:
           test "$INSTALLER_VERSION" = "$EXPECTED_VERSION"
           test "$PACKAGE_VERSION" = "$EXPECTED_PACKAGE_VERSION"
 
-      - name: Create draft Windows Release
+      - name: Create Windows Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: codex-win-${{ steps.artifacts.outputs.windows_installer_version }}
@@ -317,18 +318,21 @@ jobs:
             Windows-only rebuild from official Codex `${{ needs.build-windows.outputs.windows_internal_app_version }}` (MSIX `${{ needs.build-windows.outputs.windows_upstream_version }}`).
             - Portable ZIP and installer ZIP are attached below.
             - The installer executable is inside the ZIP to avoid direct `.exe` browser download blocking.
-            - Squirrel update packages are published separately to `windows-update-feed`.
+            - Scheduled releases also publish Squirrel update packages separately to `windows-update-feed`.
           files: |
             artifacts/Codex-Windows-Portable-x64-*/Codex-win-x64-*.zip
             artifacts/Codex-Windows-Installer-x64-*/CodexSetup-win-x64-*.zip
           fail_on_unmatched_files: true
           overwrite_files: true
-          draft: true
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
           prerelease: false
+          make_latest: ${{ github.event_name == 'schedule' }}
 
       - name: Prepare Windows update feed
+        if: github.event_name == 'schedule'
         run: node scripts/prepare-windows-update-feed.js --source artifacts --dest update-feed/updates/win32/x64
       - name: Publish Windows update feed
+        if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
