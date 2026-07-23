@@ -60,10 +60,24 @@ const { COMMAND_TITLE_TRANSLATIONS, locateTargets, patchSource } = loadPatchModu
   assert.strictEqual(commandTargets.length, 3);
   assert.ok(sources.some((source) => source.includes("menuTitleIntlId")));
   assert.ok(sources.some((source) => source.includes("codex.commandDescription.")));
+  const sourceCatalog = sources.join("\n");
   const localized = sources.map((source) => patchSource(source).code).join("\n");
+  const translationsByMessageId = new Map();
   for (const [messageId, , to] of COMMAND_TITLE_TRANSLATIONS) {
-    assert.ok(localized.includes(`id:\`${messageId}\``), `missing catalog message: ${messageId}`);
-    assert.ok(localized.includes(`defaultMessage:\`${to}\``), `missing catalog translation: ${to}`);
+    const translations = translationsByMessageId.get(messageId) ?? [];
+    translations.push(to);
+    translationsByMessageId.set(messageId, translations);
+  }
+  const presentMessageIds = new Set(
+    [...sourceCatalog.matchAll(/id:\`(codex\.commandMenuTitle\.[^`]+)\`/g)].map((match) => match[1]),
+  );
+  for (const messageId of presentMessageIds) {
+    const translations = translationsByMessageId.get(messageId);
+    assert.ok(translations, `missing translation specification for: ${messageId}`);
+    assert.ok(
+      translations.some((to) => localized.includes(`defaultMessage:\`${to}\``)),
+      `missing catalog translation for: ${messageId}`,
+    );
   }
 }
 
@@ -131,6 +145,116 @@ const { COMMAND_TITLE_TRANSLATIONS, locateTargets, patchSource } = loadPatchModu
     "defaultMessage:`系统状态`",
   ]) {
     assert.ok(first.code.includes(expected), `missing localized menu source: ${expected}`);
+  }
+
+  const second = patchSource(first.code);
+  assert.strictEqual(second.code, first.code);
+  assert.strictEqual(second.replacements.length, 0);
+}
+
+{
+  const source = [
+    "const contextMenu={",
+    "learnSpelling:T9({id:`learnSpelling`,label:`&Learn Spelling`}),",
+    "lookUpSelection:T9({id:`lookUpSelection`,label:`Look Up “{selection}”`}),",
+    "saveImage:T9({id:`saveImage`,label:`Save I&mage`}),",
+    "saveImageAs:T9({id:`saveImageAs`,label:`Sa&ve Image As…`}),",
+    "saveVideo:T9({id:`saveVideo`,label:`Save Vide&o`}),",
+    "saveVideoAs:T9({id:`saveVideoAs`,label:`Save Video& As…`}),",
+    "copyLink:T9({id:`copyLink`,label:`Copy Lin&k`}),",
+    "saveLinkAs:T9({id:`saveLinkAs`,label:`Save Link As…`}),",
+    "copyImage:T9({id:`copyImage`,label:`Cop&y Image`}),",
+    "copyImageAddress:T9({id:`copyImageAddress`,label:`C&opy Image Address`}),",
+    "copyVideoAddress:T9({id:`copyVideoAddress`,label:`Copy Video Ad&dress`}),",
+    "services:T9({id:`services`,label:`Services`}),",
+    "dictionary:T9({id:`dictionarySuggestions`,label:`No Guesses Found`})",
+    "};",
+  ].join("");
+  const first = patchSource(source);
+
+  for (const expected of [
+    "label:`学习拼写`",
+    "label:`查询“{selection}”`",
+    "label:`保存图片`",
+    "label:`图片另存为...`",
+    "label:`保存视频`",
+    "label:`视频另存为...`",
+    "label:`复制链接`",
+    "label:`链接另存为...`",
+    "label:`复制图片`",
+    "label:`复制图片地址`",
+    "label:`复制视频地址`",
+    "label:`服务`",
+    "label:`未找到建议`",
+  ]) {
+    assert.ok(first.code.includes(expected), `missing media-menu translation: ${expected}`);
+  }
+
+  const second = patchSource(first.code);
+  assert.strictEqual(second.code, first.code);
+  assert.strictEqual(second.replacements.length, 0);
+}
+
+{
+  const source = [
+    "const nativeMenu=[",
+    "{label:`Browser Back`},{label:`Browser Forward`},",
+    "{label:`Find Next`},{label:`Find Previous`},",
+    "{label:`Default app`},{label:`File Explorer`},{label:`Terminal`}",
+    "];",
+  ].join("");
+  const first = patchSource(source);
+
+  for (const expected of [
+    "label:`浏览器后退`",
+    "label:`浏览器前进`",
+    "label:`查找下一个`",
+    "label:`查找上一个`",
+    "label:`默认应用`",
+    "label:`文件资源管理器`",
+    "label:`终端`",
+  ]) {
+    assert.ok(first.code.includes(expected), `missing native-menu translation: ${expected}`);
+  }
+
+  const second = patchSource(first.code);
+  assert.strictEqual(second.code, first.code);
+  assert.strictEqual(second.replacements.length, 0);
+}
+
+{
+  const source = [
+    "var a=`trayMenu.newChat`,b=`New Chat`,c=`trayMenu.projectlessThreads`,d=`Chats`;",
+    "const commands=[",
+    "{id:`codex.commandMenuTitle.archiveThread`,defaultMessage:`Archive chat`},",
+    "{id:`codex.commandMenuTitle.newProjectlessTask`,defaultMessage:`New standalone chat`},",
+    "{id:`codex.commandMenuTitle.newThread`,defaultMessage:`New Chat`},",
+    "{id:`codex.commandMenuTitle.nextThread`,defaultMessage:`Next Chat`},",
+    "{id:`codex.commandMenuTitle.previousThread`,defaultMessage:`Previous Chat`},",
+    "{id:`codex.commandMenuTitle.renameThread`,defaultMessage:`Rename chat`},",
+    "{id:`codex.commandMenuTitle.searchChats`,defaultMessage:`Search Chats…`},",
+    "{id:`codex.commandMenuTitle.thread1`,defaultMessage:`Go to Chat 1`},",
+    "{id:`codex.commandMenuTitle.toggleReviewPanel`,defaultMessage:`Toggle Review Panel`},",
+    "{id:`codex.commandMenuTitle.toggleThreadPin`,defaultMessage:`Pin/unpin chat`}",
+    "];",
+  ].join("");
+  const first = patchSource(source);
+
+  for (const expected of [
+    "a=`trayMenu.newChat`,b=`新建对话`",
+    "c=`trayMenu.projectlessThreads`,d=`对话`",
+    "defaultMessage:`归档对话`",
+    "defaultMessage:`新建无项目任务`",
+    "defaultMessage:`新建对话`",
+    "defaultMessage:`下一个对话`",
+    "defaultMessage:`上一个对话`",
+    "defaultMessage:`重命名对话`",
+    "defaultMessage:`搜索对话...`",
+    "defaultMessage:`转到对话 1`",
+    "defaultMessage:`切换审查面板`",
+    "defaultMessage:`固定/取消固定对话`",
+  ]) {
+    assert.ok(first.code.includes(expected), `missing current-bundle translation: ${expected}`);
   }
 
   const second = patchSource(first.code);
