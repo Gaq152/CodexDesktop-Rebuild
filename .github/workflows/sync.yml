@@ -9,6 +9,10 @@ on:
         description: "Force a Windows rebuild even without a version change"
         type: boolean
         default: false
+      publish_release:
+        description: "Publish a formal GitHub Release and Windows update feed instead of a test draft"
+        type: boolean
+        default: false
 
 env:
   NODE_VERSION: "24"
@@ -270,7 +274,7 @@ jobs:
           test "$metadata_sha" = "$GITHUB_SHA"
 
       - name: Record built Windows versions
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.publish_release == true
         env:
           WINDOWS_UPSTREAM_VERSION: ${{ needs.build-windows.outputs.windows_upstream_version }}
           WINDOWS_INTERNAL_APP_VERSION: ${{ needs.build-windows.outputs.windows_internal_app_version }}
@@ -324,15 +328,15 @@ jobs:
             artifacts/Codex-Windows-Installer-x64-*/CodexSetup-win-x64-*.zip
           fail_on_unmatched_files: true
           overwrite_files: true
-          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release != true }}
           prerelease: false
-          make_latest: ${{ github.event_name == 'schedule' }}
+          make_latest: ${{ github.event_name == 'schedule' || inputs.publish_release == true }}
 
       - name: Prepare Windows update feed
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.publish_release == true
         run: node scripts/prepare-windows-update-feed.js --source artifacts --dest update-feed/updates/win32/x64
       - name: Publish Windows update feed
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.publish_release == true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
